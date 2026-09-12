@@ -39,6 +39,10 @@ class TestClock {
     },
   };
 
+  get pendingCallbackCount() {
+    return this.animationFrames.size + this.timeouts.size;
+  }
+
   advanceBy(ms: number, frameMs = 16) {
     const target = this.currentTime + ms;
 
@@ -174,6 +178,86 @@ describe("page scroll helpers", () => {
 });
 
 describe("createPageScrollController", () => {
+  test("ignores composer page keys while the displayed timeline is paint-only", () => {
+    const clock = new TestClock();
+    const started: string[] = [];
+    const container = {
+      clientHeight: 600,
+      scrollHeight: 4_000,
+      scrollTop: 1_400,
+      getBoundingClientRect: () => ({ height: 600 }),
+    };
+    const options = {
+      enabled: false,
+      getContainer: () => container,
+      getScrollPaddingBottomPx: () => 100,
+      onScrollStart: (key: string) => started.push(key),
+      env: clock.env,
+    };
+    const controller = createPageScrollController(options);
+    controller.handleKeyDown("PageUp");
+    controller.handleKeyUp("PageUp");
+    clock.advanceBy(PAGE_SCROLL_ANIMATION_MS);
+    expect(container.scrollTop).toBe(1_400);
+    expect(started).toEqual([]);
+    controller.handleKeyDown("PageDown");
+    clock.advanceBy(PAGE_SCROLL_ANIMATION_MS * 3);
+
+    expect(container.scrollTop).toBe(1_400);
+    expect(started).toEqual([]);
+    expect(clock.pendingCallbackCount).toBe(0);
+  });
+
+  test.each([
+    { phase: "queued step and hold delay", elapsed: 0, release: false },
+    { phase: "in-flight tapped step", elapsed: 48, release: true },
+    { phase: "active hold animation", elapsed: 250, release: false },
+  ])(
+    "cancels $phase before a held paint and resumes only on a new live key",
+    ({ elapsed, release }) => {
+      const clock = new TestClock();
+      const started: string[] = [];
+      const container = {
+        clientHeight: 600,
+        scrollHeight: 4_000,
+        scrollTop: 1_400,
+        getBoundingClientRect: () => ({ height: 600 }),
+      };
+      const controller = createPageScrollController({
+        getContainer: () => container,
+        getScrollPaddingBottomPx: () => 100,
+        onScrollStart: (key) => started.push(key),
+        env: clock.env,
+      });
+      controller.handleKeyDown("PageUp");
+      if (release) controller.handleKeyUp("PageUp");
+      clock.advanceBy(elapsed);
+      const stoppedAt = container.scrollTop;
+      expect(clock.pendingCallbackCount).toBeGreaterThan(0);
+
+      controller.setEnabled(false);
+      controller.setEnabled(false);
+      expect(clock.pendingCallbackCount).toBe(0);
+      controller.handleKeyDown("PageDown");
+      controller.handleKeyUp("PageUp");
+      controller.releaseActiveKey();
+      clock.advanceBy(1_000);
+      expect(container.scrollTop).toBe(stoppedAt);
+      expect(started).toEqual(["PageUp"]);
+      expect(clock.pendingCallbackCount).toBe(0);
+
+      controller.setEnabled(true);
+      clock.advanceBy(300);
+      expect(container.scrollTop).toBe(stoppedAt);
+      controller.handleKeyDown("PageDown");
+      controller.handleKeyUp("PageDown");
+      clock.advanceBy(PAGE_SCROLL_ANIMATION_MS);
+      expect(container.scrollTop).toBeCloseTo(stoppedAt + 464, 5);
+      expect(started).toEqual(["PageUp", "PageDown"]);
+      expect(clock.pendingCallbackCount).toBe(0);
+    },
+  );
+
   test("keeps a single page scroll when the key is tapped", () => {
     const clock = new TestClock();
     const container = {

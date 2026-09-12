@@ -252,10 +252,38 @@ describe("resolveThreadSwitchTimeline", () => {
     modelSelection: null,
     parentThreadLink: null,
   };
+  const heldAvailability = {
+    environmentReady: true,
+    heldThread: { archivedAt: null, deletedAt: null },
+  };
+
+  it.each([
+    { archivedAt: "2026-09-12T20:00:00.000Z", deletedAt: null },
+    { archivedAt: null, deletedAt: "2026-09-12T20:00:00.000Z" },
+    null,
+  ])(
+    "rejects an archived, deleted, or removed source in the selecting render: %j",
+    (heldThread) => {
+      rememberReadyThreadTimeline(held);
+      const input = {
+        loading: true,
+        activeThreadKey: loadingDestination.threadKey,
+        activeEnvironmentId: environmentOne,
+        current: loadingDestination,
+        ...heldAvailability,
+        heldThread,
+      };
+      expect(resolveThreadSwitchTimeline(input)).toEqual({
+        snapshot: loadingDestination,
+        paintOnly: false,
+      });
+    },
+  );
 
   it("keeps one coherent previous display while the next thread is loading", () => {
     expect(
       resolveThreadSwitchTimeline({
+        ...heldAvailability,
         loading: true,
         activeThreadKey: "env-1:thread-b",
         activeEnvironmentId: environmentOne,
@@ -265,10 +293,39 @@ describe("resolveThreadSwitchTimeline", () => {
     ).toEqual({ snapshot: held, paintOnly: true });
   });
 
+  it("does not paint cached history before the environment catalog and shell are ready", () => {
+    rememberReadyThreadTimeline(held);
+    expect(
+      resolveThreadSwitchTimeline({
+        ...heldAvailability,
+        environmentReady: false,
+        loading: true,
+        activeThreadKey: loadingDestination.threadKey,
+        activeEnvironmentId: environmentOne,
+        current: loadingDestination,
+      }),
+    ).toEqual({ snapshot: loadingDestination, paintOnly: false });
+  });
+
+  it("honors an explicit empty held snapshot even while the cache contains an old paint", () => {
+    rememberReadyThreadTimeline(held);
+    expect(
+      resolveThreadSwitchTimeline({
+        ...heldAvailability,
+        held: null,
+        loading: true,
+        activeThreadKey: loadingDestination.threadKey,
+        activeEnvironmentId: environmentOne,
+        current: loadingDestination,
+      }),
+    ).toEqual({ snapshot: loadingDestination, paintOnly: false });
+  });
+
   it("shows the new thread once its detail is ready", () => {
     const ready = { ...loadingDestination, entries: ["b1"] };
     expect(
       resolveThreadSwitchTimeline({
+        ...heldAvailability,
         loading: false,
         activeThreadKey: "env-1:thread-b",
         activeEnvironmentId: environmentOne,
@@ -282,6 +339,7 @@ describe("resolveThreadSwitchTimeline", () => {
     const partiallyReady = { ...loadingDestination, entries: ["b1"] };
     expect(
       resolveThreadSwitchTimeline({
+        ...heldAvailability,
         loading: true,
         activeThreadKey: "env-1:thread-b",
         activeEnvironmentId: environmentOne,
@@ -294,6 +352,7 @@ describe("resolveThreadSwitchTimeline", () => {
   it("lets a loaded empty destination replace the held display", () => {
     expect(
       resolveThreadSwitchTimeline({
+        ...heldAvailability,
         loading: false,
         activeThreadKey: "env-1:thread-b",
         activeEnvironmentId: environmentOne,
@@ -306,6 +365,7 @@ describe("resolveThreadSwitchTimeline", () => {
   it("does not invent a timeline on the first open of a thread", () => {
     expect(
       resolveThreadSwitchTimeline({
+        ...heldAvailability,
         loading: true,
         activeThreadKey: "env-1:thread-b",
         activeEnvironmentId: environmentOne,
@@ -323,6 +383,7 @@ describe("resolveThreadSwitchTimeline", () => {
     };
     expect(
       resolveThreadSwitchTimeline({
+        ...heldAvailability,
         loading: true,
         activeThreadKey: destination.threadKey,
         activeEnvironmentId: environmentTwo,
@@ -337,6 +398,7 @@ describe("resolveThreadSwitchTimeline", () => {
     expect(peekHeldThreadTimeline<typeof held>()).toBe(held);
     expect(
       resolveThreadSwitchTimeline({
+        ...heldAvailability,
         loading: true,
         activeThreadKey: loadingDestination.threadKey,
         activeEnvironmentId: environmentOne,

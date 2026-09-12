@@ -306,6 +306,8 @@ import {
 } from "../state/server";
 import { terminalEnvironment } from "../state/terminal";
 import { threadEnvironment } from "../state/threads";
+import { compactThreadContext, type ThreadTurnSettings } from "./chat/contextCompaction";
+import { useHeldThreadTimeline } from "../heldThreadTimeline";
 import { resolveProviderSkillsForCwd } from "@t3tools/client-runtime/providerSkills";
 import { vcsEnvironment } from "../state/vcs";
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
@@ -1749,10 +1751,6 @@ export default function ChatView(props: ChatViewProps) {
     LastInvokedScriptByProjectSchema,
   );
   const legendListRef = useRef<LegendListRef | null>(null);
-  const getTimelineScrollableNode = useCallback(
-    () => legendListRef.current?.getScrollableNode() ?? null,
-    [],
-  );
   const [composerOverlayElement, setComposerOverlayElement] = useState<HTMLDivElement | null>(null);
   const [composerOverlayHeight, setComposerOverlayHeight] = useState(0);
   const composerOverlayHeightRef = useRef(0);
@@ -3676,17 +3674,47 @@ export default function ChatView(props: ChatViewProps) {
       turnDiffSummaries,
     ],
   );
+  const loadingEmptyTimeline =
+    isServerThread && threadDetailLoading && timelineEntries.length === 0;
+  const heldTimeline = useHeldThreadTimeline<typeof liveTimelineDisplay>(loadingEmptyTimeline);
+  const heldTimelineThread = useThreadShell(
+    heldTimeline === null ? null : parseScopedThreadKey(heldTimeline.threadKey),
+  );
+  const timelineEnvironmentReady =
+    environmentsReady &&
+    environmentById.has(liveTimelineDisplay.environmentId) &&
+    activeEnvironmentBootstrapComplete;
   const displayedTimelineState = resolveThreadSwitchTimeline({
-    loading: isServerThread && threadDetailLoading && timelineEntries.length === 0,
+    loading: loadingEmptyTimeline,
     activeThreadKey,
     activeEnvironmentId: activeThread?.environmentId ?? environmentId,
     current: liveTimelineDisplay,
+    held: heldTimeline,
+    heldThread: heldTimelineThread,
+    environmentReady: timelineEnvironmentReady,
   });
   const displayedTimeline = displayedTimelineState.snapshot ?? liveTimelineDisplay;
   const paintOnlyDisplayedTimeline = displayedTimelineState.paintOnly;
+  const paintOnlyDisplayedTimelineRef = useRef(paintOnlyDisplayedTimeline);
+  useLayoutEffect(() => {
+    paintOnlyDisplayedTimelineRef.current = paintOnlyDisplayedTimeline;
+  }, [paintOnlyDisplayedTimeline]);
+  const getTimelineScrollableNode = useCallback(
+    () =>
+      paintOnlyDisplayedTimelineRef.current
+        ? null
+        : (legendListRef.current?.getScrollableNode() ?? null),
+    [],
+  );
 
   useLayoutEffect(() => {
-    if (!isServerThread || activeThreadKey === null) {
+    if (
+      !isServerThread ||
+      activeThreadKey === null ||
+      !timelineEnvironmentReady ||
+      activeThread?.archivedAt !== null ||
+      activeThread?.deletedAt !== null
+    ) {
       resetHeldThreadTimeline();
       return;
     }
@@ -3694,7 +3722,15 @@ export default function ChatView(props: ChatViewProps) {
     if (!rememberReadyThreadTimeline(liveTimelineDisplay)) {
       resetHeldThreadTimeline();
     }
-  }, [activeThreadKey, isServerThread, liveTimelineDisplay, threadDetailLoading]);
+  }, [
+    activeThread?.archivedAt,
+    activeThread?.deletedAt,
+    activeThreadKey,
+    isServerThread,
+    liveTimelineDisplay,
+    threadDetailLoading,
+    timelineEnvironmentReady,
+  ]);
   const activeTerminalLaunchContext =
     terminalUiLaunchContext?.threadId === activeThreadId ? terminalUiLaunchContext : null;
   // Git status arrives after the composer paints. A checkout seen earlier in
@@ -5285,14 +5321,7 @@ export default function ChatView(props: ChatViewProps) {
     [togglePreviewPanel],
   );
   const persistThreadSettingsForNextTurn = useCallback(
-    async (input: {
-      threadId: ThreadId;
-      createdAt: string;
-      modelSelection?: ModelSelection;
-      branch?: string;
-      runtimeMode: RuntimeMode;
-      interactionMode: ProviderInteractionMode;
-    }): Promise<AtomCommandResult<void, unknown>> => {
+    async (input: ThreadTurnSettings): Promise<AtomCommandResult<void, unknown>> => {
       if (!serverThread) {
         return AsyncResult.success(undefined);
       }
@@ -5494,15 +5523,17 @@ export default function ChatView(props: ChatViewProps) {
     null,
   );
   const handlePageScrollStart = useEffectEvent((key: PageScrollKey) => {
+    if (paintOnlyDisplayedTimeline) return;
     timelineScrollIntentRef.current = key === "PageUp" ? "away-from-end" : "toward-end";
     composerRef.current?.collapseForTimelineScrollKey(key);
     if ((key === "PageUp" && timelineRealContentOverflowsViewport()) || !isTimelineAtLogicalEnd()) {
       cancelTimelineLiveFollowForUserNavigation();
     }
   });
-  useEffect(() => {
+  useLayoutEffect(() => {
     const controller = createPageScrollController({
-      getContainer: () => legendListRef.current?.getScrollableNode() ?? null,
+      enabled: false,
+      getContainer: getTimelineScrollableNode,
       getScrollPaddingBottomPx: () => composerOverlayElement?.getBoundingClientRect().height ?? 0,
       onScrollStart: handlePageScrollStart,
     });
@@ -5514,7 +5545,11 @@ export default function ChatView(props: ChatViewProps) {
         pageScrollControllerRef.current = null;
       }
     };
-  }, [composerOverlayElement]);
+  }, [composerOverlayElement, getTimelineScrollableNode]);
+  useLayoutEffect(() => {
+    // Cancel page steps and holds before an inert snapshot can paint.
+    pageScrollControllerRef.current?.setEnabled(!paintOnlyDisplayedTimeline);
+  }, [composerOverlayElement, paintOnlyDisplayedTimeline]);
   const onComposerPageScrollKeyDown = useCallback((key: PageScrollKey) => {
     pageScrollControllerRef.current?.handleKeyDown(key);
   }, []);
@@ -5527,6 +5562,7 @@ export default function ChatView(props: ChatViewProps) {
   // Live-follow stays active after send/thread-open until an actual list scroll
   // gesture opts out.
   const scrollToEnd = useCallback((animated = false) => {
+    if (paintOnlyDisplayedTimelineRef.current) return;
     isAtEndRef.current = true;
     timelineScrollModeRef.current = "following-end";
     liveFollowUserScrollGenerationRef.current = anchorUserScrollGenerationRef.current;
@@ -5539,6 +5575,7 @@ export default function ChatView(props: ChatViewProps) {
     // The anchored end space must be gone before the scroll measures, or the
     // list lands short of the real end (#6519).
     requestAnimationFrame(() => {
+      if (paintOnlyDisplayedTimelineRef.current) return;
       void legendListRef.current?.scrollToEnd?.({ animated });
     });
   }, []);
@@ -5557,7 +5594,8 @@ export default function ChatView(props: ChatViewProps) {
     // its end the way a remount used to via initialScrollAtEnd.
     scrollToEnd();
   }, [activeThreadKey, displayedTimeline.threadKey, scrollToEnd]);
-  useEffect(() => {
+  useLayoutEffect(() => {
+    if (paintOnlyDisplayedTimeline) return;
     let removeListeners: (() => void) | null = null;
     let frame: number | null = null;
     const attach = (remainingAttempts: number) => {
@@ -5705,7 +5743,12 @@ export default function ChatView(props: ChatViewProps) {
       }
       removeListeners?.();
     };
-  }, [activeThread?.id, isTimelineAtLogicalEnd, timelineRealContentOverflowsViewport]);
+  }, [
+    activeThread?.id,
+    isTimelineAtLogicalEnd,
+    paintOnlyDisplayedTimeline,
+    timelineRealContentOverflowsViewport,
+  ]);
 
   const onTimelineAnchorReady = useCallback((messageId: MessageId, anchorIndex: number) => {
     if (pendingTimelineAnchorRef.current === messageId) {
@@ -5719,7 +5762,10 @@ export default function ChatView(props: ChatViewProps) {
     settledTimelineAnchorRef.current = null;
     const positionAnchor = (remainingAttempts: number) => {
       requestAnimationFrame(() => {
-        if (positionedTimelineAnchorRef.current !== messageId) {
+        if (
+          paintOnlyDisplayedTimelineRef.current ||
+          positionedTimelineAnchorRef.current !== messageId
+        ) {
           return;
         }
         const list = legendListRef.current;
@@ -5738,7 +5784,10 @@ export default function ChatView(props: ChatViewProps) {
           finished = true;
           window.clearTimeout(fallbackTimer);
           scrollNode.removeEventListener("scrollend", finishAnimatedPositioning);
-          if (positionedTimelineAnchorRef.current !== messageId) {
+          if (
+            paintOnlyDisplayedTimelineRef.current ||
+            positionedTimelineAnchorRef.current !== messageId
+          ) {
             return;
           }
           const scrollOffset = list.getState().scroll;
@@ -5783,6 +5832,7 @@ export default function ChatView(props: ChatViewProps) {
       const pending = pendingAnchorScrollRestoreRef.current;
       pendingAnchorScrollRestoreRef.current = null;
       if (
+        !paintOnlyDisplayedTimelineRef.current &&
         pending &&
         settledTimelineAnchorRef.current === pending.messageId &&
         pending.userScrollGeneration === anchorUserScrollGenerationRef.current
@@ -6270,8 +6320,6 @@ export default function ChatView(props: ChatViewProps) {
   const composerHasDraftContent = useComposerDraftStore((store) =>
     composerDraftHasUserContent(store.getComposerDraft(composerDraftTarget)),
   );
-  const composerHasUnsentContent =
-    composerHasDraftContent || (composerEditingQueuedAttachments?.length ?? 0) > 0;
   const nowMinute = useNowMinute();
   const activeBranchMismatchKey = branchMismatchKey(
     activeThread?.id ?? null,
@@ -6513,15 +6561,13 @@ export default function ChatView(props: ChatViewProps) {
     pendingApprovals.length > 0 ||
     pendingUserInputs.length > 0 ||
     showPlanFollowUpPrompt;
-  const compactDisabled = compactThreadUnavailable || composerHasUnsentContent;
+  const compactDisabled = compactThreadUnavailable;
   const compactDisabledReason = compactDisabled
-    ? composerHasUnsentContent
-      ? "Send or clear your draft before compacting"
-      : !activeProject
-        ? "Choose a project before compacting"
-        : !manualCompactionProviderAvailable
-          ? "Compaction is unavailable for this provider"
-          : "Compacting is unavailable right now"
+    ? !activeProject
+      ? "Choose a project before compacting"
+      : !manualCompactionProviderAvailable
+        ? "Compaction is unavailable for this provider"
+        : "Compacting is unavailable right now"
     : null;
   const resumeCompactionBannerItem = useMemo<ComposerBannerStackItem | null>(() => {
     if (
@@ -7219,6 +7265,29 @@ export default function ChatView(props: ChatViewProps) {
       setThreadError,
     ],
   );
+
+  const onCompactContext = () =>
+    compactThreadContext({
+      environmentId,
+      threadId: activeThread?.id ?? null,
+      disabled:
+        compactDisabled ||
+        !clientSettingsHydrated ||
+        feedbackUploadsInFlightRef.current.has(routeThreadKey),
+      sendInFlightRef,
+      getRunContext: () => composerRef.current?.getRunContext(),
+      runtimeMode,
+      ...(localCheckoutBranchMismatch ? { branch: localCheckoutBranchMismatch.currentBranch } : {}),
+      persistSettings: persistThreadSettingsForNextTurn,
+      startTurn: startThreadTurn,
+      setOptimisticMessages: setOptimisticUserMessages,
+      beginLocalDispatch,
+      resetLocalDispatch,
+      setThreadError,
+      scrollToEnd,
+      clearUsageLimits: () => clearUsageLimitsFor(routeThreadKey),
+      acknowledgeThreadWoke: acknowledgeActiveThreadWoke,
+    });
 
   const onSend = async (
     e?: { preventDefault: () => void },
@@ -9374,6 +9443,7 @@ export default function ChatView(props: ChatViewProps) {
                             onPageScrollKeyDown={onComposerPageScrollKeyDown}
                             onPageScrollKeyUp={onComposerPageScrollKeyUp}
                             onPageScrollRelease={onComposerPageScrollRelease}
+                            onCompactContext={onCompactContext}
                             onSend={onSend}
                             onInterrupt={onInterrupt}
                             onImplementPlanInNewThread={onImplementPlanInNewThread}

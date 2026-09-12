@@ -1,4 +1,6 @@
 import type { EnvironmentId } from "@t3tools/contracts";
+import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
+import { useCallback, useSyncExternalStore } from "react";
 
 /**
  * A complete timeline paint. Generic fields keep entries and their rendering
@@ -11,6 +13,23 @@ export interface ThreadTimelineDisplaySnapshot {
 }
 
 let lastPaintedThreadTimeline: ThreadTimelineDisplaySnapshot | null = null;
+const invalidationListeners = new Set<() => void>();
+
+function subscribeInvalidation(listener: () => void): () => void {
+  invalidationListeners.add(listener);
+  return () => {
+    invalidationListeners.delete(listener);
+  };
+}
+
+export function useHeldThreadTimeline<T extends ThreadTimelineDisplaySnapshot>(
+  loading: boolean,
+): T | null {
+  // A live view writes each streaming paint to the cache. Only read it while
+  // loading, so those writes cannot cause an extra render of their own view.
+  const getSnapshot = useCallback(() => (loading ? peekHeldThreadTimeline<T>() : null), [loading]);
+  return useSyncExternalStore(subscribeInvalidation, getSnapshot, getSnapshot);
+}
 
 export function timelineHasEphemeralPreviewUrls(value: unknown): boolean {
   const seen = new Set<object>();
@@ -42,7 +61,9 @@ export function peekHeldThreadTimeline<T extends ThreadTimelineDisplaySnapshot>(
 }
 
 export function resetHeldThreadTimeline(): void {
+  if (lastPaintedThreadTimeline === null) return;
   lastPaintedThreadTimeline = null;
+  for (const listener of invalidationListeners) listener();
 }
 
 export function clearHeldThreadTimelineForEnvironment(environmentId: EnvironmentId): void {
@@ -57,13 +78,19 @@ export function resolveThreadSwitchTimeline<T extends ThreadTimelineDisplaySnaps
   readonly activeEnvironmentId: EnvironmentId | null;
   readonly current: T | null;
   readonly held?: T | null;
+  readonly heldThread: Pick<EnvironmentThreadShell, "archivedAt" | "deletedAt"> | null;
+  readonly environmentReady: boolean;
 }): { readonly snapshot: T | null; readonly paintOnly: boolean } {
   if (input.current === null || !input.loading || input.current.entries.length > 0) {
     return { snapshot: input.current, paintOnly: false };
   }
 
-  const held = input.held ?? peekHeldThreadTimeline<T>();
+  const held = input.held === undefined ? peekHeldThreadTimeline<T>() : input.held;
   if (
+    !input.environmentReady ||
+    input.heldThread === null ||
+    input.heldThread.archivedAt !== null ||
+    input.heldThread.deletedAt !== null ||
     held === null ||
     input.activeThreadKey === null ||
     input.activeEnvironmentId === null ||
