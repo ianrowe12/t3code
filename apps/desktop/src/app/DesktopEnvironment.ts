@@ -10,6 +10,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import * as DesktopConfig from "./DesktopConfig.ts";
@@ -78,6 +79,7 @@ export class DesktopEnvironment extends Context.Service<
     readonly linuxApplicationsDir: string;
     readonly appImagePath: Option.Option<string>;
     readonly userDataDirName: string;
+    readonly userDataDirectory: Option.Option<string>;
     readonly legacyUserDataDirName: string;
     readonly defaultDesktopSettings: DesktopAppSettings.DesktopSettings;
     readonly runtimeInfo: DesktopRuntimeInfo;
@@ -146,6 +148,16 @@ const make = Effect.fn("desktop.environment.make")(function* (
 ): Effect.fn.Return<DesktopEnvironment["Service"], Config.ConfigError, Path.Path> {
   const path = yield* Path.Path;
   const config = yield* DesktopConfig.DesktopConfig;
+  // oxlint-disable-next-line t3code/no-inline-schema-compile -- Absolute-path semantics depend on the injected Path service.
+  const userDataDirectory = yield* Schema.decodeEffect(
+    Schema.Option(
+      Schema.String.check(
+        Schema.makeFilter((value) => path.isAbsolute(value) && !value.includes("\0"), {
+          message: "T3CODE_DESKTOP_USER_DATA_DIR must be an absolute directory without null bytes",
+        }),
+      ),
+    ),
+  )(config.userDataDirectory).pipe(Effect.mapError((cause) => new Config.ConfigError(cause)));
   const homeDirectory = input.homeDirectory;
   const devServerUrl = config.devServerUrl;
   const isDevelopment = Option.isSome(devServerUrl);
@@ -232,6 +244,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
     linuxApplicationsDir,
     appImagePath: config.appImagePath,
     userDataDirName,
+    userDataDirectory,
     legacyUserDataDirName,
     defaultDesktopSettings: DesktopAppSettings.resolveDefaultDesktopSettings(input.appVersion),
     runtimeInfo: resolveDesktopRuntimeInfo({

@@ -103,6 +103,15 @@ DMGs default to the host architecture. Use `--arch` to choose another target and
 to retain packaging files for inspection. Run `vp run dist:desktop:artifact --help` for other
 options.
 
+For an isolated desktop install, set `T3CODE_HOME` for server state and
+`T3CODE_DESKTOP_USER_DATA_DIR` to an absolute directory for the Electron profile. The profile
+override takes precedence over existing legacy profiles; an unset or blank value preserves
+the normal profile selection. Relative paths, including `~`, and paths containing null bytes
+are rejected. Set `T3CODE_DISABLE_AUTO_UPDATE=true` to keep a local build from being replaced
+through its update feed. On macOS, package these values as strings under
+`mac.extendInfo.LSEnvironment` in the local electron-builder configuration so Finder and Dock
+launches retain them. Directly executing the app binary does not apply `LSEnvironment`.
+
 ### Linux AppImage prerequisites
 
 Build on Linux because the browser-secret helper links against the host's libsecret. Install

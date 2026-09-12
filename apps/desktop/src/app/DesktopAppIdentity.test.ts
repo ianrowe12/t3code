@@ -1,6 +1,7 @@
 import * as NodePath from "@effect/platform-node/NodePath";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
+import * as Config from "effect/Config";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -89,7 +90,7 @@ const makeEnvironmentLayer = (overrides: TestEnvironmentInput = {}) => {
     Layer.provide(
       Layer.mergeAll(
         NodeServices.layer,
-        NodePath.layerPosix,
+        environmentOverrides.platform === "win32" ? NodePath.layerWin32 : NodePath.layerPosix,
         DesktopConfig.layerTest({
           ...env,
         }),
@@ -131,7 +132,7 @@ const withIdentity = <A, E, R>(
               input.legacyPathProbeError
                 ? Effect.fail(input.legacyPathProbeError)
                 : Effect.succeed(
-                    input.legacyPathExists === true && path.includes("T3 Code (Alpha)"),
+                    input.legacyPathExists === true && /T3 Code \((Alpha|Dev)\)/.test(path),
                   ),
             readFileString: () =>
               Effect.succeed(input.packageJson ?? '{"t3codeCommitHash":"abcdef1234567890"}'),
@@ -146,6 +147,72 @@ const withIdentity = <A, E, R>(
 };
 
 describe("DesktopAppIdentity", () => {
+  it.effect("uses an explicit userData directory instead of an existing legacy profile", () =>
+    withIdentity(
+      Effect.gen(function* () {
+        const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
+        const userDataPath = yield* identity.resolveUserDataPath;
+
+        assert.equal(userDataPath, "/Users/alice/Library/Application Support/t3code-personal");
+      }),
+      {
+        environment: {
+          env: {
+            T3CODE_DESKTOP_USER_DATA_DIR:
+              " /Users/alice/Library/Application Support/t3code-personal ",
+          },
+        },
+        legacyPathExists: true,
+      },
+    ),
+  );
+
+  it.effect("does not inspect legacy profiles when a userData override is configured", () =>
+    withIdentity(
+      Effect.gen(function* () {
+        const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
+        assert.equal(yield* identity.resolveUserDataPath, "/Users/alice/personal-profile");
+      }),
+      {
+        environment: { env: { T3CODE_DESKTOP_USER_DATA_DIR: "/Users/alice/personal-profile" } },
+        legacyPathProbeError: PlatformError.systemError({
+          _tag: "PermissionDenied",
+          module: "FileSystem",
+          method: "exists",
+          description: "permission denied",
+        }),
+      },
+    ),
+  );
+
+  it.effect("accepts an absolute Windows userData override", () =>
+    withIdentity(
+      Effect.gen(function* () {
+        const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
+        assert.equal(yield* identity.resolveUserDataPath, "C:\\Users\\alice\\personal-profile");
+      }),
+      {
+        environment: {
+          platform: "win32",
+          env: { T3CODE_DESKTOP_USER_DATA_DIR: " C:\\Users\\alice\\personal-profile " },
+        },
+      },
+    ),
+  );
+
+  it.effect("rejects invalid userData overrides before choosing a profile", () =>
+    Effect.gen(function* () {
+      for (const value of ["relative/profile", "~/profile", "/profile\0invalid"]) {
+        const error = yield* Effect.service(DesktopEnvironment.DesktopEnvironment).pipe(
+          Effect.provide(makeEnvironmentLayer({ env: { T3CODE_DESKTOP_USER_DATA_DIR: value } })),
+          Effect.flip,
+        );
+        assert.instanceOf(error, Config.ConfigError);
+        assert.include(String(error), "T3CODE_DESKTOP_USER_DATA_DIR");
+      }
+    }),
+  );
+
   it.effect("keeps using the legacy userData path when it already exists", () =>
     withIdentity(
       Effect.gen(function* () {
@@ -156,6 +223,41 @@ describe("DesktopAppIdentity", () => {
       }),
       { legacyPathExists: true },
     ),
+  );
+
+  it.effect("preserves production and development profiles without a nonblank override", () =>
+    Effect.gen(function* () {
+      for (const value of [undefined, "", " \t "]) {
+        for (const isDevelopment of [false, true]) {
+          for (const legacyPathExists of [false, true]) {
+            const userDataPath = yield* withIdentity(
+              Effect.gen(function* () {
+                const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
+                return yield* identity.resolveUserDataPath;
+              }),
+              {
+                environment: {
+                  env: {
+                    T3CODE_DESKTOP_USER_DATA_DIR: value,
+                    VITE_DEV_SERVER_URL: isDevelopment ? "http://localhost:5173" : undefined,
+                  },
+                },
+                legacyPathExists,
+              },
+            );
+
+            const directory = legacyPathExists
+              ? isDevelopment
+                ? "T3 Code (Dev)"
+                : "T3 Code (Alpha)"
+              : isDevelopment
+                ? "t3code-dev"
+                : "t3code";
+            assert.equal(userDataPath, `/Users/alice/Library/Application Support/${directory}`);
+          }
+        }
+      }
+    }),
   );
 
   it.effect("preserves failures while inspecting the legacy userData path", () => {
