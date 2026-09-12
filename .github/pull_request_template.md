@@ -27,6 +27,11 @@ we may close it without merging it, or never review it.
 
 ## Checklist
 
+<!-- For advisory follow-ups, replace with:
+Review lineage: Follow-up PR, originating issue #N, PR #M, <review comment link>
+See docs/agents/independent-review.md. -->
+Review lineage: Original PR
+
 - [ ] This PR is small and focused
 - [ ] I explained what changed and why
 - [ ] I included before/after screenshots for any UI changes

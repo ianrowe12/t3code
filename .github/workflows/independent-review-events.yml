@@ -1,0 +1,17 @@
+name: Independent Review Events
+
+# Review events use PR-controlled workflow definitions. This relay has no write
+# credentials and executes no PR code; workflow_run wakes the trusted gate.
+on:
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions: {}
+
+jobs:
+  notify:
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 1
+    steps:
+      - name: Notify trusted gate
+        run: echo "Independent review changed; the trusted gate will re-read GitHub."
