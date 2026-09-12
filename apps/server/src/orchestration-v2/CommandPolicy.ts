@@ -14,6 +14,8 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 
+import { isCompactCommand } from "./MaintenanceCommand.ts";
+
 export const MessageDispatchDecisionV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("start_run"),
@@ -383,6 +385,17 @@ const decideMessageDispatch: CommandPolicyV2Shape["decideMessageDispatch"] = (in
       run.status === "waiting",
   );
   const modelSelection = input.requestedModelSelection ?? input.projection.thread.modelSelection;
+  const activeMessage = input.projection.messages.find(
+    (message) => message.id === activeRun?.userMessageId,
+  );
+  const activeRunIsCompacting = activeMessage !== undefined && isCompactCommand(activeMessage);
+  const queueAfterActive = (activeRunId: RunId) =>
+    ensureQueuedMessages({
+      commandId: input.commandId,
+      threadId: input.projection.thread.id,
+      providerInstanceId: modelSelection.instanceId,
+      capabilities: input.capabilities,
+    }).pipe(Effect.as({ type: "queue_after_active" as const, activeRunId }));
 
   switch (input.requestedMode.type) {
     case "steer_active": {
@@ -395,6 +408,9 @@ const decideMessageDispatch: CommandPolicyV2Shape["decideMessageDispatch"] = (in
             providerInstanceId: modelSelection.instanceId,
           }),
         );
+      }
+      if (activeRunIsCompacting) {
+        return queueAfterActive(activeRun.id);
       }
       const providerTurnId =
         activeRun.activeAttemptId === null
@@ -418,7 +434,20 @@ const decideMessageDispatch: CommandPolicyV2Shape["decideMessageDispatch"] = (in
           });
     }
     case "restart_active": {
-      if (activeRun?.id !== input.requestedMode.targetRunId || activeRun.activeAttemptId === null) {
+      if (activeRun?.id !== input.requestedMode.targetRunId) {
+        return Effect.fail(
+          new CommandPolicyUnsupportedError({
+            commandId: input.commandId,
+            threadId: input.projection.thread.id,
+            requestedMode: input.requestedMode.type,
+            providerInstanceId: modelSelection.instanceId,
+          }),
+        );
+      }
+      if (activeRunIsCompacting) {
+        return queueAfterActive(activeRun.id);
+      }
+      if (activeRun.activeAttemptId === null) {
         return Effect.fail(
           new CommandPolicyUnsupportedError({
             commandId: input.commandId,
@@ -448,22 +477,12 @@ const decideMessageDispatch: CommandPolicyV2Shape["decideMessageDispatch"] = (in
     case "queue_after_active":
       return activeRun === undefined
         ? Effect.succeed({ type: "start_run", modelSelection })
-        : ensureQueuedMessages({
-            commandId: input.commandId,
-            threadId: input.projection.thread.id,
-            providerInstanceId: modelSelection.instanceId,
-            capabilities: input.capabilities,
-          }).pipe(Effect.as({ type: "queue_after_active", activeRunId: activeRun.id }));
+        : queueAfterActive(activeRun.id);
     case "start_immediately":
       if (activeRun === undefined) {
         return Effect.succeed({ type: "start_run", modelSelection });
       }
-      return ensureQueuedMessages({
-        commandId: input.commandId,
-        threadId: input.projection.thread.id,
-        providerInstanceId: modelSelection.instanceId,
-        capabilities: input.capabilities,
-      }).pipe(Effect.as({ type: "queue_after_active", activeRunId: activeRun.id }));
+      return queueAfterActive(activeRun.id);
   }
 };
 

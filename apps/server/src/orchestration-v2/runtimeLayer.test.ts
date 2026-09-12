@@ -13,6 +13,7 @@ import {
   RuntimeRequestId,
   TurnItemId,
   type ModelSelection,
+  type OrchestrationV2ProviderCapabilities,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -217,6 +218,97 @@ const ProjectDeletionTestLayer = Layer.mergeAll(
   Layer.provide(GitWorkflowTestLayer),
   Layer.provide(NodeServices.layer),
 );
+
+const startRunningMessage = Effect.fn("runtimeLayerTest.startRunningMessage")(function* (input: {
+  readonly orchestrator: OrchestratorV2["Service"];
+  readonly eventSink: EventSinkV2["Service"];
+  readonly threadId: ThreadId;
+  readonly text: string;
+  readonly capabilities?: OrchestrationV2ProviderCapabilities;
+}) {
+  const key = String(input.threadId);
+  yield* input.orchestrator.dispatch({
+    type: "thread.create",
+    createdBy: "user",
+    creationSource: "web",
+    commandId: CommandId.make(`${key}:create`),
+    threadId: input.threadId,
+    projectId: ProjectId.make(`${key}:project`),
+    title: "Runtime message",
+    modelSelection,
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    branch: null,
+    worktreePath: process.cwd(),
+  });
+  yield* input.orchestrator.dispatch({
+    type: "message.dispatch",
+    createdBy: "user",
+    creationSource: "web",
+    commandId: CommandId.make(`${key}:message`),
+    threadId: input.threadId,
+    messageId: MessageId.make(`${key}:message`),
+    text: input.text,
+    attachments: [],
+    dispatchMode: { type: "start_immediately" },
+  });
+  const initial = yield* input.orchestrator.getThreadProjection(input.threadId);
+  const run = initial.runs[0]!;
+  const providerThread = initial.providerThreads[0]!;
+  const now = yield* DateTime.now;
+  const providerSession = {
+    id: providerThread.providerSessionId!,
+    driver,
+    providerInstanceId: modelSelection.instanceId,
+    status: "running" as const,
+    cwd: process.cwd(),
+    model: modelSelection.model,
+    capabilities: input.capabilities ?? CodexProviderCapabilitiesV2,
+    createdAt: now,
+    updatedAt: now,
+    lastError: null,
+  };
+  const providerTurn = {
+    id: ProviderTurnId.make(`${key}:turn`),
+    providerThreadId: providerThread.id,
+    nodeId: run.rootNodeId!,
+    runAttemptId: run.activeAttemptId,
+    nativeTurnRef: null,
+    ordinal: 1,
+    status: "running" as const,
+    startedAt: now,
+    completedAt: null,
+  };
+  yield* input.eventSink.write({
+    commandId: CommandId.make(`${key}:running`),
+    events: [
+      {
+        id: EventId.make(`${key}:run-event`),
+        type: "run.updated",
+        threadId: input.threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: { ...run, status: "running", startedAt: now },
+      },
+      {
+        id: EventId.make(`${key}:session-event`),
+        type: "provider-session.attached",
+        threadId: input.threadId,
+        occurredAt: now,
+        payload: providerSession,
+      },
+      {
+        id: EventId.make(`${key}:turn-event`),
+        type: "provider-turn.updated",
+        threadId: input.threadId,
+        runId: run.id,
+        occurredAt: now,
+        payload: providerTurn,
+      },
+    ],
+  });
+  return { run, providerThread, providerSession, providerTurn };
+});
 
 it.layer(ProjectDeletionTestLayer)("project deletion during thread commands", (it) => {
   it.effect("waits for an in-flight thread update before planning deletion", () =>
@@ -699,6 +791,343 @@ it.layer(TestLayer)("OrchestrationV2LayerLive", (it) => {
         (yield* outbox.listByCommandId(nextCommandId)).map((effect) => effect.request.type),
         ["provider-turn.start"],
       );
+    }),
+  );
+
+  it.effect("queues normal message intents while context compaction is active", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* OrchestratorV2;
+      const eventSink = yield* EventSinkV2;
+      const outbox = yield* EffectOutboxV2;
+      const threadId = ThreadId.make("runtime-compact-auto-queue");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-compact-auto-queue-create"),
+        threadId,
+        projectId: ProjectId.make("runtime-compact-auto-queue-project"),
+        title: "Compact queue",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-compact-auto-queue-compact"),
+        threadId,
+        messageId: MessageId.make("runtime-compact-auto-queue-compact"),
+        text: " /COMPACT ",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+      });
+      const initial = yield* orchestrator.getThreadProjection(threadId);
+      const compactRun = initial.runs[0]!;
+      const providerThread = initial.providerThreads[0]!;
+      const now = yield* DateTime.now;
+      const providerSession = {
+        id: providerThread.providerSessionId!,
+        driver,
+        providerInstanceId: modelSelection.instanceId,
+        status: "running" as const,
+        cwd: process.cwd(),
+        model: modelSelection.model,
+        capabilities: CodexProviderCapabilitiesV2,
+        createdAt: now,
+        updatedAt: now,
+        lastError: null,
+      };
+      yield* eventSink.write({
+        commandId: CommandId.make("runtime-compact-auto-queue-running"),
+        events: [
+          {
+            id: EventId.make("runtime-compact-auto-queue-run-event"),
+            type: "run.updated",
+            threadId,
+            runId: compactRun.id,
+            occurredAt: now,
+            payload: { ...compactRun, status: "running", startedAt: now },
+          },
+          {
+            id: EventId.make("runtime-compact-auto-queue-session-event"),
+            type: "provider-session.attached",
+            threadId,
+            occurredAt: now,
+            payload: providerSession,
+          },
+          {
+            id: EventId.make("runtime-compact-auto-queue-turn-event"),
+            type: "provider-turn.updated",
+            threadId,
+            runId: compactRun.id,
+            occurredAt: now,
+            payload: {
+              id: ProviderTurnId.make("runtime-compact-auto-queue-turn"),
+              providerThreadId: providerThread.id,
+              nodeId: compactRun.rootNodeId!,
+              runAttemptId: compactRun.activeAttemptId,
+              nativeTurnRef: null,
+              ordinal: 1,
+              status: "running",
+              startedAt: now,
+              completedAt: null,
+            },
+          },
+        ],
+      });
+
+      const queuedCommands = [
+        {
+          name: "auto",
+          dispatchMode: { type: "start_immediately" as const },
+          deliveryIntent: "auto" as const,
+        },
+        {
+          name: "steer-intent",
+          dispatchMode: { type: "start_immediately" as const },
+          deliveryIntent: "steer" as const,
+        },
+        {
+          name: "restart-intent",
+          dispatchMode: { type: "start_immediately" as const },
+          deliveryIntent: "restart" as const,
+        },
+        {
+          name: "start-immediately",
+          dispatchMode: { type: "start_immediately" as const },
+        },
+        {
+          name: "targeted-steer",
+          dispatchMode: { type: "steer_active" as const, targetRunId: compactRun.id },
+        },
+        {
+          name: "targeted-restart",
+          dispatchMode: { type: "restart_active" as const, targetRunId: compactRun.id },
+        },
+      ];
+      for (const queuedCommand of queuedCommands) {
+        const queuedCommandId = CommandId.make(
+          `runtime-compact-auto-queue-next-${queuedCommand.name}`,
+        );
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: queuedCommandId,
+          threadId,
+          messageId: MessageId.make(`runtime-compact-auto-queue-next-${queuedCommand.name}`),
+          text: `Continue after compaction (${queuedCommand.name}).`,
+          attachments: [],
+          dispatchMode: queuedCommand.dispatchMode,
+          ...("deliveryIntent" in queuedCommand
+            ? { deliveryIntent: queuedCommand.deliveryIntent }
+            : {}),
+        });
+        assert.deepEqual(
+          (yield* outbox.listByCommandId(queuedCommandId)).filter((effect) =>
+            effect.request.type.startsWith("provider-turn."),
+          ),
+          [],
+        );
+      }
+
+      const queued = yield* orchestrator.getThreadProjection(threadId);
+      assert.deepEqual(
+        queued.runs.map((run) => run.status),
+        ["running", "queued", "queued", "queued", "queued", "queued", "queued"],
+      );
+    }),
+  );
+
+  it.effect("rejects stale explicit targets while context compaction is active", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* OrchestratorV2;
+      const eventSink = yield* EventSinkV2;
+      const threadId = ThreadId.make("runtime-compact-stale-target");
+      yield* startRunningMessage({
+        orchestrator,
+        eventSink,
+        threadId,
+        text: "/compact",
+      });
+
+      for (const requestedMode of [
+        {
+          name: "steer",
+          dispatchMode: {
+            type: "steer_active" as const,
+            targetRunId: RunId.make("runtime-compact-stale-target-steer"),
+          },
+        },
+        {
+          name: "restart",
+          dispatchMode: {
+            type: "restart_active" as const,
+            targetRunId: RunId.make("runtime-compact-stale-target-restart"),
+          },
+        },
+      ]) {
+        const error = yield* orchestrator
+          .dispatch({
+            type: "message.dispatch",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make(`runtime-compact-stale-target-${requestedMode.name}`),
+            threadId,
+            messageId: MessageId.make(`runtime-compact-stale-target-${requestedMode.name}`),
+            text: "Do not retarget this message.",
+            attachments: [],
+            dispatchMode: requestedMode.dispatchMode,
+          })
+          .pipe(Effect.flip);
+
+        assert.instanceOf(error, OrchestratorDispatchError);
+      }
+
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      assert.lengthOf(projection.runs, 1);
+    }),
+  );
+
+  it.effect("rejects completed stale steer targets while a newer compaction is active", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* OrchestratorV2;
+      const eventSink = yield* EventSinkV2;
+      const outbox = yield* EffectOutboxV2;
+      const threadId = ThreadId.make("runtime-compact-completed-target");
+      const { run, providerTurn } = yield* startRunningMessage({
+        orchestrator,
+        eventSink,
+        threadId,
+        text: "Earlier work.",
+      });
+      const now = yield* DateTime.now;
+      yield* eventSink.write({
+        commandId: CommandId.make("runtime-compact-completed-target-finish"),
+        events: [
+          {
+            id: EventId.make("runtime-compact-completed-target-run-finish"),
+            type: "run.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: { ...run, status: "completed", startedAt: now, completedAt: now },
+          },
+          {
+            id: EventId.make("runtime-compact-completed-target-turn-finish"),
+            type: "provider-turn.updated",
+            threadId,
+            runId: run.id,
+            occurredAt: now,
+            payload: { ...providerTurn, status: "completed", completedAt: now },
+          },
+        ],
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make("runtime-compact-completed-target-compact"),
+        threadId,
+        messageId: MessageId.make("runtime-compact-completed-target-compact"),
+        text: "/compact",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+      });
+      const before = yield* orchestrator.getThreadProjection(threadId);
+      assert.deepEqual(
+        before.runs.map((candidate) => candidate.status),
+        ["completed", "starting"],
+      );
+
+      const commandId = CommandId.make("runtime-compact-completed-target-late-steer");
+      const messageId = MessageId.make("runtime-compact-completed-target-late-steer");
+      const error = yield* orchestrator
+        .dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId,
+          threadId,
+          messageId,
+          text: "This still targets the earlier run.",
+          attachments: [],
+          dispatchMode: { type: "steer_active", targetRunId: run.id },
+        })
+        .pipe(Effect.flip);
+
+      assert.instanceOf(error, OrchestratorDispatchError);
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      assert.deepEqual(after.runs, before.runs);
+      assert.isFalse(after.messages.some((message) => message.id === messageId));
+      assert.deepEqual(yield* outbox.listByCommandId(commandId), []);
+    }),
+  );
+
+  it.effect("preserves queue capability and provider matching checks during compaction", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* OrchestratorV2;
+      const eventSink = yield* EventSinkV2;
+      const unsupportedThreadId = ThreadId.make("runtime-compact-unsupported-queue");
+      yield* startRunningMessage({
+        orchestrator,
+        eventSink,
+        threadId: unsupportedThreadId,
+        text: "/compact",
+        capabilities: {
+          ...CodexProviderCapabilitiesV2,
+          turns: {
+            ...CodexProviderCapabilitiesV2.turns,
+            supportsQueuedMessages: false,
+          },
+        },
+      });
+
+      const unsupported = yield* orchestrator
+        .dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make("runtime-compact-unsupported-queue-next"),
+          threadId: unsupportedThreadId,
+          messageId: MessageId.make("runtime-compact-unsupported-queue-next"),
+          text: "This provider cannot queue.",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          deliveryIntent: "auto",
+        })
+        .pipe(Effect.flip);
+      assert.instanceOf(unsupported, OrchestratorDispatchError);
+      assert.include(String(unsupported.cause), "queued_messages");
+
+      const mismatchedThreadId = ThreadId.make("runtime-compact-provider-mismatch");
+      yield* startRunningMessage({
+        orchestrator,
+        eventSink,
+        threadId: mismatchedThreadId,
+        text: "/compact",
+      });
+      const mismatched = yield* orchestrator
+        .dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make("runtime-compact-provider-mismatch-next"),
+          threadId: mismatchedThreadId,
+          messageId: MessageId.make("runtime-compact-provider-mismatch-next"),
+          text: "Use another provider later.",
+          attachments: [],
+          modelSelection: { instanceId: alternateInstanceId, model: "gpt-5.5" },
+          dispatchMode: { type: "start_immediately" },
+          deliveryIntent: "auto",
+        })
+        .pipe(Effect.flip);
+      assert.instanceOf(mismatched, OrchestratorDispatchError);
+      assert.include(String(mismatched.cause), "cannot run behind active provider instance");
     }),
   );
 
@@ -2052,6 +2481,87 @@ it.layer(TestLayer)("OrchestrationV2LayerLive lifecycle", (it) => {
 
       const afterPromotion = yield* orchestrator.getThreadProjection(threadId);
       assert.equal(afterPromotion.runs.find((run) => run.id === queuedRun.id)?.status, "cancelled");
+    }),
+  );
+
+  it.effect("starts one queued successor after every compact terminal state", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* OrchestratorV2;
+      const eventSink = yield* EventSinkV2;
+      const outbox = yield* EffectOutboxV2;
+
+      for (const terminalStatus of ["completed", "failed", "interrupted"] as const) {
+        const threadId = ThreadId.make(`runtime-compact-terminal-${terminalStatus}`);
+        const { run: compactRun } = yield* startRunningMessage({
+          orchestrator,
+          eventSink,
+          threadId,
+          text: "/compact",
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`runtime-compact-terminal-queued-${terminalStatus}`),
+          threadId,
+          messageId: MessageId.make(`runtime-compact-terminal-queued-${terminalStatus}`),
+          text: `Continue after compact ${terminalStatus}.`,
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          deliveryIntent: "auto",
+        });
+        const before = yield* orchestrator.getThreadProjection(threadId);
+        const queuedRun = before.runs.find((run) => run.status === "queued");
+        assert.isDefined(queuedRun);
+
+        const promotedRunIds = yield* Queue.unbounded<RunId>();
+        const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
+        yield* eventSink.stream({ threadId, afterSequence }).pipe(
+          Stream.runForEach((stored) =>
+            stored.event.type === "run.updated" && stored.event.payload.status === "starting"
+              ? Queue.offer(promotedRunIds, stored.event.payload.id)
+              : Effect.void,
+          ),
+          Effect.forkScoped,
+        );
+
+        const terminalAt = yield* DateTime.now;
+        yield* eventSink.write({
+          commandId: CommandId.make(`runtime-compact-terminal-write-${terminalStatus}`),
+          events: [
+            {
+              id: EventId.make(`runtime-compact-terminal-event-${terminalStatus}`),
+              type: "run.updated",
+              threadId,
+              runId: compactRun.id,
+              ...(compactRun.rootNodeId === null ? {} : { nodeId: compactRun.rootNodeId }),
+              providerInstanceId: compactRun.providerInstanceId,
+              occurredAt: terminalAt,
+              payload: {
+                ...compactRun,
+                status: terminalStatus,
+                completedAt: terminalAt,
+              },
+            },
+          ],
+        });
+
+        assert.equal(yield* Queue.take(promotedRunIds), queuedRun.id);
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        assert.equal(after.runs.find((run) => run.id === compactRun.id)?.status, terminalStatus);
+        assert.equal(after.runs.find((run) => run.id === queuedRun.id)?.status, "starting");
+
+        const startCommandId = CommandId.make(`command:system:start-queued:${queuedRun.id}`);
+        assert.deepEqual(
+          (yield* outbox.listByCommandId(startCommandId)).map((effect) => effect.request),
+          [{ type: "provider-turn.start", runId: queuedRun.id }],
+        );
+        assert.equal(yield* orchestrator.resumeQueuedRuns, 0);
+        assert.deepEqual(
+          (yield* outbox.listByCommandId(startCommandId)).map((effect) => effect.request),
+          [{ type: "provider-turn.start", runId: queuedRun.id }],
+        );
+      }
     }),
   );
 

@@ -653,12 +653,6 @@ it.effect("keeps native maintenance commands out of steering and restart message
           next: "Continue with the parser",
           mode: "steer_active",
         },
-        {
-          name: "steer-compaction",
-          first: "/compact",
-          next: "Continue with the parser",
-          mode: "steer_active",
-        },
       ] as const) {
         const launched = yield* launches.launch(
           launchInput({
@@ -693,6 +687,52 @@ it.effect("keeps native maintenance commands out of steering and restart message
         assert.deepEqual(after.thread.titleRegeneration, before.thread.titleRegeneration);
         assert.deepEqual(yield* outbox.listByCommandId(commandId), []);
       }
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+
+it.effect("queues a message behind starting context compaction", () =>
+  Effect.gen(function* () {
+    const harness = makeHarness();
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const launched = yield* launches.launch(
+        launchInput({
+          command: "steer-compaction:launch",
+          thread: "steer-compaction",
+          message: "/compact",
+        }),
+      );
+      const before = yield* threads.getThreadProjection(launched.threadId);
+      const targetRun = before.runs[0];
+      if (targetRun === undefined) return yield* Effect.die("Launch must create a run");
+      const commandId = CommandId.make("steer-compaction:message");
+
+      yield* threads.dispatch({
+        type: "message.dispatch",
+        commandId,
+        threadId: launched.threadId,
+        messageId: MessageId.make("steer-compaction:message"),
+        createdBy: "user",
+        creationSource: "web",
+        text: "Continue with the parser",
+        attachments: [],
+        dispatchMode: { type: "steer_active", targetRunId: targetRun.id },
+      });
+
+      const after = yield* threads.getThreadProjection(launched.threadId);
+      assert.deepEqual(
+        after.runs.map((run) => run.status),
+        ["starting", "queued"],
+      );
+      assert.deepEqual(
+        (yield* outbox.listByCommandId(commandId)).filter((effect) =>
+          effect.request.type.startsWith("provider-turn."),
+        ),
+        [],
+      );
     }).pipe(Effect.provide(harness.layer));
   }),
 );

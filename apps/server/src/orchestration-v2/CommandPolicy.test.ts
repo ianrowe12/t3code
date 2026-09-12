@@ -1,11 +1,14 @@
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  MessageId,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ThreadProjection,
   ProviderInstanceId,
   ProviderSessionId,
   ProviderThreadId,
+  ProviderTurnId,
+  RunAttemptId,
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -16,6 +19,7 @@ import { CursorProviderCapabilitiesV2 } from "./Adapters/CursorAdapterV2.ts";
 import { GrokProviderCapabilitiesV2 } from "./Adapters/GrokAdapterV2.ts";
 import {
   CommandPolicyCapabilityUnsupportedError,
+  CommandPolicyUnsupportedError,
   CommandPolicyV2,
   layer as commandPolicyLayer,
   resolveMessageDispatchIntent,
@@ -24,6 +28,10 @@ import {
 const commandId = CommandId.make("command-policy-test");
 const threadId = ThreadId.make("command-policy-thread");
 const activeRunId = RunId.make("command-policy-active-run");
+const modelSelection = {
+  instanceId: ProviderInstanceId.make("codex"),
+  model: "gpt-5.4",
+};
 
 const baseCapabilities: OrchestrationV2ProviderCapabilities = CodexProviderCapabilitiesV2;
 
@@ -49,6 +57,45 @@ function dispatchProjection(
       sessionCapabilities === undefined
         ? []
         : [{ id: providerSessionId, capabilities: sessionCapabilities }],
+  } as unknown as OrchestrationV2ThreadProjection;
+}
+
+function decisionProjection(input: {
+  readonly text: string;
+  readonly attachments?: ReadonlyArray<unknown>;
+  readonly status?: "preparing" | "starting" | "running" | "waiting";
+  readonly withProviderTurn?: boolean;
+}): OrchestrationV2ThreadProjection {
+  const activeAttemptId = RunAttemptId.make("command-policy-decision-attempt");
+  const activeMessageId = MessageId.make("command-policy-decision-message");
+  const withProviderTurn = input.withProviderTurn ?? true;
+  return {
+    thread: { id: threadId, modelSelection },
+    runs: [
+      {
+        id: activeRunId,
+        status: input.status ?? "running",
+        activeAttemptId: withProviderTurn ? activeAttemptId : null,
+        userMessageId: activeMessageId,
+      },
+    ],
+    messages: [
+      {
+        id: activeMessageId,
+        role: "user",
+        text: input.text,
+        attachments: input.attachments ?? [],
+      },
+    ],
+    providerTurns: withProviderTurn
+      ? [
+          {
+            id: ProviderTurnId.make("command-policy-decision-turn"),
+            runAttemptId: activeAttemptId,
+            status: "running",
+          },
+        ]
+      : [],
   } as unknown as OrchestrationV2ThreadProjection;
 }
 
@@ -122,6 +169,139 @@ it("targets the latest active run for explicit steer and restart intent", () => 
 const layer = it.layer(commandPolicyLayer);
 
 layer("CommandPolicyV2", (it) => {
+  it.effect("queues a targeted message while context compaction is active", () =>
+    Effect.gen(function* () {
+      const policy = yield* CommandPolicyV2;
+
+      const result = yield* policy.decideMessageDispatch({
+        commandId,
+        projection: decisionProjection({ text: " /COMPACT " }),
+        requestedMode: { type: "steer_active", targetRunId: activeRunId },
+        capabilities: baseCapabilities,
+      });
+
+      assert.deepEqual(result, { type: "queue_after_active", activeRunId });
+    }),
+  );
+
+  it.effect("queues behind preparing and starting compaction without a provider turn", () =>
+    Effect.gen(function* () {
+      const policy = yield* CommandPolicyV2;
+
+      for (const status of ["preparing", "starting"] as const) {
+        for (const requestedMode of [
+          { type: "steer_active" as const, targetRunId: activeRunId },
+          { type: "restart_active" as const, targetRunId: activeRunId },
+          { type: "start_immediately" as const },
+        ]) {
+          const result = yield* policy.decideMessageDispatch({
+            commandId,
+            projection: decisionProjection({
+              text: "/compact",
+              status,
+              withProviderTurn: false,
+            }),
+            requestedMode,
+            capabilities: baseCapabilities,
+          });
+
+          assert.deepEqual(result, { type: "queue_after_active", activeRunId });
+        }
+      }
+    }),
+  );
+
+  it.effect("rejects stale explicit targets before compact queue conversion", () =>
+    Effect.gen(function* () {
+      const policy = yield* CommandPolicyV2;
+      const staleRunId = RunId.make("command-policy-stale-run");
+
+      for (const requestedMode of [
+        { type: "steer_active" as const, targetRunId: staleRunId },
+        { type: "restart_active" as const, targetRunId: staleRunId },
+      ]) {
+        const error = yield* policy
+          .decideMessageDispatch({
+            commandId,
+            projection: decisionProjection({ text: "/compact" }),
+            requestedMode,
+            capabilities: baseCapabilities,
+          })
+          .pipe(Effect.flip);
+
+        assert.instanceOf(error, CommandPolicyUnsupportedError);
+        assert.equal(error.requestedMode, requestedMode.type);
+      }
+    }),
+  );
+
+  it.effect("does not treat logout, compact arguments, or compact attachments as compaction", () =>
+    Effect.gen(function* () {
+      const policy = yield* CommandPolicyV2;
+
+      for (const input of [
+        { text: "/logout", attachments: [] },
+        { text: "/compact preserve the summary", attachments: [] },
+        { text: "/compact", attachments: [{}] },
+      ]) {
+        const result = yield* policy.decideMessageDispatch({
+          commandId,
+          projection: decisionProjection(input),
+          requestedMode: { type: "steer_active", targetRunId: activeRunId },
+          capabilities: baseCapabilities,
+        });
+
+        assert.equal(result.type, "steer_active");
+      }
+    }),
+  );
+
+  it.effect("starts immediately when no run is active", () =>
+    Effect.gen(function* () {
+      const policy = yield* CommandPolicyV2;
+      const projection = {
+        thread: { id: threadId, modelSelection },
+        runs: [],
+        messages: [],
+        providerTurns: [],
+      } as unknown as OrchestrationV2ThreadProjection;
+
+      const result = yield* policy.decideMessageDispatch({
+        commandId,
+        projection,
+        requestedMode: { type: "start_immediately" },
+        capabilities: baseCapabilities,
+      });
+
+      assert.deepEqual(result, { type: "start_run", modelSelection });
+    }),
+  );
+
+  it.effect("rejects compact queue conversion without queued-message support", () =>
+    Effect.gen(function* () {
+      const policy = yield* CommandPolicyV2;
+      const unsupportedCapabilities = capabilities((current) => ({
+        ...current,
+        turns: {
+          ...current.turns,
+          supportsQueuedMessages: false,
+        },
+      }));
+
+      const error = yield* policy
+        .decideMessageDispatch({
+          commandId,
+          projection: decisionProjection({ text: "/compact" }),
+          requestedMode: { type: "restart_active", targetRunId: activeRunId },
+          capabilities: unsupportedCapabilities,
+        })
+        .pipe(Effect.flip);
+
+      assert.instanceOf(error, CommandPolicyCapabilityUnsupportedError);
+      assert.equal(error.capability, "queued_messages");
+    }),
+  );
+
   it.effect("prefers direct active steering when the provider supports it", () =>
     Effect.gen(function* () {
       const policy = yield* CommandPolicyV2;

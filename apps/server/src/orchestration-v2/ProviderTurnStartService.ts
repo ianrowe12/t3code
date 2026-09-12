@@ -27,6 +27,7 @@ import {
   providerMessageWithContextHandoffs,
 } from "./ContextHandoffService.ts";
 import { IdAllocatorV2 } from "./IdAllocator.ts";
+import { isCompactCommand } from "./MaintenanceCommand.ts";
 import { ProjectionStoreV2 } from "./ProjectionStore.ts";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { makeProviderFailure } from "./ProviderFailure.ts";
@@ -146,12 +147,9 @@ export const layer: Layer.Layer<
       }
       if (message.attachments.length === 0 && message.text.trimStart().startsWith("/")) {
         const isEmptyCompaction =
-          message.text.trim().toLowerCase() === "/compact" &&
+          isCompactCommand(message) &&
           !projection.messages.some(
-            (candidate) =>
-              candidate.role === "user" &&
-              (candidate.text.trim().toLowerCase() !== "/compact" ||
-                candidate.attachments.length > 0),
+            (candidate) => candidate.role === "user" && !isCompactCommand(candidate),
           );
         // Preparing a run may already point the thread at a newly selected
         // provider. Account commands still belong to its last native session.

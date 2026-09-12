@@ -56,6 +56,7 @@ import { isUndeliveredMailboxSteer } from "./NotificationMailbox.ts";
 import { EventSinkV2 } from "./EventSink.ts";
 import type { OrchestrationEffectRequestV2, PendingOrchestrationEffectV2 } from "./EffectOutbox.ts";
 import { IdAllocatorV2 } from "./IdAllocator.ts";
+import { isCompactCommand, isNativeMaintenanceCommand } from "./MaintenanceCommand.ts";
 import {
   ThreadCommandExecutor,
   layer as threadCommandExecutorLayer,
@@ -250,16 +251,6 @@ export class OrchestratorV2 extends Context.Service<OrchestratorV2, Orchestrator
 
 function nextRunOrdinal(projection: OrchestrationV2ThreadProjection): number {
   return projection.runs.length + 1;
-}
-
-function isNativeMaintenanceCommand(message: {
-  readonly text: string;
-  readonly attachments: ReadonlyArray<ChatAttachment>;
-}): boolean {
-  return (
-    message.attachments.length === 0 &&
-    ["/compact", "/logout"].includes(message.text.trim().toLowerCase())
-  );
 }
 
 const threadPullRequestLinksEqual = Schema.toEquivalence(Schema.NullOr(ThreadLinkedPullRequest));
@@ -2605,10 +2596,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         return yield* new OrchestratorDispatchError({
           commandId: input.command.commandId,
           commandType: input.command.type,
-          cause:
-            input.text.trim().toLowerCase() === "/compact"
-              ? "Context compaction must run as a separate turn. Queue it or wait for the active turn to finish."
-              : "Signing out must run as a separate turn. Queue it or wait for the active turn to finish.",
+          cause: isCompactCommand(input)
+            ? "Context compaction must run as a separate turn. Queue it or wait for the active turn to finish."
+            : "Signing out must run as a separate turn. Queue it or wait for the active turn to finish.",
         });
       }
       const targetMessage = input.projection.messages.find(
@@ -2618,10 +2608,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         return yield* new OrchestratorDispatchError({
           commandId: input.command.commandId,
           commandType: input.command.type,
-          cause:
-            targetMessage.text.trim().toLowerCase() === "/compact"
-              ? "Wait for context compaction to finish before steering the thread."
-              : "Wait for sign-out to finish before steering the thread.",
+          cause: isCompactCommand(targetMessage)
+            ? "Wait for context compaction to finish before steering the thread."
+            : "Wait for sign-out to finish before steering the thread.",
         });
       }
       const rootNodeId = targetRun.rootNodeId;
@@ -3341,6 +3330,51 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         command.dispatchMode,
         command.deliveryIntent,
       );
+      const activeCompactionRun = projection.runs.find(isBlockingRun);
+      const activeCompactionMessage = projection.messages.find(
+        (message) => message.id === activeCompactionRun?.userMessageId,
+      );
+      if (
+        activeCompactionRun !== undefined &&
+        activeCompactionMessage !== undefined &&
+        isCompactCommand(activeCompactionMessage) &&
+        dispatchMode.type !== "defer_start"
+      ) {
+        const activeProviderThread = projection.providerThreads.find(
+          (candidate) => candidate.id === activeCompactionRun.providerThreadId,
+        );
+        const activeProviderSession =
+          activeProviderThread?.providerSessionId == null
+            ? undefined
+            : projection.providerSessions.find(
+                (candidate) => candidate.id === activeProviderThread.providerSessionId,
+              );
+        const activeCapabilities =
+          activeProviderSession?.capabilities ??
+          (yield* providerAdapters.get(activeCompactionRun.providerInstanceId).pipe(
+            Effect.flatMap((adapter) => adapter.getCapabilities()),
+            Effect.mapError(
+              (cause) =>
+                new OrchestratorProviderAdapterError({
+                  commandId: command.commandId,
+                  providerInstanceId: activeCompactionRun.providerInstanceId,
+                  cause,
+                }),
+            ),
+          ));
+        const decision = yield* enforceCommandPolicy(command)(
+          commandPolicy.decideMessageDispatch({
+            commandId: command.commandId,
+            projection,
+            requestedModelSelection: modelSelection,
+            requestedMode: dispatchMode,
+            capabilities: activeCapabilities,
+          }),
+        );
+        if (decision.type === "queue_after_active") {
+          dispatchMode = { type: "queue_after_active" };
+        }
+      }
       if (dispatchMode.type === "steer_active") {
         const targetRunId = dispatchMode.targetRunId;
         const target = projection.runs.find((run) => run.id === targetRunId);
