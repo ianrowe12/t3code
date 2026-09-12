@@ -1,0 +1,239 @@
+name: Independent Review Gate
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, labeled, unlabeled, ready_for_review, edited]
+  issue_comment:
+    types: [created, edited, deleted]
+  workflow_run:
+    workflows: [Independent Review Events]
+    types: [completed]
+
+permissions:
+  pull-requests: read
+  issues: read
+
+jobs:
+  targets:
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      github.event.issue.pull_request ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request_review')
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 5
+    outputs:
+      numbers: ${{ steps.targets.outputs.result }}
+    steps:
+      # Never check out PR code or consume artifacts in this privileged workflow.
+      - id: targets
+        uses: actions/github-script@v8
+        with:
+          script: |
+            if (context.eventName === "pull_request_target") {
+              return [context.payload.pull_request.number];
+            }
+            if (context.eventName === "issue_comment") {
+              return [context.payload.issue.number];
+            }
+            const attached = context.payload.workflow_run.pull_requests;
+            if (attached?.length) {
+              return [...new Set(attached.map((pr) => pr.number))];
+            }
+            // Fork workflow_run payloads can omit pull_requests. Reconcile open
+            // PRs from the API rather than trusting an artifact or guessing a head.
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              ...context.repo,
+              state: "open",
+              per_page: 100,
+            });
+            return pulls.map((pr) => pr.number);
+
+  gate:
+    needs: targets
+    if: needs.targets.outputs.numbers != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        number: ${{ fromJSON(needs.targets.outputs.numbers) }}
+    concurrency:
+      group: independent-review-${{ matrix.number }}
+      cancel-in-progress: false
+      queue: max
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+      pull-requests: read
+      issues: read
+    steps:
+      - name: Evaluate independent-review status
+        uses: actions/github-script@v8
+        env:
+          PR_NUMBER: ${{ matrix.number }}
+        with:
+          # GET retries are bounded below. Never retry a possibly accepted POST.
+          retries: 0
+          script: |
+            const number = Number(process.env.PR_NUMBER);
+            if (!Number.isSafeInteger(number) || number <= 0) {
+              throw new Error("PR_NUMBER must be a positive integer");
+            }
+            const params = { ...context.repo, pull_number: number, request: { timeout: 30000 } };
+            const transientCodes = new Set([
+              "ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT", "EAI_AGAIN",
+              "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT",
+            ]);
+            function transient(error) {
+              if ([502, 503, 504].includes(error.status)) return true;
+              return transientCodes.has(error.code) ||
+                (error.cause != null && transientCodes.has(error.cause.code));
+            }
+            async function read(operation) {
+              for (let attempt = 0; ; attempt++) {
+                try {
+                  return await operation();
+                } catch (error) {
+                  if (attempt === 3 || !transient(error)) throw error;
+                  await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** attempt));
+                }
+              }
+            }
+            function parse(body, timestamp, id) {
+              // Only plain lines count. Ignore fenced examples, including their
+              // head lines, so a pasted protocol block cannot approve a PR.
+              let fence;
+              const lines = [];
+              const original = (body ?? "").split(/\r?\n/);
+              for (const [index, line] of original.entries()) {
+                const delimiter = /^[ \t]*(`{3,}|~{3,})/.exec(line);
+                if (fence) {
+                  if (new RegExp(`^[ \\t]*${fence.char}{${fence.length},}[ \\t]*$`).test(line)) {
+                    fence = undefined;
+                  }
+                } else if (delimiter) {
+                  fence = { char: delimiter[1][0], length: delimiter[1].length };
+                } else {
+                  lines.push({ text: line, index });
+                }
+              }
+              const markers = lines.filter((line) => /^[ \t]*(?:independent review )?verdict\b/i.test(line.text));
+              if (!markers.length) return null;
+              const heads = lines.filter((line) => /^[ \t]*Reviewed head:/i.test(line.text));
+              const head = heads.length === 1 && /^Reviewed head:[ \t]*([0-9a-f]{40})[ \t]*$/i.exec(heads[0].text);
+              const marker = markers.length === 1 &&
+                /^Independent review verdict: (APPROVE|REQUEST CHANGES)[ \t]*$/i.exec(markers[0].text);
+              const finalIndex = original.findLastIndex((line) => line.trim() !== "");
+              return {
+                id, timestamp,
+                head: head ? head[1].toLowerCase() : null,
+                direction: marker && markers[0].index === finalIndex ? marker[1].toUpperCase() : "INVALID",
+              };
+            }
+            async function reviews() {
+              const results = [];
+              let cursor = null;
+              do {
+                // REST review lists omit edit timestamps. updatedAt orders edited
+                // reviews against comments without trusting the triggering event.
+                const data = await read(() => github.graphql(`
+                  query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+                    repository(owner: $owner, name: $repo) {
+                      pullRequest(number: $number) {
+                        reviews(first: 100, after: $cursor) {
+                          nodes { databaseId body state updatedAt }
+                          pageInfo { hasNextPage endCursor }
+                        }
+                      }
+                    }
+                  }`, { ...context.repo, number, cursor, request: { timeout: 30000 } }));
+                const page = data.repository.pullRequest.reviews;
+                results.push(...page.nodes);
+                if (!page.pageInfo.hasNextPage) return results;
+                if (!page.pageInfo.endCursor || page.pageInfo.endCursor === cursor) {
+                  throw new Error("Review pagination did not advance");
+                }
+                cursor = page.pageInfo.endCursor;
+              } while (true);
+            }
+            async function evaluate() {
+              const { data: pr } = await read(() => github.rest.pulls.get(params));
+              if (pr.state !== "open") return null;
+              const sha = pr.head.sha.toLowerCase();
+              if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error("Invalid PR head SHA");
+              const labels = pr.labels.map((label) => label.name).sort();
+              const comments = await read(() => github.paginate(github.rest.issues.listComments, {
+                ...context.repo, issue_number: number, per_page: 100, request: { timeout: 30000 },
+              }));
+              const records = [
+                ...comments.map((comment) => parse(
+                  comment.body, comment.updated_at || comment.created_at, `comment:${comment.id}`,
+                )),
+                ...(await reviews())
+                  .filter((review) => !["DISMISSED", "PENDING"].includes(review.state))
+                  .map((review) => parse(review.body, review.updatedAt, `review:${review.databaseId}`)),
+              ].filter(Boolean).sort((a, b) => a.id.localeCompare(b.id));
+              let state = "failure";
+              let description = "No independent review verdict on this PR yet";
+              const relevant = records.filter((record) => record.head === sha || record.head === null);
+              if (labels.includes("independent-review-exempt")) {
+                state = "success";
+                description = "Exempt via independent-review-exempt label";
+              } else if (relevant.length) {
+                if (relevant.some((record) => !record.timestamp || !Number.isFinite(Date.parse(record.timestamp)))) {
+                  description = "Verdict timestamp unavailable; re-review required";
+                } else {
+                  const latest = Math.max(...relevant.map((record) => Date.parse(record.timestamp)));
+                  const current = relevant.filter((record) => Date.parse(record.timestamp) === latest);
+                  const directions = new Set(current.map((record) => record.direction));
+                  if (current.some((record) => record.head === null)) {
+                    description = "Verdict must name exactly one full Reviewed head SHA";
+                  } else if (directions.size > 1) {
+                    description = "Conflicting independent review verdicts at latest timestamp";
+                  } else if (directions.has("APPROVE")) {
+                    state = "success";
+                    description = "Independent review approved for current head";
+                  } else if (directions.has("REQUEST CHANGES")) {
+                    description = "Independent review requested changes for current head";
+                  } else {
+                    description = "Verdict must have exactly one final independent review marker";
+                  }
+                }
+              } else if (records.length) {
+                description = "No verdict names the current head SHA; re-review required";
+              }
+              return { sha, state, description, generation: JSON.stringify([sha, labels, records]) };
+            }
+            async function post(decision) {
+              await github.rest.repos.createCommitStatus({
+                ...context.repo,
+                sha: decision.sha,
+                state: decision.state,
+                context: "Independent Review",
+                description: decision.description,
+                target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/blob/main/docs/agents/independent-review.md`,
+                request: { timeout: 30000 },
+              });
+              core.info(`Independent Review on ${decision.sha}: ${decision.state} (${decision.description})`);
+            }
+            let decision = await evaluate();
+            if (!decision) {
+              core.info(`PR #${number} is closed; skipping status update.`);
+              return;
+            }
+            for (let attempt = 0; attempt < 5; attempt++) {
+              const current = await evaluate();
+              if (!current) return;
+              if (current.generation !== decision.generation) {
+                decision = current;
+                continue;
+              }
+              await post(current);
+              return;
+            }
+            const { data: pr } = await read(() => github.rest.pulls.get(params));
+            if (pr.state === "open") {
+              await post({
+                sha: pr.head.sha, state: "failure",
+                description: "Verdicts changed during evaluation; retry required",
+              });
+            }
