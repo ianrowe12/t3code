@@ -3,6 +3,7 @@ import {
   normalizeDevinToolCall,
   extractDevinSubagentUpdate,
 } from "./DevinAcp.ts";
+import { extractCopilotSubagentEndNotice, extractCopilotSubagentUpdates } from "./CopilotAcp.ts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
@@ -100,6 +101,7 @@ const serverConfigLayer = ServerConfig.layerTest(process.cwd(), {
 const testLayer = Layer.mergeAll(NodeServices.layer, idAllocatorLayer, serverConfigLayer);
 const ACP_TEST_DRIVER = ProviderDriverKind.make("acp-test");
 const decodeUnknownJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
+const encodeUnknownJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 describe("acpProjectedCommandExitCode", () => {
   const successOutput = { type: "Bash", exit_code: 0 };
@@ -992,6 +994,288 @@ describe("AcpAdapterV2", () => {
       assert.equal(parentTools.length, 1);
       assert.equal(parentTools[0]?.title, "Parent tool finished");
     }).pipe(Effect.provide(testLayer), Effect.scoped),
+  );
+
+  it.effect(
+    "projects Copilot native child lifecycle across parent turns without inventing ACP sessions",
+    () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const mockAgentPath = yield* path.fromFileUrl(
+          new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+        );
+        type Runtime = AcpSessionRuntime.AcpSessionRuntime["Service"];
+        let handler: Parameters<Runtime["handleSessionUpdate"]>[0] | undefined;
+        let updates: ReadonlyArray<EffectAcpSchema.SessionUpdate> = [];
+        const instanceId = ProviderInstanceId.make("copilot-lifecycle");
+        const adapter = makeAcpAdapterV2({
+          instanceId,
+          crypto: yield* Crypto.Crypto,
+          fileSystem: yield* FileSystem.FileSystem,
+          idAllocator: yield* IdAllocatorV2,
+          serverConfig: yield* ServerConfig,
+          flavor: {
+            driver: ACP_TEST_DRIVER,
+            capabilities: AcpProviderCapabilitiesV2,
+            retainSubagentsAcrossTurns: true,
+            extractSubagentUpdates: extractCopilotSubagentUpdates,
+            extractSubagentEndNotice: extractCopilotSubagentEndNotice,
+            makeRuntime: makeMockRuntime({
+              childProcessSpawner: yield* ChildProcessSpawner.ChildProcessSpawner,
+              mockAgentPath,
+              wrapRuntime: (runtime) => ({
+                ...runtime,
+                handleSessionUpdate: (next) =>
+                  Effect.sync(() => {
+                    handler = next;
+                  }).pipe(Effect.andThen(runtime.handleSessionUpdate(next))),
+                prompt: () =>
+                  Effect.gen(function* () {
+                    assert.isDefined(handler);
+                    for (const update of updates) {
+                      yield* handler!({ sessionId: "mock-session-1", update });
+                    }
+                    return { stopReason: "end_turn" as const };
+                  }),
+              }),
+            }),
+          },
+        });
+        const threadId = ThreadId.make("copilot-lifecycle-parent");
+        const modelSelection = { instanceId, model: "default" };
+        const runtimePolicy = ProviderAdapterV2RuntimePolicy.make({
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          cwd: process.cwd(),
+        });
+        const runtime = yield* adapter.openSession({
+          threadId,
+          providerSessionId: ProviderSessionId.make("copilot-lifecycle-session"),
+          modelSelection,
+          runtimePolicy,
+        });
+        const providerThread = yield* runtime.ensureThread({
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        assert.isDefined(runtime.hasPendingBackgroundWork);
+        const events: ProviderAdapterV2Event[] = [];
+        let ordinal = 0;
+        const run = Effect.fnUntraced(function* (
+          next: ReadonlyArray<EffectAcpSchema.SessionUpdate>,
+        ) {
+          updates = next;
+          yield* runtime.startTurn(
+            makeTurnInput({
+              threadId,
+              providerThread,
+              instanceId,
+              runtimePolicy,
+              modelSelection,
+              ordinal: ++ordinal,
+              now: yield* DateTime.now,
+            }),
+          );
+          const emitted = Array.from(
+            yield* runtime.events.pipe(
+              Stream.takeUntil((event) => event.type === "turn.terminal"),
+              Stream.runCollect,
+            ),
+          );
+          events.push(...emitted);
+          return emitted;
+        });
+        const tasks = () =>
+          events.flatMap((event) => (event.type === "subagent.updated" ? [event.subagent] : []));
+        const agentId = "c5dc746c-ebda-449a-99dd-180f6ed7a63e";
+        const prompt = "Inspect the fixture.";
+        const launchInput = {
+          prompt,
+          agent_type: "general-purpose",
+          name: "fixture-child",
+          description: "Inspect fixture",
+          mode: "background",
+          model: "gpt-6-astra",
+        };
+        const launchOutput = {
+          content: `Agent started in background with agent_id: ${agentId}. You'll be notified when it completes.`,
+        };
+        const frame = (
+          toolCallId: string,
+          title: string,
+          rawInput: unknown,
+          content: string,
+        ): EffectAcpSchema.SessionUpdate => ({
+          sessionUpdate: "tool_call",
+          toolCallId,
+          title,
+          kind: title === "read_agent" ? "read" : "other",
+          status: "completed",
+          rawInput,
+          rawOutput: { content },
+        });
+        // Copilot emits read_agent with kind "read"; session IDs and result bodies are fixtures.
+        const idle = `Agent is idle (waiting for messages). agent_id: ${agentId}, agent_type: general-purpose, status: idle, description: Prepare native Mac build, elapsed: 425s, total_turns: 3, model: gpt-6-astra`;
+        const delivered = `Message delivered to agent ${agentId}. Use read_agent to check the agent's response.`;
+        yield* run([
+          {
+            sessionUpdate: "tool_call",
+            toolCallId: "launch",
+            title: "Inspect fixture",
+            kind: "other",
+            status: "in_progress",
+            rawInput: launchInput,
+          },
+          {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "launch",
+            status: "completed",
+            rawOutput: launchOutput,
+          },
+          {
+            sessionUpdate: "tool_call_update",
+            toolCallId: "launch",
+            status: "completed",
+            rawOutput: launchOutput,
+          },
+        ]);
+        const initial = tasks()[0]!;
+        assert.equal(initial.status, "running");
+        assert.equal(tasks().at(-1)?.nativeTaskRef?.nativeId, agentId);
+        assert.equal(tasks().at(-1)?.status, "running");
+        assert.equal(tasks().at(-1)?.completedAt, null);
+        assert.equal(new Set(tasks().map((task) => task.id)).size, 1);
+        assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+
+        // Proves the existing ACP user-message seam, not that the CLI emits this frame.
+        yield* handler!({
+          sessionId: "mock-session-1",
+          update: {
+            sessionUpdate: "user_message_chunk",
+            content: {
+              type: "text",
+              text: `Agent "t3-desktop" (general-purpose) has finished processing and is now idle. Use read_agent with agent_id "${agentId}" to read the results, or write_agent to send follow-up messages.`,
+            },
+          },
+        });
+        events.push(
+          ...Array.from(
+            yield* runtime.events.pipe(
+              Stream.takeUntil(
+                (event) => event.type === "subagent.updated" && event.subagent.status === "idle",
+              ),
+              Stream.runCollect,
+            ),
+          ),
+        );
+        assert.equal(tasks().at(-1)?.status, "idle");
+        assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+
+        const firstRead = frame(
+          "read-1",
+          "read_agent",
+          { agent_id: agentId },
+          `${idle}\n\n[Turn 0]\nFIRST`,
+        );
+        yield* run([firstRead, firstRead]);
+        assert.equal(tasks().at(-1)?.result, "FIRST");
+        const childThreadId = tasks().at(-1)?.childThreadId;
+        assert.equal(childThreadId, initial.childThreadId);
+        assert.equal(tasks().at(-1)?.providerThreadId, null);
+        assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+
+        const write = frame(
+          "write-1",
+          "write_agent",
+          { agent_id: agentId, message: "Continue." },
+          delivered,
+        );
+        yield* run([write, write]);
+        assert.equal(tasks().at(-1)?.status, "pending");
+        assert.equal(tasks().at(-1)?.result, null);
+        assert.equal(tasks().at(-1)?.completedAt, null);
+        assert.isTrue(yield* runtime.hasPendingBackgroundWork!);
+
+        const secondRead = frame(
+          "read-2",
+          "read_agent",
+          { agent_id: agentId },
+          `${idle}\n\n[Turn 0]\nFIRST\n\n[Turn 1]\n[Message]\nContinue.\n[Response]\nSECOND`,
+        );
+        yield* run([
+          frame(
+            "read-running",
+            "read_agent",
+            { agent_id: agentId },
+            encodeUnknownJson({ agent_id: agentId, status: "running" }),
+          ),
+          secondRead,
+          secondRead,
+        ]);
+        assert.equal(tasks().at(-1)?.status, "idle");
+        assert.equal(tasks().at(-1)?.result, "SECOND");
+        assert.isFalse(yield* runtime.hasPendingBackgroundWork!);
+
+        const beforeReplay = tasks().length;
+        yield* run([
+          write,
+          frame("launch", "Inspect fixture", launchInput, launchOutput.content),
+          frame(
+            "unknown",
+            "read_agent",
+            { agent_id: "unknown" },
+            encodeUnknownJson({
+              agent_id: "unknown",
+              status: "completed",
+              result: "Not our child",
+            }),
+          ),
+          {
+            sessionUpdate: "tool_call",
+            toolCallId: "shell",
+            title: "bash",
+            kind: "execute",
+            status: "completed",
+            rawInput: { command: "echo fixture" },
+            rawOutput: launchOutput,
+          },
+        ]);
+        assert.equal(tasks().length, beforeReplay);
+        yield* run([
+          frame(
+            "cancelled",
+            "read_agent",
+            { agent_id: agentId },
+            `Agent cancelled. agent_id: ${agentId}, agent_type: general-purpose, status: cancelled, description: Expose Copilot background agents, elapsed: 952s, total_turns: 0, model: gpt-6-astra\n\nError: Cancelled`,
+          ),
+        ]);
+        assert.equal(tasks().at(-1)?.status, "cancelled");
+        assert.equal(tasks().at(-1)?.result, "Cancelled");
+
+        assert.equal(events.filter((event) => event.type === "app_thread.created").length, 1);
+        assert.equal(new Set(tasks().map((task) => task.id)).size, 1);
+        assert.isTrue(tasks().every((task) => task.runId === initial.runId));
+        const messages = new Map(
+          events.flatMap((event) =>
+            event.type === "message.updated" && event.message.threadId === childThreadId
+              ? [[event.message.id, event.message.text] as const]
+              : [],
+          ),
+        );
+        assert.deepEqual(
+          [...messages.values()],
+          [prompt, "FIRST", "Continue.", "SECOND", "Cancelled"],
+        );
+        assert.isTrue(
+          events.some(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "file_search" &&
+              event.turnItem.nativeItemRef?.nativeId === "unknown",
+          ),
+        );
+      }).pipe(Effect.provide(testLayer), Effect.scoped),
   );
 
   it.effect("projects ACP v2 fidelity updates into first-class orchestration items", () =>

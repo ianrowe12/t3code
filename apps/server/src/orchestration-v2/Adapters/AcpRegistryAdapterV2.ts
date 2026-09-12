@@ -3,6 +3,7 @@ import {
   normalizeDevinToolCall,
   extractDevinSubagentUpdate,
 } from "./DevinAcp.ts";
+import { extractCopilotSubagentEndNotice, extractCopilotSubagentUpdates } from "./CopilotAcp.ts";
 import {
   AcpRegistrySettings,
   defaultInstanceIdForDriver,
@@ -48,6 +49,24 @@ export const ACP_REGISTRY_PROVIDER = ProviderDriverKind.make("acpRegistry");
 export const ACP_REGISTRY_DEFAULT_INSTANCE_ID = defaultInstanceIdForDriver(ACP_REGISTRY_PROVIDER);
 
 const DEFAULT_ACP_REGISTRY_SETTINGS = Schema.decodeSync(AcpRegistrySettings)({});
+const CopilotMcpServer = Schema.Struct({
+  type: Schema.optionalKey(Schema.Literal("stdio")),
+  command: Schema.String,
+  args: Schema.optionalKey(Schema.Array(Schema.String)),
+});
+const isCopilotMcpServer = Schema.is(CopilotMcpServer);
+const encodeCopilotMcpConfig = Schema.encodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      mcpServers: Schema.Struct({
+        "t3-code": Schema.Struct({
+          ...CopilotMcpServer.fields,
+          env: Schema.Struct({ ELECTRON_RUN_AS_NODE: Schema.Literal("1") }),
+        }),
+      }),
+    }),
+  ),
+);
 
 export interface AcpRegistryAdapterV2Options {
   readonly instanceId: Parameters<typeof makeAcpAdapterV2>[0]["instanceId"];
@@ -92,16 +111,39 @@ function makeAcpRegistryRuntime(options: AcpRegistryAdapterV2Options) {
               }),
           ),
         );
+      const t3McpServer =
+        resolved.agent.id === "github-copilot-cli"
+          ? runtimeInput.mcpServers.find((server) => server.name === "t3-code")
+          : undefined;
+      // Copilot 1.0.83 drops session-supplied MCP servers, but its native CLI
+      // accepts additional config. Credentials stay in the inherited environment.
+      const spawn = {
+        ...resolved.spawn,
+        ...(t3McpServer !== undefined && isCopilotMcpServer(t3McpServer)
+          ? {
+              args: [
+                ...resolved.spawn.args,
+                "--additional-mcp-config",
+                encodeCopilotMcpConfig({
+                  mcpServers: {
+                    "t3-code": {
+                      command: t3McpServer.command,
+                      ...(t3McpServer.args === undefined ? {} : { args: t3McpServer.args }),
+                      env: { ELECTRON_RUN_AS_NODE: "1" },
+                    },
+                  },
+                }),
+              ],
+            }
+          : {}),
+        ...(processEnvironment === undefined
+          ? {}
+          : { env: { ...resolved.spawn.env, ...processEnvironment } }),
+      };
       const context = yield* Layer.build(
         AcpSessionRuntime.layer({
           ...runtimeInput,
-          spawn:
-            processEnvironment === undefined
-              ? resolved.spawn
-              : {
-                  ...resolved.spawn,
-                  env: { ...resolved.spawn.env, ...processEnvironment },
-                },
+          spawn,
           ...(options.settings.authMethodId ? { authMethodId: options.settings.authMethodId } : {}),
         }).pipe(
           Layer.provide(
@@ -118,6 +160,7 @@ function makeAcpRegistryRuntime(options: AcpRegistryAdapterV2Options) {
 export function makeAcpRegistryAdapterV2(options: AcpRegistryAdapterV2Options) {
   const runtimeCoordinator = options.runtimeCoordinator;
   const isDevin = options.settings.agentId === "devin";
+  const isCopilot = options.settings.agentId === "github-copilot-cli";
   const flavor: AcpAdapterV2Flavor = {
     driver: ACP_REGISTRY_PROVIDER,
     capabilities: AcpProviderCapabilitiesV2,
@@ -130,6 +173,13 @@ export function makeAcpRegistryAdapterV2(options: AcpRegistryAdapterV2Options) {
           normalizeSessionUpdate: normalizeDevinSessionUpdate,
           normalizeToolCall: normalizeDevinToolCall,
           extractSubagentUpdate: extractDevinSubagentUpdate,
+        }
+      : {}),
+    ...(isCopilot
+      ? {
+          extractSubagentUpdates: extractCopilotSubagentUpdates,
+          extractSubagentEndNotice: extractCopilotSubagentEndNotice,
+          retainSubagentsAcrossTurns: true,
         }
       : {}),
     makeRuntime: options.makeRuntime ?? makeAcpRegistryRuntime(options),
