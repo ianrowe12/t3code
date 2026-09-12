@@ -277,6 +277,15 @@ export function resolveDraftHeroState(input: {
   );
 }
 
+export {
+  clearHeldThreadTimelineForEnvironment,
+  peekHeldThreadTimeline,
+  rememberReadyThreadTimeline,
+  resetHeldThreadTimeline,
+  resolveThreadSwitchTimeline,
+  timelineHasEphemeralPreviewUrls,
+} from "../heldThreadTimeline";
+
 export function resolveDraftPromotionNavigationTarget(input: {
   serverThreadRef: ScopedThreadRef | null;
   serverThread: Pick<Thread, "latestRun"> | null | undefined;

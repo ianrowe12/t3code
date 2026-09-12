@@ -63,6 +63,12 @@ import {
   resolveEffectiveInteractionMode,
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
+  clearHeldThreadTimelineForEnvironment,
+  peekHeldThreadTimeline,
+  rememberReadyThreadTimeline,
+  resetHeldThreadTimeline,
+  resolveThreadSwitchTimeline,
+  timelineHasEphemeralPreviewUrls,
   startNewThreadForProject,
   shouldShowBranchMismatchBanner,
   shouldShowPlanFollowUpPrompt,
@@ -208,6 +214,208 @@ const helloWorldTemplate: CodexArtifactTemplate = {
   skillDirectory: "/Users/test/.codex/skills/artifact-template-hello-world",
   skillName: "artifact-template-hello-world",
 };
+
+describe("resolveThreadSwitchTimeline", () => {
+  afterEach(() => {
+    resetHeldThreadTimeline();
+  });
+
+  const environmentOne = EnvironmentId.make("env-1");
+  const environmentTwo = EnvironmentId.make("env-2");
+  type TestTimelineSnapshot = {
+    threadKey: string;
+    environmentId: EnvironmentId;
+    entries: string[];
+    runs: string[];
+    attempts: string[];
+    providerStatuses: string[];
+    modelSelection: { provider: string; model: string } | null;
+    parentThreadLink: { threadId: string; title: string } | null;
+  };
+  const held: TestTimelineSnapshot = {
+    threadKey: "env-1:thread-a",
+    environmentId: environmentOne,
+    entries: ["a1", "a2"],
+    runs: ["run-a"],
+    attempts: ["attempt-a"],
+    providerStatuses: ["provider-a"],
+    modelSelection: { provider: "provider-a", model: "model-a" },
+    parentThreadLink: { threadId: "parent-a", title: "Parent A" },
+  };
+  const loadingDestination: TestTimelineSnapshot = {
+    threadKey: "env-1:thread-b",
+    environmentId: environmentOne,
+    entries: [] as string[],
+    runs: [] as string[],
+    attempts: [] as string[],
+    providerStatuses: [] as string[],
+    modelSelection: null,
+    parentThreadLink: null,
+  };
+
+  it("keeps one coherent previous display while the next thread is loading", () => {
+    expect(
+      resolveThreadSwitchTimeline({
+        loading: true,
+        activeThreadKey: "env-1:thread-b",
+        activeEnvironmentId: environmentOne,
+        current: loadingDestination,
+        held,
+      }),
+    ).toEqual({ snapshot: held, paintOnly: true });
+  });
+
+  it("shows the new thread once its detail is ready", () => {
+    const ready = { ...loadingDestination, entries: ["b1"] };
+    expect(
+      resolveThreadSwitchTimeline({
+        loading: false,
+        activeThreadKey: "env-1:thread-b",
+        activeEnvironmentId: environmentOne,
+        current: ready,
+        held,
+      }),
+    ).toEqual({ snapshot: ready, paintOnly: false });
+  });
+
+  it("never covers destination entries that arrive before loading settles", () => {
+    const partiallyReady = { ...loadingDestination, entries: ["b1"] };
+    expect(
+      resolveThreadSwitchTimeline({
+        loading: true,
+        activeThreadKey: "env-1:thread-b",
+        activeEnvironmentId: environmentOne,
+        current: partiallyReady,
+        held,
+      }),
+    ).toEqual({ snapshot: partiallyReady, paintOnly: false });
+  });
+
+  it("lets a loaded empty destination replace the held display", () => {
+    expect(
+      resolveThreadSwitchTimeline({
+        loading: false,
+        activeThreadKey: "env-1:thread-b",
+        activeEnvironmentId: environmentOne,
+        current: loadingDestination,
+        held,
+      }),
+    ).toEqual({ snapshot: loadingDestination, paintOnly: false });
+  });
+
+  it("does not invent a timeline on the first open of a thread", () => {
+    expect(
+      resolveThreadSwitchTimeline({
+        loading: true,
+        activeThreadKey: "env-1:thread-b",
+        activeEnvironmentId: environmentOne,
+        current: loadingDestination,
+        held: null,
+      }),
+    ).toEqual({ snapshot: loadingDestination, paintOnly: false });
+  });
+
+  it("never holds a timeline across environments", () => {
+    const destination = {
+      ...loadingDestination,
+      threadKey: "env-2:thread-b",
+      environmentId: environmentTwo,
+    };
+    expect(
+      resolveThreadSwitchTimeline({
+        loading: true,
+        activeThreadKey: destination.threadKey,
+        activeEnvironmentId: environmentTwo,
+        current: destination,
+        held,
+      }),
+    ).toEqual({ snapshot: destination, paintOnly: false });
+  });
+
+  it("keeps the full last-painted snapshot across a ChatView remount", () => {
+    expect(rememberReadyThreadTimeline(held)).toBe(true);
+    expect(peekHeldThreadTimeline<typeof held>()).toBe(held);
+    expect(
+      resolveThreadSwitchTimeline({
+        loading: true,
+        activeThreadKey: loadingDestination.threadKey,
+        activeEnvironmentId: environmentOne,
+        current: loadingDestination,
+      }),
+    ).toEqual({ snapshot: held, paintOnly: true });
+  });
+
+  it("retains only the latest painted timeline", () => {
+    const next = {
+      ...held,
+      threadKey: "env-1:thread-b",
+      entries: ["b1"],
+      runs: ["run-b"],
+    };
+    rememberReadyThreadTimeline(held);
+    rememberReadyThreadTimeline(next);
+    expect(peekHeldThreadTimeline<typeof next>()).toBe(next);
+  });
+
+  it.each(["file", "video", "snapshot", "annotation", "handoff"])(
+    "rejects blob-backed %s previews before caching",
+    (kind) => {
+      const unsafe = {
+        ...held,
+        entries: [
+          {
+            kind: "message",
+            attachment: {
+              type: kind,
+              previewUrl: `blob:${kind}`,
+            },
+          },
+        ],
+      };
+      expect(timelineHasEphemeralPreviewUrls(unsafe.entries)).toBe(true);
+      expect(rememberReadyThreadTimeline(unsafe)).toBe(false);
+      expect(peekHeldThreadTimeline()).toBeNull();
+    },
+  );
+
+  it("allows server-backed preview URLs", () => {
+    const safe = {
+      ...held,
+      entries: [
+        {
+          kind: "message",
+          attachment: {
+            type: "image",
+            previewUrl: "https://cdn.example/a.png",
+          },
+        },
+      ],
+    };
+    expect(timelineHasEphemeralPreviewUrls(safe.entries)).toBe(false);
+    expect(rememberReadyThreadTimeline(safe)).toBe(true);
+    expect(peekHeldThreadTimeline<typeof safe>()).toBe(safe);
+  });
+
+  it("does not replace the last paint with an empty timeline", () => {
+    rememberReadyThreadTimeline(held);
+    expect(rememberReadyThreadTimeline(loadingDestination)).toBe(false);
+    expect(peekHeldThreadTimeline<typeof held>()).toBe(held);
+  });
+
+  it("clears the held display explicitly", () => {
+    rememberReadyThreadTimeline(held);
+    resetHeldThreadTimeline();
+    expect(peekHeldThreadTimeline()).toBeNull();
+  });
+
+  it("clears only the environment being discarded", () => {
+    rememberReadyThreadTimeline(held);
+    clearHeldThreadTimelineForEnvironment(environmentTwo);
+    expect(peekHeldThreadTimeline<typeof held>()).toBe(held);
+    clearHeldThreadTimelineForEnvironment(environmentOne);
+    expect(peekHeldThreadTimeline()).toBeNull();
+  });
+});
 
 function makeThread(overrides: Partial<Thread> = {}): Thread {
   return makeThreadFixture({

@@ -1,5 +1,10 @@
 import { GitPullRequestIcon } from "lucide-react";
 import {
+  deriveTimelineMinimapItems,
+  resolveTimelineMinimapPreview,
+  type TimelineMinimapItem,
+} from "./timelineMinimapItems";
+import {
   type AssistantCitation,
   type EnvironmentId,
   type MessageId,
@@ -378,6 +383,8 @@ interface MessagesTimelineProps {
   historyControls?: MessagesTimelineHistoryControls;
   /** Non-null when older turns exist beyond the loaded window. */
   loadEarlier?: CitationHistoryPage | null;
+  /** Keeps the previous thread painted while the destination loads. */
+  paintOnly?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -432,22 +439,55 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   topFadeEnabled = false,
   historyControls,
   loadEarlier = null,
+  paintOnly = false,
 }: MessagesTimelineProps) {
-  const [expandedRunIds, setExpandedRunIds] = useState<ReadonlySet<RunId>>(new Set());
-  const [expandedAttemptIds, setExpandedAttemptIds] = useState<ReadonlySet<RunAttemptId>>(
-    new Set(),
+  const emptyDisclosureState = useMemo(
+    () => ({
+      threadKey: routeThreadKey,
+      expandedRunIds: new Set<RunId>(),
+      expandedAttemptIds: new Set<RunAttemptId>(),
+      expandedWorkGroupIds: new Set<string>(),
+    }),
+    [routeThreadKey],
   );
+  const [disclosureState, setDisclosureState] = useState(emptyDisclosureState);
+  const listIdentityRef = useRef(routeThreadKey);
+  const previousLatestRunRef = useRef(latestRun);
+  useLayoutEffect(() => {
+    if (listIdentityRef.current !== routeThreadKey) {
+      listIdentityRef.current = routeThreadKey;
+      previousLatestRunRef.current = latestRun;
+    }
+  }, [latestRun, routeThreadKey]);
+  const paintedDisclosureState =
+    disclosureState.threadKey === routeThreadKey ? disclosureState : emptyDisclosureState;
+  const {
+    expandedRunIds: paintedExpandedRunIds,
+    expandedAttemptIds: paintedExpandedAttemptIds,
+    expandedWorkGroupIds: paintedExpandedWorkGroupIds,
+  } = paintedDisclosureState;
+  useLayoutEffect(() => {
+    if (disclosureState.threadKey !== routeThreadKey) {
+      setDisclosureState(emptyDisclosureState);
+    }
+  }, [disclosureState.threadKey, emptyDisclosureState, routeThreadKey]);
   const citationThreadRef = useMemo(() => parseScopedThreadKey(routeThreadKey), [routeThreadKey]);
-  const expandCitedRun = useCallback((runId: RunId) => {
-    setExpandedRunIds((current) => (current.has(runId) ? current : new Set([...current, runId])));
-  }, []);
-  const [expandedWorkGroupIds, setExpandedWorkGroupIds] = useState<ReadonlySet<string>>(new Set());
+  const expandCitedRun = useCallback(
+    (runId: RunId) => {
+      setDisclosureState((current) => {
+        const state = current.threadKey === routeThreadKey ? current : emptyDisclosureState;
+        if (state.expandedRunIds.has(runId)) return state;
+        return { ...state, expandedRunIds: new Set([...state.expandedRunIds, runId]) };
+      });
+    },
+    [emptyDisclosureState, routeThreadKey],
+  );
   // Scroll/disclosure state outlives virtualized rows, but never the current thread.
   const workGroupViewState = useMemo<WorkGroupViewState>(
     () => ({ scrollPositions: new Map(), expandedEntries: new Set() }),
     [routeThreadKey],
   );
-  const [minimapStripMap] = useState(() => new Map<string, HTMLSpanElement>());
+  const minimapStripMap = useMemo(() => new Map<string, HTMLSpanElement>(), [routeThreadKey]);
   const [disclosureToggleSettling, setDisclosureToggleSettling] = useState(false);
   const disclosureAnchorKeyRef = useRef<string | null>(null);
   const disclosureSettleFrameRef = useRef<number | null>(null);
@@ -498,52 +538,59 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   const onToggleTurnFold = useCallback(
     (runId: RunId) => {
       suspendEndScrollMaintenanceForDisclosure(`turn-fold:${runId}`);
-      setExpandedRunIds((existing) => {
-        const next = new Set(existing);
+      setDisclosureState((current) => {
+        const state = current.threadKey === routeThreadKey ? current : emptyDisclosureState;
+        const next = new Set(state.expandedRunIds);
         if (next.has(runId)) {
           next.delete(runId);
         } else {
           next.add(runId);
         }
-        return next;
+        return { ...state, expandedRunIds: next };
       });
     },
-    [suspendEndScrollMaintenanceForDisclosure],
+    [emptyDisclosureState, routeThreadKey, suspendEndScrollMaintenanceForDisclosure],
   );
   const onToggleWorkGroup = useCallback(
     (groupId: string, anchorKey: string) => {
-      suspendEndScrollMaintenanceForDisclosure(anchorKey, expandedWorkGroupIds.has(groupId));
-      setExpandedWorkGroupIds((existing) => {
-        const next = new Set(existing);
+      suspendEndScrollMaintenanceForDisclosure(anchorKey, paintedExpandedWorkGroupIds.has(groupId));
+      setDisclosureState((current) => {
+        const state = current.threadKey === routeThreadKey ? current : emptyDisclosureState;
+        const next = new Set(state.expandedWorkGroupIds);
         if (next.has(groupId)) {
           next.delete(groupId);
         } else {
           next.add(groupId);
         }
-        return next;
+        return { ...state, expandedWorkGroupIds: next };
       });
     },
-    [expandedWorkGroupIds, suspendEndScrollMaintenanceForDisclosure],
+    [
+      emptyDisclosureState,
+      paintedExpandedWorkGroupIds,
+      routeThreadKey,
+      suspendEndScrollMaintenanceForDisclosure,
+    ],
   );
   const onToggleAttemptFold = useCallback(
     (attemptId: RunAttemptId) => {
       suspendEndScrollMaintenanceForDisclosure(`attempt-fold:${attemptId}`);
-      setExpandedAttemptIds((existing) => {
-        const next = new Set(existing);
+      setDisclosureState((current) => {
+        const state = current.threadKey === routeThreadKey ? current : emptyDisclosureState;
+        const next = new Set(state.expandedAttemptIds);
         if (next.has(attemptId)) {
           next.delete(attemptId);
         } else {
           next.add(attemptId);
         }
-        return next;
+        return { ...state, expandedAttemptIds: next };
       });
     },
-    [suspendEndScrollMaintenanceForDisclosure],
+    [emptyDisclosureState, routeThreadKey, suspendEndScrollMaintenanceForDisclosure],
   );
 
   // An in-session interrupt leaves its turn expanded so the user keeps their
   // place; the next turn (or a reload, since this is local state) folds it.
-  const previousLatestRunRef = useRef(latestRun);
   useEffect(() => {
     const previous = previousLatestRunRef.current;
     previousLatestRunRef.current = latestRun;
@@ -552,23 +599,25 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     }
     if (latestRun.runId === previous.runId) {
       if (previous.status === "running" && latestRun.status === "interrupted") {
-        setExpandedRunIds((existing) => {
-          const next = new Set(existing);
+        setDisclosureState((current) => {
+          const state = current.threadKey === routeThreadKey ? current : emptyDisclosureState;
+          const next = new Set(state.expandedRunIds);
           next.add(latestRun.runId);
-          return next;
+          return { ...state, expandedRunIds: next };
         });
       }
       return;
     }
-    setExpandedRunIds((existing) => {
-      if (!existing.has(previous.runId)) {
-        return existing;
+    setDisclosureState((current) => {
+      const state = current.threadKey === routeThreadKey ? current : emptyDisclosureState;
+      if (!state.expandedRunIds.has(previous.runId)) {
+        return state;
       }
-      const next = new Set(existing);
+      const next = new Set(state.expandedRunIds);
       next.delete(previous.runId);
-      return next;
+      return { ...state, expandedRunIds: next };
     });
-  }, [latestRun]);
+  }, [emptyDisclosureState, latestRun, routeThreadKey]);
 
   const rowsProjectionRef = useRef<{
     readonly threadKey: string;
@@ -582,9 +631,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         timelineEntries,
         latestRun,
         runningRunId,
-        expandedRunIds,
-        expandedAttemptIds,
-        expandedWorkGroupIds,
+        expandedRunIds: paintedExpandedRunIds,
+        expandedAttemptIds: paintedExpandedAttemptIds,
+        expandedWorkGroupIds: paintedExpandedWorkGroupIds,
         isWorking,
         activeTurnStartedAt,
         turnDiffSummaries,
@@ -603,15 +652,15 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     timelineEntries,
     latestRun,
     runningRunId,
-    expandedRunIds,
-    expandedAttemptIds,
-    expandedWorkGroupIds,
+    paintedExpandedRunIds,
+    paintedExpandedAttemptIds,
+    paintedExpandedWorkGroupIds,
     isWorking,
     activeTurnStartedAt,
     turnDiffSummaries,
     supportsConversationRollback,
   ]);
-  const rows = useStableRows(rawRows);
+  const rows = useStableRows(rawRows, routeThreadKey);
   // Run status/timestamps churn on every stream event; the shared row context
   // must not change with them or every timeline row re-renders per event.
   const runs = useStableHandoffRuns(runsProp);
@@ -697,12 +746,12 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     }
   }, []);
   const reportContentOverflow = useCallback(() => {
-    if (!onContentOverflowChange || contentOverflowFrameRef.current !== null) return;
+    if (paintOnly || !onContentOverflowChange || contentOverflowFrameRef.current !== null) return;
     contentOverflowFrameRef.current = requestAnimationFrame(() => {
       contentOverflowFrameRef.current = null;
       onContentOverflowChange(measureContentOverflow());
     });
-  }, [measureContentOverflow, onContentOverflowChange]);
+  }, [measureContentOverflow, onContentOverflowChange, paintOnly]);
   useEffect(() => cancelContentOverflowFrame, [cancelContentOverflowFrame]);
   // The list's own layout effects have already run here, so estimated row
   // positions are in place. Reporting before the first paint lets a thread
@@ -711,10 +760,21 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   // it is dropped first.
   useLayoutEffect(() => {
     cancelContentOverflowFrame();
-    onContentOverflowChange?.(measureContentOverflow());
-  }, [cancelContentOverflowFrame, measureContentOverflow, onContentOverflowChange, rows.length]);
+    if (!paintOnly) {
+      onContentOverflowChange?.(measureContentOverflow());
+    }
+  }, [
+    cancelContentOverflowFrame,
+    measureContentOverflow,
+    onContentOverflowChange,
+    paintOnly,
+    rows.length,
+  ]);
 
   const handleScroll = useCallback(() => {
+    if (paintOnly) {
+      return;
+    }
     const state = listRef.current?.getState?.();
     const isAtEnd = resolveTimelineIsAtEnd(state);
     if (isAtEnd !== undefined && !citationPositioning) {
@@ -764,6 +824,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     minimapItems,
     minimapStripMap,
     onIsAtEndChange,
+    paintOnly,
     reportContentOverflow,
   ]);
 
@@ -927,7 +988,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     historyControls === undefined
   ) {
     if (hideEmptyPlaceholder) {
-      return null;
+      // Occupy the pane with the theme surface so a thread switch cannot
+      // punch a hole through to the window chrome (white in light mode).
+      return <div className="h-full min-h-0 bg-background" data-timeline-loading="true" />;
     }
     return (
       <div className="flex h-full items-center justify-center">
@@ -943,10 +1006,12 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       <TimelineRowActivityCtx value={activityState}>
         <div
           ref={setTimelineViewportElement}
-          className="relative h-full min-h-0"
+          className={cn("relative h-full min-h-0", paintOnly && "pointer-events-none")}
           data-assistant-citation-viewport="true"
+          data-timeline-paint-only={paintOnly ? "true" : undefined}
+          inert={paintOnly ? true : undefined}
         >
-          {onCiteAssistantText && citationThreadRef ? (
+          {!paintOnly && onCiteAssistantText && citationThreadRef ? (
             <AssistantSelectionToolbar
               viewport={timelineViewportElement}
               threadRef={citationThreadRef}
@@ -956,7 +1021,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
           <LegendList<MessagesTimelineRow>
             ref={listRef}
             data={rows}
-            extraData={rows.length}
+            extraData={`${routeThreadKey}:${rows.length}`}
             keyExtractor={keyExtractor}
             getItemType={getItemType}
             renderItem={renderItem}
@@ -971,6 +1036,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
             maintainScrollAtEnd={
               citationPositioning ||
               anchoredEndSpace ||
+              paintOnly ||
               !liveFollowEnabled ||
               disclosureToggleSettling
                 ? false
@@ -1046,64 +1112,12 @@ function getItemType(item: MessagesTimelineRow) {
   return item.kind === "message" ? `message:${item.message.role}` : item.kind;
 }
 
-interface TimelineMinimapItem {
-  readonly id: string;
-  readonly rowIndex: number;
-  readonly userText: string | null;
-  readonly assistantText: string | null;
-}
-
 interface TimelinePositionState {
   readonly contentLength?: number;
   readonly scroll?: number;
   readonly scrollLength?: number;
   readonly positionAtIndex?: (index: number) => number | undefined;
   readonly sizeAtIndex?: (index: number) => number | undefined;
-}
-
-function deriveTimelineMinimapItems(
-  rows: ReadonlyArray<MessagesTimelineRow>,
-): TimelineMinimapItem[] {
-  const items: TimelineMinimapItem[] = [];
-  for (let index = 0; index < rows.length; index += 1) {
-    const row = rows[index];
-    if (row?.kind !== "message" || row.message.role !== "user") {
-      continue;
-    }
-
-    items.push({
-      id: row.id,
-      rowIndex: index,
-      userText: compactMinimapPreview(row.message.text),
-      assistantText: compactMinimapPreview(resolveFinalAssistantTextForTurn(rows, index)),
-    });
-  }
-  return items;
-}
-
-function resolveFinalAssistantTextForTurn(
-  rows: ReadonlyArray<MessagesTimelineRow>,
-  userRowIndex: number,
-) {
-  let finalAssistantText: string | null = null;
-  for (let index = userRowIndex + 1; index < rows.length; index += 1) {
-    const row = rows[index];
-    if (row?.kind !== "message") {
-      continue;
-    }
-    if (row.message.role === "user") {
-      break;
-    }
-    if (row.message.role === "assistant") {
-      finalAssistantText = row.message.text ?? null;
-    }
-  }
-  return finalAssistantText;
-}
-
-function compactMinimapPreview(text: string | null | undefined) {
-  const compact = text?.replace(/\s+/g, " ").trim() ?? "";
-  return compact.length > 0 ? compact : null;
 }
 
 function resolveTimelineRowTop(state: TimelinePositionState, rowIndex: number) {
@@ -1139,7 +1153,13 @@ function TimelineMinimap({
 
   const resolvedActiveIndex =
     activeIndex !== null && activeIndex < items.length ? activeIndex : null;
-  const activeItem = resolvedActiveIndex === null ? null : (items[resolvedActiveIndex] ?? null);
+  const activeItem = useMemo(
+    () =>
+      resolveTimelineMinimapPreview(
+        resolvedActiveIndex === null ? null : (items[resolvedActiveIndex] ?? null),
+      ),
+    [items, resolvedActiveIndex],
+  );
   const activeTopPercent =
     resolvedActiveIndex === null
       ? 0
@@ -3410,17 +3430,23 @@ function useStableHandoffRuns(
 
 /** Returns a structurally-shared copy of `rows`: for each row whose content
  *  hasn't changed since last call, the previous object reference is reused. */
-function useStableRows(rows: MessagesTimelineRow[]): MessagesTimelineRow[] {
+function useStableRows(rows: MessagesTimelineRow[], identity: string): MessagesTimelineRow[] {
   const prevState = useRef<StableMessagesTimelineRowsState>({
     byId: new Map<string, MessagesTimelineRow>(),
     result: [],
   });
+  const prevIdentity = useRef(identity);
 
   return useMemo(() => {
-    const nextState = computeStableMessagesTimelineRows(rows, prevState.current);
+    const previous =
+      prevIdentity.current === identity
+        ? prevState.current
+        : { byId: new Map<string, MessagesTimelineRow>(), result: [] };
+    prevIdentity.current = identity;
+    const nextState = computeStableMessagesTimelineRows(rows, previous);
     prevState.current = nextState;
     return nextState.result;
-  }, [rows]);
+  }, [identity, rows]);
 }
 
 // ---------------------------------------------------------------------------

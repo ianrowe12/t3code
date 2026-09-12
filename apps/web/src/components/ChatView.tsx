@@ -311,6 +311,7 @@ import { vcsEnvironment } from "../state/vcs";
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
 import {
   resolveThreadDetailRef,
+  useAllEnvironmentShellsBootstrapped,
   useProject,
   useProjects,
   useThreadProjection,
@@ -421,6 +422,10 @@ import {
   reconcileMountedTerminalThreadIds,
   resolveComposerInteractionMode,
   resolveComposerProviderSelection,
+  peekHeldThreadTimeline,
+  rememberReadyThreadTimeline,
+  resetHeldThreadTimeline,
+  resolveThreadSwitchTimeline,
   observeProactivePanelUserChoice,
   resolveProactiveTurnDiffAction,
   resolveThreadMetadataUpdateForNextTurn,
@@ -1374,6 +1379,7 @@ function chatActionErrorMessage(error: unknown): string {
 }
 
 const ENVIRONMENT_UNAVAILABLE_SEND_TOAST_TRAIL_SIZE = 3;
+const EMPTY_TIMELINE_RUNS = [] as const;
 
 /**
  * Drops the send-time anchored end space. That space is what holds a sent
@@ -1458,7 +1464,7 @@ export default function ChatView(props: ChatViewProps) {
   });
   const openPreview = useAtomCommand(previewEnvironment.open, { reportFailure: false });
   const closePreview = useAtomCommand(previewEnvironment.close, "preview close");
-  const { environments } = useEnvironments();
+  const { isReady: environmentsReady, environments } = useEnvironments();
   const primaryEnvironment = usePrimaryEnvironment();
   const retryEnvironment = useAtomCommand(environmentCatalog.retryNow, { reportFailure: false });
   const environmentById = useMemo(
@@ -1810,7 +1816,19 @@ export default function ChatView(props: ChatViewProps) {
   const storeSetActiveTerminal = useTerminalUiStateStore((s) => s.setActiveTerminal);
   const storeCloseTerminal = useTerminalUiStateStore((s) => s.closeTerminal);
   const serverThreadRefs = useThreadRefs();
+  const allEnvironmentShellsBootstrapped = useAllEnvironmentShellsBootstrapped();
   const serverThreadKeys = useMemo(() => serverThreadRefs.map(scopedThreadKey), [serverThreadRefs]);
+  const serverThreadKeySet = useMemo(() => new Set(serverThreadKeys), [serverThreadKeys]);
+  useEffect(() => {
+    const held = peekHeldThreadTimeline();
+    if (held === null) return;
+    if (
+      (environmentsReady && !environmentById.has(held.environmentId)) ||
+      (allEnvironmentShellsBootstrapped && !serverThreadKeySet.has(held.threadKey))
+    ) {
+      resetHeldThreadTimeline();
+    }
+  }, [allEnvironmentShellsBootstrapped, environmentById, environmentsReady, serverThreadKeySet]);
   const draftThreadsByThreadKey = useComposerDraftStore((store) => store.draftThreadsByThreadKey);
   const draftThreadKeys = useMemo(
     () =>
@@ -1892,6 +1910,11 @@ export default function ChatView(props: ChatViewProps) {
   );
   const isServerThread = serverThread !== null;
   const activeThread = isServerThread ? serverThread : localDraftThread;
+  useEffect(() => {
+    if ((activeThread?.archivedAt ?? null) !== null || (activeThread?.deletedAt ?? null) !== null) {
+      resetHeldThreadTimeline();
+    }
+  }, [activeThread?.archivedAt, activeThread?.deletedAt]);
   const serverLatestRun = useMemo(
     () => (serverProjection === null ? null : deriveLatestThreadRun(serverProjection)),
     [serverProjection],
@@ -1913,6 +1936,7 @@ export default function ChatView(props: ChatViewProps) {
   const activeLatestRun = isServerThread ? serverLatestRun : (activeThread?.latestRun ?? null);
   const activeActivityRun = isServerThread ? serverActivityRun : (activeThread?.latestRun ?? null);
   const activeRuntime = isServerThread ? serverRuntime : (activeThread?.runtime ?? null);
+  const activeRunningTurnId = activeRuntime?.activeRunId ?? null;
   const parentSubagentThreadId =
     activeThread?.lineage.relationshipToParent === "subagent"
       ? activeThread.lineage.parentThreadId
@@ -3607,6 +3631,70 @@ export default function ChatView(props: ChatViewProps) {
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
   const activeThreadWorktreePath = activeThread?.worktreePath ?? null;
   const activeWorkspaceRoot = activeThreadWorktreePath ?? activeProjectCwd ?? undefined;
+  const timelineSkills = useMemo(
+    () =>
+      activeProviderStatus
+        ? resolveProviderSkillsForCwd(activeProviderStatus, gitCwd)
+        : EMPTY_PROVIDER_SKILLS,
+    [activeProviderStatus, gitCwd],
+  );
+  const liveTimelineDisplay = useMemo(
+    () => ({
+      threadKey: activeThreadKey ?? routeThreadKey,
+      environmentId: activeThread?.environmentId ?? environmentId,
+      entries: timelineEntries,
+      latestRun: activeActivityRun,
+      runningRunId: activeRunningTurnId,
+      turnDiffSummaries,
+      markdownCwd: gitCwd ?? undefined,
+      workspaceRoot: activeWorkspaceRoot,
+      skills: timelineSkills,
+      providerStatuses,
+      runs: serverProjection?.runs ?? EMPTY_TIMELINE_RUNS,
+      attempts: serverProjection?.attempts ?? EMPTY_TIMELINE_RUNS,
+      modelSelection: activeThread?.modelSelection ?? NO_PROVIDER_MODEL_SELECTION,
+      parentThreadLink,
+      supportsConversationRollback,
+    }),
+    [
+      activeActivityRun,
+      activeRunningTurnId,
+      activeThread?.environmentId,
+      activeThread?.modelSelection,
+      activeThreadKey,
+      activeWorkspaceRoot,
+      environmentId,
+      gitCwd,
+      parentThreadLink,
+      providerStatuses,
+      routeThreadKey,
+      serverProjection?.attempts,
+      serverProjection?.runs,
+      supportsConversationRollback,
+      timelineEntries,
+      timelineSkills,
+      turnDiffSummaries,
+    ],
+  );
+  const displayedTimelineState = resolveThreadSwitchTimeline({
+    loading: isServerThread && threadDetailLoading && timelineEntries.length === 0,
+    activeThreadKey,
+    activeEnvironmentId: activeThread?.environmentId ?? environmentId,
+    current: liveTimelineDisplay,
+  });
+  const displayedTimeline = displayedTimelineState.snapshot ?? liveTimelineDisplay;
+  const paintOnlyDisplayedTimeline = displayedTimelineState.paintOnly;
+
+  useLayoutEffect(() => {
+    if (!isServerThread || activeThreadKey === null) {
+      resetHeldThreadTimeline();
+      return;
+    }
+    if (threadDetailLoading) return;
+    if (!rememberReadyThreadTimeline(liveTimelineDisplay)) {
+      resetHeldThreadTimeline();
+    }
+  }, [activeThreadKey, isServerThread, liveTimelineDisplay, threadDetailLoading]);
   const activeTerminalLaunchContext =
     terminalUiLaunchContext?.threadId === activeThreadId ? terminalUiLaunchContext : null;
   // Git status arrives after the composer paints. A checkout seen earlier in
@@ -4712,7 +4800,6 @@ export default function ChatView(props: ChatViewProps) {
     replacementLinkedThreadPullRequest,
     updateThreadMetadata,
   ]);
-  const activeRunningTurnId = activeRuntime?.activeRunId ?? null;
   const proactivePanelObservationRef = useRef<ReturnType<
     typeof observeProactivePanelUserChoice
   > | null>(null);
@@ -5455,6 +5542,21 @@ export default function ChatView(props: ChatViewProps) {
       void legendListRef.current?.scrollToEnd?.({ animated });
     });
   }, []);
+  const displayedTimelineKeyRef = useRef(displayedTimeline.threadKey);
+  useLayoutEffect(() => {
+    const displayKey = displayedTimeline.threadKey;
+    if (displayKey !== activeThreadKey) {
+      displayedTimelineKeyRef.current = displayKey;
+      return;
+    }
+    if (displayedTimelineKeyRef.current === displayKey) {
+      return;
+    }
+    displayedTimelineKeyRef.current = displayKey;
+    // Keep the list mounted across jumps; pin the newly displayed thread to
+    // its end the way a remount used to via initialScrollAtEnd.
+    scrollToEnd();
+  }, [activeThreadKey, displayedTimeline.threadKey, scrollToEnd]);
   useEffect(() => {
     let removeListeners: (() => void) | null = null;
     let frame: number | null = null;
@@ -9021,12 +9123,12 @@ export default function ChatView(props: ChatViewProps) {
             {/* Banners overlay the timeline without changing its content height. */}
             <div className="pointer-events-none absolute inset-x-0 top-0 z-20 flex flex-col">
               <ProviderStatusBanner
-                status={visibleProviderStatus}
+                status={paintOnlyDisplayedTimeline ? null : visibleProviderStatus}
                 onDismiss={() => setDismissedProviderStatusBannerKey(providerStatusBannerKey)}
                 onOpenProviderSetup={openProviderSetup}
               />
               <ThreadErrorBanner
-                error={visibleThreadError}
+                error={paintOnlyDisplayedTimeline ? null : visibleThreadError}
                 onDismiss={() => {
                   setThreadError(activeThread.id, null);
                   dismissThreadErrorBannerForSession(threadErrorBannerKey);
@@ -9035,64 +9137,74 @@ export default function ChatView(props: ChatViewProps) {
               />
             </div>
             {/* Messages Wrapper */}
-            <div className="relative flex min-h-0 flex-1 flex-col">
+            <div className="relative flex min-h-0 flex-1 flex-col bg-background">
               {/* Messages — LegendList handles virtualization and scrolling internally */}
               <MessagesTimeline
-                citationRequest={citationRequest}
-                citationHistoryLoading={threadDetailLoading}
-                onCiteAssistantText={citeAssistantText}
-                key={activeThread.id}
-                isWorking={isWorking}
-                activeTurnInProgress={isWorking || !latestRunSettled}
-                isCompacting={isCompacting}
-                activeTurnStartedAt={activeWorkStartedAt}
-                isPreparingWorktree={isPreparingWorktree || activeRunPreparing}
+                citationRequest={paintOnlyDisplayedTimeline ? null : citationRequest}
+                citationHistoryLoading={!paintOnlyDisplayedTimeline && threadDetailLoading}
+                {...(paintOnlyDisplayedTimeline
+                  ? {}
+                  : {
+                      onCiteAssistantText: citeAssistantText,
+                      onUseArtifactTemplate: useArtifactTemplate,
+                    })}
+                paintOnly={paintOnlyDisplayedTimeline}
+                isWorking={!paintOnlyDisplayedTimeline && isWorking}
+                activeTurnInProgress={
+                  !paintOnlyDisplayedTimeline && (isWorking || !latestRunSettled)
+                }
+                isPreparingWorktree={
+                  !paintOnlyDisplayedTimeline && (isPreparingWorktree || activeRunPreparing)
+                }
+                isCompacting={!paintOnlyDisplayedTimeline && isCompacting}
+                activeTurnStartedAt={paintOnlyDisplayedTimeline ? null : activeWorkStartedAt}
                 listRef={legendListRef}
-                timelineEntries={timelineEntries}
-                latestRun={activeActivityRun}
-                runningRunId={activeRunningTurnId}
-                turnDiffSummaries={turnDiffSummaries}
-                activeThreadEnvironmentId={activeThread.environmentId}
-                routeThreadKey={routeThreadKey}
+                timelineEntries={displayedTimeline.entries}
+                latestRun={displayedTimeline.latestRun}
+                runningRunId={paintOnlyDisplayedTimeline ? null : displayedTimeline.runningRunId}
+                turnDiffSummaries={displayedTimeline.turnDiffSummaries}
+                activeThreadEnvironmentId={displayedTimeline.environmentId}
+                routeThreadKey={displayedTimeline.threadKey}
                 onOpenTurnDiff={onOpenTurnDiff}
                 onOpenThread={onOpenRelatedThread}
-                parentThreadLink={parentThreadLink}
+                parentThreadLink={displayedTimeline.parentThreadLink}
                 onForkFromRun={onForkFromRun}
                 onRollbackCheckpoint={(input) => void onRollbackCheckpoint(input)}
-                supportsConversationRollback={supportsConversationRollback}
+                supportsConversationRollback={
+                  !paintOnlyDisplayedTimeline && displayedTimeline.supportsConversationRollback
+                }
                 onRevertToTurnCount={onRevertTimelineTurn}
-                onUseArtifactTemplate={useArtifactTemplate}
-                isRevertingCheckpoint={isRevertingCheckpoint}
+                isRevertingCheckpoint={!paintOnlyDisplayedTimeline && isRevertingCheckpoint}
                 onImageExpand={onExpandTimelineImage}
                 onFileOpen={openFileAttachment}
                 onFileDownload={downloadFileAttachment}
-                markdownCwd={gitCwd ?? undefined}
+                markdownCwd={displayedTimeline.markdownCwd}
                 resolvedTheme={resolvedTheme}
                 timestampFormat={timestampFormat}
-                workspaceRoot={activeWorkspaceRoot}
-                skills={
-                  activeProviderStatus
-                    ? resolveProviderSkillsForCwd(activeProviderStatus, gitCwd)
-                    : EMPTY_PROVIDER_SKILLS
-                }
-                anchorMessageId={timelineAnchorMessageId}
+                workspaceRoot={displayedTimeline.workspaceRoot}
+                skills={displayedTimeline.skills}
+                providerStatuses={displayedTimeline.providerStatuses}
+                runs={displayedTimeline.runs}
+                anchorMessageId={paintOnlyDisplayedTimeline ? null : timelineAnchorMessageId}
                 onAnchorReady={onTimelineAnchorReady}
                 onAnchorSizeChanged={onTimelineAnchorSizeChanged}
                 contentInsetEndAdjustment={composerTimelineInset}
-                liveFollowEnabled={timelineLiveFollowEnabled}
+                liveFollowEnabled={!paintOnlyDisplayedTimeline && timelineLiveFollowEnabled}
                 onIsAtEndChange={onIsAtEndChange}
-                onContentOverflowChange={setTimelineOverflows}
+                {...(paintOnlyDisplayedTimeline
+                  ? {}
+                  : { onContentOverflowChange: setTimelineOverflows })}
                 onToolOutputCollapsedAtEnd={onToolOutputCollapsedAtEnd}
                 onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
-                hideEmptyPlaceholder={isDraftHeroState}
-                topFadeEnabled={!hasTimelineTopBanner}
-                {...(threadHistoryControls === undefined
+                hideEmptyPlaceholder={isDraftHeroState || threadDetailLoading}
+                topFadeEnabled={!paintOnlyDisplayedTimeline && !hasTimelineTopBanner}
+                {...(paintOnlyDisplayedTimeline || threadHistoryControls === undefined
                   ? {}
                   : { historyControls: threadHistoryControls })}
               />
 
               {/* scroll to end pill — shown when user has scrolled away from the live edge */}
-              {showScrollToBottom && (
+              {showScrollToBottom && !paintOnlyDisplayedTimeline && (
                 <div
                   className="chat-scroll-to-bottom pointer-events-none absolute z-30 flex justify-center py-1.5"
                   style={{ bottom: scrollToEndClearance + 4 }}

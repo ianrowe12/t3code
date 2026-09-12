@@ -1,7 +1,9 @@
 import { EnvironmentId } from "@t3tools/contracts";
+import type { Root } from "mdast";
 import { act, type ComponentProps, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { create, type ReactTestRenderer } from "react-test-renderer";
+import type { Plugin } from "unified";
 import { describe, expect, it, vi } from "vite-plus/test";
 
 import { getSyntaxHighlighterPromise } from "../lib/syntaxHighlighting";
@@ -110,13 +112,81 @@ describe("ChatMarkdown favicon privacy", () => {
 });
 
 describe("ChatMarkdown streaming", () => {
+  it("uses the full parser when an extra remark plugin is present", async () => {
+    const parsedSources: string[] = [];
+    const observeParsing: Plugin<[], Root> = function () {
+      const original = this.parser;
+      if (original) {
+        this.parser = (source, file) => {
+          parsedSources.push(source);
+          return original(source, file);
+        };
+      }
+    };
+    const extraRemarkPlugins = [observeParsing];
+    const first = "```typescript\nconst completed = 1;\n```\n\nStreaming";
+    const next = `${first} reply`;
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(async () => {
+        renderer = create(
+          <ChatMarkdown
+            cwd="/tmp/project"
+            text={first}
+            isStreaming
+            extraRemarkPlugins={extraRemarkPlugins}
+          />,
+        );
+      });
+      parsedSources.length = 0;
+      await act(async () => {
+        renderer!.update(
+          <ChatMarkdown
+            cwd="/tmp/project"
+            text={next}
+            isStreaming
+            extraRemarkPlugins={extraRemarkPlugins}
+          />,
+        );
+      });
+      expect(parsedSources).toContain(next);
+    } finally {
+      await act(async () => renderer?.unmount());
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("does not retokenize completed lines when streaming finishes", async () => {
+    const highlighter = await getSyntaxHighlighterPromise("typescript");
+    const highlight = vi.spyOn(highlighter, "codeToHast");
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    let renderer: ReactTestRenderer | undefined;
+    const text = "```typescript\nconst completed = 1;\nconst current = 2;";
+    try {
+      await act(async () => {
+        renderer = create(<ChatMarkdown cwd="/tmp/project" text={text} isStreaming />);
+      });
+      expect(highlight).toHaveBeenCalled();
+      highlight.mockClear();
+      await act(async () => {
+        renderer!.update(<ChatMarkdown cwd="/tmp/project" text={text + "\n```"} />);
+      });
+      expect(highlight.mock.calls.every(([code]) => !code.includes("const completed"))).toBe(true);
+    } finally {
+      await act(async () => renderer?.unmount());
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
   it("recovers highlighting after a failed fence changes without resetting its controls", async () => {
     const highlighter = await getSyntaxHighlighterPromise("text");
-    const codeToHtml = highlighter.codeToHtml.bind(highlighter);
+    const codeToHast = highlighter.codeToHast.bind(highlighter);
     let fail = true;
-    vi.spyOn(highlighter, "codeToHtml").mockImplementation((...args) => {
+    vi.spyOn(highlighter, "codeToHast").mockImplementation((...args) => {
       if (fail) throw new Error("Temporary highlighter failure");
-      return codeToHtml(...args);
+      return codeToHast(...args);
     });
     vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -156,7 +226,7 @@ describe("ChatMarkdown streaming", () => {
 
   it("preserves code controls and details without highlighting an unchanged fence again", async () => {
     const highlighter = await getSyntaxHighlighterPromise("text");
-    const highlight = vi.spyOn(highlighter, "codeToHtml");
+    const highlight = vi.spyOn(highlighter, "codeToHast");
     const writeText = vi.fn(async (_text: string) => {});
     vi.stubGlobal("navigator", { clipboard: { writeText } });
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);

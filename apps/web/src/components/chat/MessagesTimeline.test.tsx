@@ -308,6 +308,78 @@ function buildSnapShotTimelineEntry(previewUrl?: string) {
 }
 
 describe("MessagesTimeline", () => {
+  it("makes a held timeline inert and disables scroll-to-end maintenance", () => {
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        paintOnly
+        timelineEntries={[buildAssistantTimelineEntry("Previously painted response.")]}
+      />,
+    );
+
+    expect(markup).toContain('data-timeline-paint-only="true"');
+    expect(markup).toContain("pointer-events-none");
+    expect(markup).toContain("inert");
+    expect(markup).not.toContain('data-maintain-scroll-at-end="enabled"');
+  });
+
+  it("clears expanded work when the displayed thread changes", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    const entries = [
+      {
+        id: "thread-scoped-work-1",
+        kind: "work" as const,
+        createdAt: MESSAGE_CREATED_AT,
+        entry: {
+          id: "thread-scoped-work-1",
+          createdAt: MESSAGE_CREATED_AT,
+          label: "Ran command",
+          command: "THREAD_SCOPED_COMMAND",
+          tone: "tool" as const,
+          itemType: "command_execution" as const,
+          toolLifecycleStatus: "completed" as const,
+        },
+      },
+      {
+        id: "thread-scoped-work-2",
+        kind: "work" as const,
+        createdAt: MESSAGE_CREATED_AT,
+        entry: {
+          id: "thread-scoped-work-2",
+          createdAt: MESSAGE_CREATED_AT,
+          label: "Ran command",
+          command: "vp test run",
+          tone: "tool" as const,
+          itemType: "command_execution" as const,
+          toolLifecycleStatus: "completed" as const,
+        },
+      },
+    ];
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(<MessagesTimeline {...buildProps()} timelineEntries={entries} />);
+      });
+      await act(() => renderer!.root.findByProps({ "aria-expanded": false }).props.onClick());
+      expect(JSON.stringify(renderer!.toJSON())).toContain("THREAD_SCOPED_COMMAND");
+
+      await act(() => {
+        renderer!.update(
+          <MessagesTimeline
+            {...buildProps()}
+            routeThreadKey="environment-local:thread-2"
+            timelineEntries={entries}
+          />,
+        );
+      });
+      expect(JSON.stringify(renderer!.toJSON())).not.toContain("THREAD_SCOPED_COMMAND");
+    } finally {
+      await act(() => renderer?.unmount());
+    }
+  });
+
   it("shows dynamic tool input without cached output when the row is expanded", async () => {
     activityTestState.expanded = true;
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
