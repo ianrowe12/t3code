@@ -146,17 +146,20 @@ function easeInOut(progress: number): number {
 }
 
 export function createPageScrollController({
+  enabled = true,
   getContainer,
   getScrollPaddingBottomPx,
   onScrollStart,
   env = getDefaultEnv(),
 }: {
+  enabled?: boolean;
   getContainer: () => PageScrollContainer | null;
   getScrollPaddingBottomPx: () => number;
   onScrollStart?: (key: PageScrollKey) => void;
   env?: PageScrollEnv;
 }) {
   const state = {
+    enabled,
     activeKey: null as PageScrollKey | null,
     discreteAnimationFrame: 0,
     holdDelayTimeout: 0,
@@ -213,6 +216,10 @@ export function createPageScrollController({
     const startTime = env.now();
 
     const step = (now: number) => {
+      if (!state.enabled) {
+        state.discreteAnimationFrame = 0;
+        return;
+      }
       const progress = Math.min(1, (now - startTime) / PAGE_SCROLL_ANIMATION_MS);
       container.scrollTop = startScrollTop + deltaY * easeInOut(progress);
 
@@ -261,7 +268,16 @@ export function createPageScrollController({
   };
 
   return {
+    setEnabled(enabled: boolean) {
+      state.enabled = enabled;
+      if (!enabled) {
+        stop({ cancelDiscreteAnimation: true });
+      }
+    },
     handleKeyDown(key: PageScrollKey) {
+      if (!state.enabled) {
+        return;
+      }
       const container = getContainer();
       if (!container) {
         return;

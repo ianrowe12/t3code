@@ -40,6 +40,7 @@ import {
   type IdAllocatorV2AllocationError,
   type IdAllocatorV2Shape,
 } from "./IdAllocator.ts";
+import { isCompactCommand } from "./MaintenanceCommand.ts";
 import type {
   ProviderAdapterV2Event,
   ProviderAdapterV2RuntimePolicy,
@@ -1300,9 +1301,7 @@ export const layer: Layer.Layer<
             modelSelection: input.modelSelection,
             runtimePolicy: input.runtimePolicy,
           };
-          const compact =
-            input.message.attachments.length === 0 &&
-            input.message.text.trim().toLowerCase() === "/compact";
+          const compact = isCompactCommand(input.message);
           const startTurn = compact
             ? (input.session.compactThread?.(turnInput) ??
               Effect.fail(
