@@ -118,6 +118,11 @@ const AcpRequestRecord = Schema.Struct({
     Schema.Struct({
       sessionId: Schema.optionalKey(Schema.String),
       mcpServers: Schema.optionalKey(Schema.Array(Schema.Unknown)),
+      clientCapabilities: Schema.optionalKey(
+        Schema.Struct({
+          _meta: Schema.optionalKey(Schema.Unknown),
+        }),
+      ),
     }),
   ),
 });
@@ -303,6 +308,15 @@ describe("AcpRegistryAdapterV2", () => {
         requests.find((request) => request.method === "session/new")?.params?.mcpServers,
         [],
       );
+      assert.deepEqual(
+        requests.find((request) => request.method === "initialize")?.params?.clientCapabilities
+          ?._meta,
+        {
+          "github.com/copilot": {
+            events: ["user.message", "assistant.turn_start", "assistant.idle"],
+          },
+        },
+      );
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
@@ -325,6 +339,10 @@ describe("AcpRegistryAdapterV2", () => {
       assert.equal(spawns[0]!.authorization, authorization);
       assert.equal(spawns[0]!.endpoint, endpoint);
       const requests = yield* fixture.readRequests;
+      assert.isUndefined(
+        requests.find((request) => request.method === "initialize")?.params?.clientCapabilities
+          ?._meta,
+      );
       assert.deepEqual(
         requests.find((request) => request.method === "session/new")?.params?.mcpServers,
         [

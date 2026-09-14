@@ -29,6 +29,10 @@ import {
 import { AcpRegistryCatalog } from "../../provider/acp/AcpRegistrySupport.ts";
 import { AcpRegistryRuntimeCoordinator } from "../../provider/acp/AcpRegistryRuntimeCoordinator.ts";
 import * as AcpSessionRuntime from "../../provider/acp/AcpSessionRuntime.ts";
+import {
+  copilotCompletionCapabilities,
+  makeCopilotPromptCompletionRuntime,
+} from "../../provider/acp/CopilotPromptCompletion.ts";
 import { makeAcpNativeLoggerFactory } from "../../provider/acp/AcpNativeLogging.ts";
 import { ProviderEventLoggers } from "../../provider/Layers/ProviderEventLoggers.ts";
 import { mergeProviderInstanceEnvironment } from "../../provider/ProviderInstanceEnvironment.ts";
@@ -144,6 +148,9 @@ function makeAcpRegistryRuntime(options: AcpRegistryAdapterV2Options) {
         AcpSessionRuntime.layer({
           ...runtimeInput,
           spawn,
+          ...(resolved.agent.id === "github-copilot-cli"
+            ? { cancelBehavior: "wait-for-prompt" as const }
+            : {}),
           ...(options.settings.authMethodId ? { authMethodId: options.settings.authMethodId } : {}),
         }).pipe(
           Layer.provide(
@@ -151,9 +158,20 @@ function makeAcpRegistryRuntime(options: AcpRegistryAdapterV2Options) {
           ),
         ),
       );
-      return yield* Effect.service(AcpSessionRuntime.AcpSessionRuntime).pipe(
+      const runtime = yield* Effect.service(AcpSessionRuntime.AcpSessionRuntime).pipe(
         Effect.provide(context),
       );
+      return resolved.agent.id === "github-copilot-cli"
+        ? yield* makeCopilotPromptCompletionRuntime(
+            runtime,
+            runtimeInput.onTermination?.(
+              new EffectAcpErrors.AcpRequestError({
+                code: -32603,
+                errorMessage: "Copilot session recovery failed; a replacement runtime is required.",
+              }),
+            ) ?? Effect.void,
+          )
+        : runtime;
     });
 }
 
@@ -177,6 +195,7 @@ export function makeAcpRegistryAdapterV2(options: AcpRegistryAdapterV2Options) {
       : {}),
     ...(isCopilot
       ? {
+          clientCapabilitiesMeta: copilotCompletionCapabilities,
           extractSubagentUpdates: extractCopilotSubagentUpdates,
           extractSubagentEndNotice: extractCopilotSubagentEndNotice,
           retainSubagentsAcrossTurns: true,
