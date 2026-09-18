@@ -41,9 +41,13 @@ const SessionEvent = Schema.Struct({
     parentToolCallId: Schema.optionalKey(Schema.String),
     mcpServerName: Schema.optionalKey(Schema.String),
     arguments: Schema.optionalKey(Schema.Unknown),
+    omitted: Schema.optionalKey(Schema.String),
   }),
 });
 const isTaskCompleteInput = Schema.is(Schema.Struct({ summary: Schema.String }));
+const isTaskCompleteOutput = Schema.is(
+  Schema.Struct({ content: Schema.String, isError: Schema.optionalKey(Schema.Boolean) }),
+);
 const isTaskCompleteMeta = Schema.is(
   Schema.Struct({ "github.com/copilot/task_complete": Schema.String }),
 );
@@ -82,12 +86,14 @@ interface PendingPrompt {
   rpcSucceeded: boolean;
   recovery: Deferred.Deferred<void, AcpErrors.AcpError> | undefined;
   invalidated: boolean;
+  omittedToolStart: boolean;
   taskComplete:
     | {
         readonly toolCallId?: string;
         readonly summary: string;
         status: "pending" | "accepted" | "rejected";
         hasAssistantReply: boolean;
+        readonly useAcpResult?: boolean;
       }
     | undefined;
 }
@@ -147,6 +153,9 @@ export const makeCopilotPromptCompletionRuntime = Effect.fn("makeCopilotPromptCo
         ) {
           return;
         }
+        if (event.type === "tool.execution_start" && current.running) {
+          current.omittedToolStart = event.data.omitted === "too-large";
+        }
         if (
           event.type === "tool.execution_start" &&
           current.running &&
@@ -172,7 +181,11 @@ export const makeCopilotPromptCompletionRuntime = Effect.fn("makeCopilotPromptCo
           current.taskComplete.status !== "rejected"
         ) {
           current.taskComplete.status = event.data.success === true ? "accepted" : "rejected";
-        } else if (event.type === "session.task_complete" && current.running) {
+        } else if (
+          event.type === "session.task_complete" &&
+          current.running &&
+          event.data.omitted === undefined
+        ) {
           // The native CLI also accepts legacy completion events without a success field.
           const accepted =
             event.data.success !== false &&
@@ -225,8 +238,52 @@ export const makeCopilotPromptCompletionRuntime = Effect.fn("makeCopilotPromptCo
         const current = pending;
         const update = notification.update;
         if (
+          current === undefined ||
+          notification.sessionId !== current.sessionId ||
+          !current.running
+        ) {
+          return;
+        }
+        if (update.sessionUpdate === "tool_call") {
+          const omittedStart = current.omittedToolStart;
+          current.omittedToolStart = false;
+          if (
+            omittedStart &&
+            update.title === "task_complete" &&
+            update.kind === "other" &&
+            update._meta === undefined &&
+            isTaskCompleteInput(update.rawInput) &&
+            update.rawInput.summary.trim().length > 0
+          ) {
+            // Copilot caps native event data; ACP still carries the complete tool input.
+            current.taskComplete = {
+              toolCallId: update.toolCallId,
+              summary: update.rawInput.summary,
+              status: update.status === "failed" ? "rejected" : "pending",
+              hasAssistantReply: false,
+              useAcpResult: true,
+            };
+          }
+        }
+        if (
+          (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+          current.taskComplete?.useAcpResult === true &&
+          current.taskComplete.toolCallId === update.toolCallId &&
+          current.taskComplete.status === "pending"
+        ) {
+          if (update.status === "failed") {
+            current.taskComplete.status = "rejected";
+          } else if (update.status === "completed") {
+            current.taskComplete.status =
+              isTaskCompleteOutput(update.rawOutput) &&
+              update.rawOutput.isError !== true &&
+              update.rawOutput.content === current.taskComplete.summary
+                ? "accepted"
+                : "rejected";
+          }
+        }
+        if (
           current?.taskComplete !== undefined &&
-          notification.sessionId === current.sessionId &&
           update.sessionUpdate === "agent_message_chunk" &&
           update.content.type === "text" &&
           update.content.text.trim().length > 0
@@ -268,6 +325,7 @@ export const makeCopilotPromptCompletionRuntime = Effect.fn("makeCopilotPromptCo
               rpcSucceeded: false,
               recovery: undefined,
               invalidated: false,
+              omittedToolStart: false,
               taskComplete: undefined,
             };
             pending = current;

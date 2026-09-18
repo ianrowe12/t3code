@@ -267,6 +267,86 @@ const makeFixture = Effect.fnUntraced(function* (agentId = "github-copilot-cli")
 });
 
 describe("Copilot ACP settlement", () => {
+  for (const outcome of [
+    "completed",
+    "no semantic event",
+    "failed",
+    "blocked",
+    "later reply",
+    "child",
+    "tagged tool",
+    "unmatched result",
+    "cancelled",
+  ] as const) {
+    it.effect(`preserves a large task_complete answer with omitted native data: ${outcome}`, () =>
+      Effect.gen(function* () {
+        const fixture = yield* makeFixture();
+        yield* fixture.runtime.startTurn(fixture.turn(1));
+        const prompt = yield* Queue.take(fixture.prompts);
+        yield* fixture.lifecycle("user.message", { interactionId: "current" });
+        yield* fixture.lifecycle("assistant.turn_start", { interactionId: "current" });
+        const summary = `# Complete report\n${"A full line of the answer.\n".repeat(3_000)}END`;
+        assert.isAbove(Buffer.byteLength(summary), 65_536);
+        const agentId = outcome === "child" ? "child" : undefined;
+        yield* fixture.lifecycle("tool.execution_start", { omitted: "too-large" }, agentId);
+        yield* fixture.update({
+          sessionUpdate: "tool_call",
+          toolCallId: "large-completion",
+          title: "task_complete",
+          kind: "other",
+          status: "pending",
+          rawInput: { summary },
+          ...(outcome === "tagged tool" ? { _meta: { agentId: "child" } } : {}),
+        });
+        yield* fixture.lifecycle("tool.execution_complete", { omitted: "too-large" }, agentId);
+        yield* fixture.update({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "large-completion",
+          status: outcome === "failed" ? "failed" : "completed",
+          rawOutput: {
+            content: outcome === "unmatched result" ? "Completion was declined." : summary,
+            detailedContent: `Task completed: ${summary}`,
+          },
+        });
+        if (outcome === "blocked") {
+          yield* fixture.lifecycle("session.task_complete", { success: false, outcome: "blocked" });
+        } else if (outcome !== "no semantic event") {
+          yield* fixture.lifecycle("session.task_complete", { omitted: "too-large" }, agentId);
+        }
+        if (outcome === "later reply") {
+          yield* fixture.update({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "A later answer in chat." },
+          });
+        }
+        yield* fixture.lifecycle("assistant.idle");
+        yield* fixture.respond(prompt, {
+          stopReason: outcome === "cancelled" ? "cancelled" : "end_turn",
+        });
+        assert.equal(
+          (yield* fixture.terminal).status,
+          outcome === "cancelled" ? "cancelled" : "completed",
+        );
+        const replies = fixture.observed.flatMap((event) =>
+          event.type === "message.updated" &&
+          event.message.role === "assistant" &&
+          !event.message.streaming
+            ? [event.message]
+            : [],
+        );
+        if (outcome === "completed" || outcome === "no semantic event") {
+          assert.isTrue(
+            replies.some((message) => message.text === summary),
+            "the full answer must reach chat even when Copilot omits oversized native event data",
+          );
+          assert.equal(new Set(replies.map((message) => message.id)).size, 1);
+        } else {
+          assert.isFalse(replies.some((message) => message.text === summary));
+        }
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+  }
+
   for (const nativeCompletionEvent of [false, true]) {
     it.effect(
       `publishes root task_complete as chat ${nativeCompletionEvent ? "with" : "without"} the semantic completion event`,
