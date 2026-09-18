@@ -31,12 +31,18 @@ import * as Schema from "effect/Schema";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as ServerConfig from "../config.ts";
+import { acquireAuthDatabaseAccess } from "../serverStateOwnership.ts";
+import { ServerStateLockError } from "../serverStateLock.ts";
 import * as EnvironmentAuthPolicy from "./EnvironmentAuthPolicy.ts";
 import * as PairingGrantStore from "./PairingGrantStore.ts";
 import * as ServerSecretStore from "./ServerSecretStore.ts";
 import * as SessionStore from "./SessionStore.ts";
 import { verifyRequestDpopProof } from "./dpop.ts";
-import { layerConfig as SqlitePersistenceLayer } from "../persistence/Layers/Sqlite.ts";
+import {
+  layerConfig as SqlitePersistenceLayer,
+  SqliteMigrationsEnabled,
+} from "../persistence/Layers/Sqlite.ts";
 
 const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
 export const INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT = "administrative-bootstrap";
@@ -1036,7 +1042,43 @@ export const layer = Layer.effect(EnvironmentAuth, make).pipe(
 
 const storageLayer = Layer.mergeAll(ServerSecretStore.layer, SqlitePersistenceLayer);
 
-export const runtimeLayer = layer.pipe(
-  Layer.provideMerge(storageLayer),
-  Layer.provideMerge(ServerEnvironment.identityLayer),
+class AuthPersistenceAccess extends Context.Service<
+  AuthPersistenceAccess,
+  {
+    readonly allowMigrations: boolean;
+    readonly completeInitialization: () => void;
+  }
+>()("t3/auth/EnvironmentAuth/AuthPersistenceAccess") {}
+
+const authPersistenceAccessLayer = Layer.effect(
+  AuthPersistenceAccess,
+  Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    const access = yield* Effect.acquireRelease(
+      Effect.tryPromise(() => acquireAuthDatabaseAccess(config.stateDir)).pipe(
+        Effect.mapError((cause) => new ServerStateLockError({ stateDir: config.stateDir, cause })),
+      ),
+      (access) => Effect.sync(access.release),
+    );
+    const requestedMigrations = yield* SqliteMigrationsEnabled;
+    return {
+      allowMigrations: access.allowMigrations && requestedMigrations,
+      completeInitialization: access.completeInitialization,
+    };
+  }),
 );
+
+export const runtimeLayer = Layer.unwrap(
+  Effect.gen(function* () {
+    const access = yield* AuthPersistenceAccess;
+    return layer.pipe(
+      Layer.provideMerge(
+        storageLayer.pipe(
+          Layer.provide(Layer.succeed(SqliteMigrationsEnabled, access.allowMigrations)),
+        ),
+      ),
+      Layer.provideMerge(ServerEnvironment.identityLayer),
+      Layer.tap(() => Effect.sync(access.completeInitialization)),
+    );
+  }),
+).pipe(Layer.provide(authPersistenceAccessLayer));

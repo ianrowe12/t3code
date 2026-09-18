@@ -27,6 +27,11 @@ import {
   SERVICE_STOP_MARKER_FILE,
 } from "./cloud/serviceProtocol.ts";
 import { isEntrypoint } from "./entrypoint.ts";
+import {
+  acquireDatabaseAccess,
+  acquireRuntimeStateOwnership,
+  acquireStateLaunchGate,
+} from "./serverStateOwnership.ts";
 
 const HANDOFF_DELAY_MS = 2_000;
 const PREPARED_TIMEOUT_MS = 120_000;
@@ -265,6 +270,7 @@ const stopMarkerPath = (baseDir: string) =>
 
 export class Launcher {
   readonly #baseDir: string;
+  readonly #stateDir: string;
   readonly #statePath: string;
   #state: ServiceState;
   #child: ManagedChild | null = null;
@@ -274,9 +280,11 @@ export class Launcher {
   #stopping = false;
   #done = false;
   readonly #completion = Promise.withResolvers<void>();
+  #releaseLaunchGate: (() => void) | undefined;
 
   constructor(baseDir: string, state: ServiceState) {
     this.#baseDir = baseDir;
+    this.#stateDir = NodePath.join(baseDir, "userdata");
     this.#statePath = NodePath.join(baseDir, "runtime", SERVICE_STATE_FILE);
     this.#state = state;
   }
@@ -287,11 +295,15 @@ export class Launcher {
     process.once("SIGTERM", onSigterm);
     process.once("SIGINT", onSigint);
     try {
-      this.#enqueue(() => this.#recover());
+      this.#enqueue(async () => {
+        this.#releaseLaunchGate = await acquireStateLaunchGate(this.#stateDir);
+        await this.#recover();
+      });
       await this.#completion.promise;
     } finally {
       process.off("SIGTERM", onSigterm);
       process.off("SIGINT", onSigint);
+      this.#releaseLaunchGate?.();
     }
   }
 
@@ -364,6 +376,7 @@ export class Launcher {
       await this.#startChild(this.#state.activeVersion, "active", update);
       return;
     }
+    await this.#validateDatabasePath(update.dbPath);
     if (await databaseRestorePending(this.#baseDir, update)) {
       await this.#returnToPrevious(update, "failed", "rollback-interrupted");
       return;
@@ -376,9 +389,11 @@ export class Launcher {
   }
 
   async #startTrial(pending: PendingServiceUpdate): Promise<void> {
-    // The previous child is dead here, so all three SQLite files are quiescent.
     try {
-      await backupDatabaseOnce(this.#baseDir, pending);
+      await this.#withDatabaseMaintenance(async () => {
+        await this.#validateDatabasePath(pending.dbPath);
+        await backupDatabaseOnce(this.#baseDir, pending);
+      });
     } catch {
       await this.#returnToPrevious(pending, "failed", "db-backup-failed");
       return;
@@ -396,14 +411,22 @@ export class Launcher {
       throw new Error(`Selected t3@${version} runtime is missing or incomplete.`);
     }
     if (this.#stopping) return;
+    const releaseRuntime = await acquireRuntimeStateOwnership(this.#stateDir);
+    releaseRuntime();
     const paths = runtimePaths(this.#baseDir, version);
     const context: ServiceLauncherContext = {
       protocol: SERVICE_LAUNCHER_PROTOCOL,
       childVersion: version,
+      stateDir: this.#stateDir,
+      launcherPid: process.pid,
       ...(update === undefined ? {} : { update }),
     };
     const child = NodeChildProcess.spawn(process.execPath, [paths.entryPath, "serve"], {
-      env: { ...process.env, [SERVICE_LAUNCHER_CONTEXT_ENV]: JSON.stringify(context) },
+      env: {
+        ...process.env,
+        T3CODE_HOME: this.#baseDir,
+        [SERVICE_LAUNCHER_CONTEXT_ENV]: JSON.stringify(context),
+      },
       stdio: ["inherit", "inherit", "inherit", "ipc"],
     });
     await new Promise<void>((resolve, reject) => {
@@ -477,8 +500,10 @@ export class Launcher {
       await reject("Remote updates must select a newer server version.");
       return;
     }
-    if (!NodePath.isAbsolute(message.dbPath)) {
-      await reject("The requested database path is not absolute.");
+    try {
+      await this.#validateDatabasePath(message.dbPath);
+    } catch {
+      await reject("The requested database is not in the state directory owned by this launcher.");
       return;
     }
     if (!(await runtimeExists(this.#baseDir, message.targetVersion))) {
@@ -588,7 +613,10 @@ export class Launcher {
       this.#child = null;
       await terminateChild(child.process);
     }
-    await restoreDatabaseBackup(this.#baseDir, pending);
+    await this.#withDatabaseMaintenance(async () => {
+      await this.#validateDatabasePath(pending.dbPath);
+      await restoreDatabaseBackup(this.#baseDir, pending);
+    });
     const outcome = terminalUpdate({ pending, status, reason });
     const next: ServiceState = {
       ...this.#state,
@@ -599,6 +627,42 @@ export class Launcher {
     this.#state = next;
     await discardDatabaseBackup(this.#baseDir, pending.id).catch(() => undefined);
     await this.#startChild(next.activeVersion, "active", outcome);
+  }
+
+  async #withDatabaseMaintenance<A>(operation: () => Promise<A>): Promise<A> {
+    const release = await acquireRuntimeStateOwnership(this.#stateDir);
+    try {
+      const releaseDatabase = await acquireDatabaseAccess(this.#stateDir, { exclusive: true });
+      try {
+        return await operation();
+      } finally {
+        releaseDatabase();
+      }
+    } finally {
+      release();
+    }
+  }
+
+  async #validateDatabasePath(dbPath: string): Promise<void> {
+    if (
+      !NodePath.isAbsolute(dbPath) ||
+      NodePath.basename(dbPath) !== "state.sqlite" ||
+      (await NodeFSP.realpath(NodePath.dirname(dbPath))) !==
+        (await NodeFSP.realpath(this.#stateDir))
+    ) {
+      throw new Error(
+        "The service database is outside the state directory owned by this launcher.",
+      );
+    }
+    for (const suffix of DB_FILE_SUFFIXES) {
+      const stat = await NodeFSP.lstat(`${dbPath}${suffix}`).catch((cause: unknown) => {
+        if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") return undefined;
+        throw cause;
+      });
+      if (stat !== undefined && !stat.isFile()) {
+        throw new Error("The service database and sidecars must be regular files, not symlinks.");
+      }
+    }
   }
 }
 

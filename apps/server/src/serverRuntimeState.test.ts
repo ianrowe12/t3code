@@ -19,6 +19,33 @@ interface CapturedLog {
 }
 
 describe("serverRuntimeState", () => {
+  it.effect("clears only the runtime record published by the releasing owner", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-runtime-owner-" });
+      const statePath = path.join(root, "server-runtime.json");
+      const first = yield* ServerRuntimeState.makePersistedServerRuntimeState({
+        config: { host: "127.0.0.1", devUrl: undefined },
+        port: 3773,
+      });
+      const replacement = { ...first, startedAt: "2026-09-17T20:31:10.274Z", port: 3774 };
+      yield* ServerRuntimeState.persistServerRuntimeState({
+        path: statePath,
+        state: replacement,
+      });
+
+      yield* ServerRuntimeState.clearPersistedServerRuntimeState(statePath, first);
+      const retained = yield* ServerRuntimeState.readPersistedServerRuntimeState(statePath);
+      assert.deepEqual(Option.getOrThrow(retained), replacement);
+
+      yield* ServerRuntimeState.clearPersistedServerRuntimeState(statePath, replacement);
+      assert.isTrue(
+        Option.isNone(yield* ServerRuntimeState.readPersistedServerRuntimeState(statePath)),
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("persists and reads the runtime state", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

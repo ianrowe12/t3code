@@ -30,6 +30,68 @@ ready to commit.
 A failed or timed-out trial returns to the old version. After commit, the target
 is authoritative and the service manager's ordinary restart policy applies.
 
+## State ownership
+
+Only one server may own a T3 state directory, regardless of port or launcher.
+[State ownership](../../apps/server/src/serverStateLock.ts) must be acquired
+before migrations or startup recovery and held through shutdown recovery. A
+second process cannot reconcile runs whose provider processes are still alive
+in the first. SSH reconnects reuse a live owner; a readiness timeout is not
+permission to replace it or start another server against its state. Project CLI
+commands must not discard a live owner's discovery or silently switch to offline
+mutations when that owner cannot be reached.
+
+Ownership uses two SQLite lock files, separate from the application database.
+The launcher holds an exclusive transaction in `server-launcher-lock.sqlite` for
+its whole lifetime, including gaps between children and database rollback. Every
+child holds an exclusive transaction in `server-lock.sqlite` through shutdown.
+A standalone server or offline project mutation acquires both, launch gate first.
+One lock file is insufficient: a child-only
+lock leaves handoffs open to independent starts, while a launcher-only lock
+disappears on parent death even if its child is still writing.
+
+A managed child checks its launcher's state directory and live parent/IPC again
+after acquiring the runtime lock, before opening application state. A restarted
+launcher must acquire the runtime lock before snapshotting or restoring, so an
+orphan child blocks recovery.
+
+Database access is a separate role. Every file-backed application SQLite
+connection holds a shared transaction in `server-database-access.sqlite` from
+before opening the database through its final close and WAL checkpoint, including
+failed layer builds. Snapshot and restore require exclusive database access after
+runtime ownership. Auth cleanup therefore cannot race a raw restore, even after
+the server exits. Merely starting a child does not require exclusive database
+access. All three coordination files require rollback journal mode, not WAL,
+because WAL readers do not exclude an exclusive writer. Contention fails
+immediately; the launcher never copies through a busy access lease.
+
+Offline project commands acquire ownership before constructing persistence and
+do not initialize authentication. All CLI auth entry points use the same admission
+layer: fresh/offline initialization takes both ownership locks before opening
+SQLite or migrating; live access requires guarded discovery and native runtime
+ownership and skips migrations. Shared access alone never authorizes migrations.
+Initialization releases ownership only after the auth layer is ready, retaining
+database access through session cleanup and connection close. This lets a cloud
+command start its managed server without retaining the launch gate. Live project
+commands also confirm native runtime ownership before selecting HTTP execution.
+Merely wrapping a mutation body would leave auth-layer migrations and cleanup
+outside coordination.
+Updates may only use `state.sqlite` in the
+canonical owned directory; database and sidecar symlinks are rejected. Otherwise
+holding a lock would say nothing about the database being replaced.
+
+The OS releases transactions on process exit. Never delete or replace any
+coordination file while a participant might exist. Discovery metadata is not ownership.
+Guarded discovery can outlive its PID, so SSH checks both locks rather than
+trusting a recycled PID. SSH retains guarded provenance alongside its cached
+PID and port; otherwise a clean shutdown that removes discovery would make a
+recycled cached PID indistinguishable from a legacy server. Busy locks without usable discovery, unreadable metadata,
+and readiness failures stop the connection attempt instead of launching a rival.
+Legacy servers and CLI processes do not participate in these leases; stop them
+and upgrade every participating binary before relying on the guarantee. Launcher
+protocol 3 requires a local `t3 service update` to replace the stable launcher;
+updating only its child cannot add the missing launch gate or access coordinator.
+
 ## Database rollback
 
 After the old child exits, the launcher snapshots SQLite's main file, WAL, and

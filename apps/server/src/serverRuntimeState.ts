@@ -18,6 +18,7 @@ export const PersistedServerRuntimeState = Schema.Struct({
   // Dev is single-origin: browsers must pair through this URL, not `origin`.
   devUrl: Schema.optional(Schema.String),
   startedAt: Schema.String,
+  stateLockVersion: Schema.optional(Schema.Literal(1)),
 });
 export type PersistedServerRuntimeState = typeof PersistedServerRuntimeState.Type;
 
@@ -50,6 +51,7 @@ const runtimeOriginForConfig = (
 export const makePersistedServerRuntimeState = (input: {
   readonly config: Pick<ServerConfig.ServerConfig["Service"], "host" | "devUrl">;
   readonly port: number;
+  readonly stateLockVersion?: 1;
 }): Effect.Effect<PersistedServerRuntimeState> =>
   Effect.map(DateTime.now, (now) => ({
     version: 1,
@@ -59,6 +61,7 @@ export const makePersistedServerRuntimeState = (input: {
     origin: runtimeOriginForConfig(input.config, input.port),
     ...(input.config.devUrl ? { devUrl: input.config.devUrl.toString() } : {}),
     startedAt: DateTime.formatIso(now),
+    ...(input.stateLockVersion === undefined ? {} : { stateLockVersion: input.stateLockVersion }),
   }));
 
 export const persistServerRuntimeState = (input: {
@@ -79,9 +82,21 @@ export const persistServerRuntimeState = (input: {
     ),
   );
 
-export const clearPersistedServerRuntimeState = (path: string) =>
+// The caller holds state ownership through comparison and removal.
+export const clearPersistedServerRuntimeState = (
+  path: string,
+  owner: Pick<PersistedServerRuntimeState, "pid" | "startedAt">,
+) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
+    const current = yield* readPersistedServerRuntimeState(path);
+    if (
+      Option.isNone(current) ||
+      current.value.pid !== owner.pid ||
+      current.value.startedAt !== owner.startedAt
+    ) {
+      return;
+    }
     yield* fs.remove(path, { force: true }).pipe(
       Effect.mapError(
         (cause) =>

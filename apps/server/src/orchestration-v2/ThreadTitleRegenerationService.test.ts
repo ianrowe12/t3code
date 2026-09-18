@@ -1,5 +1,7 @@
 import { assert, describe, it, vi } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
+  AcpRegistrySettings,
   type ChatAttachment,
   CommandId,
   MessageId,
@@ -8,8 +10,12 @@ import {
   ProviderInstanceId,
   ThreadId,
   TextGenerationError,
+  type ServerSettingsError,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
@@ -20,6 +26,9 @@ import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import { ProjectionProjectRepository } from "../persistence/Services/ProjectionProjects.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as TextGeneration from "../textGeneration/TextGeneration.ts";
+import { makeCopilotTextGeneration } from "../textGeneration/CopilotTextGeneration.ts";
+import { AcpRegistryCatalog } from "../provider/acp/AcpRegistrySupport.ts";
+import { writeFakeCli } from "../testUtils/fakeCli.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import type { ProviderAdapterV2Shape } from "./ProviderAdapter.ts";
@@ -30,6 +39,7 @@ import { formatThreadTitleContext } from "./ThreadTitleRegenerationService.ts";
 import { makeOrchestratorV2ReplayLayerWithRegistry } from "./testkit/ProviderReplayHarness.ts";
 
 const projectId = ProjectId.make("project:title-regeneration");
+const decodeCopilotConfig = Schema.decodeEffect(AcpRegistrySettings);
 const modelSelection = {
   instanceId: ProviderInstanceId.make("codex"),
   model: "gpt-5.1-codex",
@@ -46,6 +56,7 @@ const adapter = {
 function makeHarness(
   options: {
     readonly generateTitle?: TextGeneration.TextGeneration["Service"]["generateThreadTitle"];
+    readonly settings?: Layer.Layer<ServerSettings.ServerSettingsService, ServerSettingsError>;
   } = {},
 ) {
   const database = SqlitePersistenceMemory;
@@ -85,7 +96,7 @@ function makeHarness(
         threadManagement,
         projectedProjects,
         Layer.mock(TextGeneration.TextGeneration)({ generateThreadTitle }),
-        ServerSettings.layerTest({}),
+        options.settings ?? ServerSettings.layerTest({}),
       ),
     ),
   );
@@ -218,6 +229,134 @@ describe("formatThreadTitleContext", () => {
 });
 
 describe("ThreadTitleRegenerationService", () => {
+  for (const selection of ["explicit", "unsupported"] as const) {
+    it.effect(
+      `lands an initial Copilot title with ${selection} host text generation selection`,
+      () =>
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const directory = yield* fs.makeTempDirectoryScoped({
+            directory: process.cwd(),
+            prefix: ".copilot-title-service-test-",
+          });
+          const command = writeFakeCli({
+            directory,
+            name: "copilot",
+            source: `
+            import assert from "node:assert/strict";
+            const args = process.argv.slice(2);
+            ${
+              selection === "explicit"
+                ? 'assert.equal(args[args.indexOf("--model") + 1], "gpt-4.1");'
+                : 'assert.equal(args.includes("--model"), false);'
+            }
+            assert.ok(args[args.indexOf("--prompt") + 1].includes("synthetic reconnect failure"));
+            console.log('Experimental features enabled!\\n{"title":"Repair synthetic reconnect"}');
+          `,
+          });
+          const copilotConfig = yield* decodeCopilotConfig({
+            agentId: "github-copilot-cli",
+            enabled: true,
+          });
+          const copilot = yield* makeCopilotTextGeneration({
+            settings: copilotConfig,
+            environment: { PATH: process.env.PATH },
+            helperDirectory: path.join(directory, "helpers"),
+          }).pipe(
+            Effect.provideService(
+              AcpRegistryCatalog,
+              AcpRegistryCatalog.of({
+                search: () => Effect.die("unused"),
+                prepare: () => Effect.die("unused"),
+                inspect: () => Effect.die("unused"),
+                uninstallManagedBinary: () => Effect.die("unused"),
+                resolve: (_settings, cwd, environment) =>
+                  Effect.succeed({
+                    agent: {
+                      id: "github-copilot-cli",
+                      name: "Copilot",
+                      version: "1.0.83",
+                      description: "",
+                      distribution: {},
+                    },
+                    distribution: "binary" as const,
+                    spawn: { command, args: ["--acp"], cwd, env: environment ?? {} },
+                  }),
+              }),
+            ),
+          );
+          const copilotId = ProviderInstanceId.make("copilot_personal");
+          const unsupportedId = ProviderInstanceId.make("unrelated_acp");
+          const harness = makeHarness({
+            generateTitle: copilot.generateThreadTitle,
+            settings: ServerSettings.layerTest({
+              providers: {
+                codex: { enabled: false },
+                claudeAgent: { enabled: false },
+                cursor: { enabled: false },
+                grok: { enabled: false },
+                opencode: { enabled: false },
+                pi: { enabled: false },
+              },
+              providerInstances: {
+                [unsupportedId]: {
+                  driver: ProviderDriverKind.make("acpRegistry"),
+                  enabled: true,
+                  config: { agentId: "gemini-cli" },
+                },
+                [copilotId]: {
+                  driver: ProviderDriverKind.make("acpRegistry"),
+                  enabled: true,
+                  config: copilotConfig,
+                },
+              },
+              textGenerationModelSelection: {
+                instanceId: selection === "explicit" ? copilotId : unsupportedId,
+                model: "gpt-4.1",
+                options: [{ id: "reasoning_effort", value: "medium" }],
+              },
+            }),
+          });
+          yield* Effect.gen(function* () {
+            const threads = yield* ThreadManagement.ThreadManagementService;
+            const titles = yield* ThreadTitleRegeneration.ThreadTitleRegenerationService;
+            const threadId = yield* createThread({
+              command: "command:copilot:create",
+              thread: "thread:copilot-title",
+            });
+            const messageCommand = "command:copilot:message";
+            yield* dispatchUserMessage({
+              command: messageCommand,
+              threadId,
+              text: "Investigate synthetic reconnect failure",
+            });
+            const requestId = yield* armRegeneration({
+              command: "command:copilot:title",
+              threadId,
+            });
+            yield* titles.execute({
+              threadId,
+              requestId,
+              kind: { type: "initial", messageId: MessageId.make(`${messageCommand}:message`) },
+            });
+            const projection = yield* threads.getThreadProjection(threadId);
+            assert.equal(projection.thread.title, "Repair synthetic reconnect");
+            assert.isNotOk(projection.thread.titleRegeneration);
+            assert.equal(harness.generateThreadTitle.mock.calls.length, 1);
+            assert.deepEqual(harness.generateThreadTitle.mock.calls[0]?.[0].modelSelection, {
+              instanceId: copilotId,
+              model: selection === "explicit" ? "gpt-4.1" : "default",
+              ...(selection === "explicit"
+                ? { options: [{ id: "reasoning_effort", value: "medium" }] }
+                : {}),
+            });
+          }).pipe(Effect.provide(harness.layer));
+          assert.deepEqual(yield* fs.readDirectory(path.join(directory, "helpers")), []);
+        }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+    );
+  }
+
   it.effect("arms and clears the regeneration marker through metadata commands", () =>
     Effect.gen(function* () {
       const harness = makeHarness();

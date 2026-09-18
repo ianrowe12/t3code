@@ -456,6 +456,7 @@ DEFAULT_RUNTIME_FILE="$DEFAULT_SERVER_HOME/userdata/server-runtime.json"
 PORT_FILE="$STATE_DIR/port"
 PID_FILE="$STATE_DIR/pid"
 MANAGED_FILE="$STATE_DIR/managed"
+GUARDED_RUNTIME_FILE="$STATE_DIR/guarded-runtime.json"
 LOG_FILE="$STATE_DIR/server.log"
 RUNNER_FILE="$STATE_DIR/run-t3.sh"
 RUNNER_NEXT="$STATE_DIR/run-t3.next.$$"
@@ -467,10 +468,6 @@ trap cleanup_runner_next EXIT
 cat >"$RUNNER_NEXT" <<'SH'
 @@T3_RUNNER_SCRIPT@@
 SH
-RUNNER_CHANGED=0
-if [ ! -f "$RUNNER_FILE" ] || ! cmp -s "$RUNNER_NEXT" "$RUNNER_FILE"; then
-  RUNNER_CHANGED=1
-fi
 mv "$RUNNER_NEXT" "$RUNNER_FILE"
 chmod 700 "$RUNNER_FILE"
 if ! ensure_remote_node_path; then
@@ -496,23 +493,99 @@ wait_for_pid_exit() {
   done
 }
 resolve_default_runtime_port() {
-  node - "$DEFAULT_RUNTIME_FILE" <<'NODE'
+  node - "$DEFAULT_RUNTIME_FILE" "$GUARDED_RUNTIME_FILE" "$PID_FILE" "$PORT_FILE" "\${1:-probe}" <<'NODE'
 const fs = require("node:fs");
+const path = require("node:path");
+const { DatabaseSync } = require("node:sqlite");
 const runtimePath = process.argv[2] ?? "";
+const guardedPath = process.argv[3];
+function readOptional(file) {
+  try { return fs.readFileSync(file, "utf8"); }
+  catch (error) {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+function lockBusy(filename) {
+  const lockPath = path.join(path.dirname(runtimePath), filename);
+  try {
+    fs.statSync(lockPath);
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+  const db = new DatabaseSync(lockPath);
+  try {
+    db.exec("PRAGMA busy_timeout = 0");
+    db.exec("BEGIN EXCLUSIVE");
+    return false;
+  } catch (error) {
+    if (error.errcode === 5 || error.errcode === 6) return true;
+    throw error;
+  } finally {
+    db.close();
+  }
+}
 try {
-	  const runtime = JSON.parse(fs.readFileSync(runtimePath, "utf8"));
-	  const pid = Number(runtime.pid);
-	  const port = Number(runtime.port);
-	  if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(port)) {
-	    process.exit(1);
-	  }
+  const guardedRaw = readOptional(guardedPath);
+  const guarded = guardedRaw === undefined ? undefined : JSON.parse(guardedRaw);
+  if (guarded !== undefined && (guarded === null || guarded.version !== 1 ||
+      !Number.isInteger(guarded.pid) || guarded.pid <= 0 ||
+      !Number.isInteger(guarded.port) || guarded.port <= 0 || guarded.port > 65535)) {
+    throw new Error("Guarded SSH discovery cache is invalid.");
+  }
+  const launchBusy = lockBusy("server-launcher-lock.sqlite");
+  const runtimeBusy = lockBusy("server-lock.sqlite");
+  const busy = launchBusy || runtimeBusy;
+  let raw;
+  try {
+    raw = fs.readFileSync(runtimePath, "utf8");
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    if (busy) throw new Error("State ownership is busy but server discovery is missing.");
+    if (guarded !== undefined) {
+      if (readOptional(process.argv[4])?.trim() !== String(guarded.pid) ||
+          readOptional(process.argv[5])?.trim() !== String(guarded.port)) {
+        throw new Error("Guarded SSH discovery does not match the cached runtime.");
+      }
+      fs.rmSync(guardedPath);
+      process.stdout.write("stale");
+    }
+    process.exit(0);
+  }
+  const runtime = JSON.parse(raw);
+  const { pid, port } = runtime;
+  if (runtime.version !== 1 || !Number.isInteger(pid) || pid <= 0 ||
+      !Number.isInteger(port) || port <= 0 || port > 65535 ||
+      (runtime.stateLockVersion !== undefined && runtime.stateLockVersion !== 1)) {
+    throw new Error("Server discovery is invalid or unsupported.");
+  }
   const origin = new URL(String(runtime.origin ?? ""));
   if (origin.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(origin.hostname)) {
-    process.exit(1);
+    throw new Error("Server discovery does not have a loopback HTTP origin.");
   }
-  process.kill(pid, 0);
+  if (runtime.stateLockVersion === 1 && !busy) {
+    fs.rmSync(guardedPath, { force: true });
+    process.stdout.write("stale");
+    process.exit(0);
+  }
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if (error.code !== "ESRCH") throw error;
+    if (busy) throw new Error("State ownership is busy but server discovery is stale.");
+    fs.rmSync(guardedPath, { force: true });
+    process.stdout.write("stale");
+    process.exit(0);
+  }
+  if (process.argv[6] === "remember") {
+    if (runtime.stateLockVersion === 1) {
+      fs.writeFileSync(guardedPath, JSON.stringify({ version: 1, pid, port }) + "\\n", { mode: 0o600 });
+    } else fs.rmSync(guardedPath, { force: true });
+  }
   process.stdout.write(\`\${pid} \${port}\`);
-} catch {
+} catch (error) {
+  process.stderr.write("Refusing to start another T3 server: " + error.message + "\\n");
   process.exit(1);
 }
 NODE
@@ -520,60 +593,32 @@ NODE
 REMOTE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
 REMOTE_PORT="$(cat "$PORT_FILE" 2>/dev/null || true)"
 REMOTE_MANAGED="$(cat "$MANAGED_FILE" 2>/dev/null || true)"
-DEFAULT_RUNTIME_INFO="$(resolve_default_runtime_port 2>/dev/null || true)"
+DEFAULT_RUNTIME_INFO="$(resolve_default_runtime_port)" || exit 1
 DEFAULT_RUNTIME_PID=""
 DEFAULT_REMOTE_PORT=""
-if [ -n "$DEFAULT_RUNTIME_INFO" ]; then
+if [ "$DEFAULT_RUNTIME_INFO" = "stale" ]; then
+  REMOTE_PID=""
+  REMOTE_PORT=""
+  REMOTE_MANAGED=""
+elif [ -n "$DEFAULT_RUNTIME_INFO" ]; then
   DEFAULT_RUNTIME_PID="\${DEFAULT_RUNTIME_INFO%% *}"
   DEFAULT_REMOTE_PORT="\${DEFAULT_RUNTIME_INFO#* }"
 fi
 if [ -n "$DEFAULT_REMOTE_PORT" ]; then
+  REMOTE_PID="$DEFAULT_RUNTIME_PID"
   REMOTE_PORT="$DEFAULT_REMOTE_PORT"
-  if wait_ready "@@T3_REUSE_READY_TIMEOUT_MS@@"; then
-    if [ "$REMOTE_MANAGED" = "managed" ]; then
-      PID_TO_STOP="\${REMOTE_PID:-$DEFAULT_RUNTIME_PID}"
-      if [ -n "$PID_TO_STOP" ] && kill -0 "$PID_TO_STOP" 2>/dev/null; then
-        kill "$PID_TO_STOP" 2>/dev/null || true
-        wait_for_pid_exit "$PID_TO_STOP"
-      fi
-      REMOTE_PID=""
-      REMOTE_PORT="$DEFAULT_REMOTE_PORT"
-      REMOTE_MANAGED="external"
-      rm -f "$PID_FILE"
-      printf '%s\\n' "$REMOTE_PORT" >"$PORT_FILE"
-      printf 'external\\n' >"$MANAGED_FILE"
-    else
-      printf '%s\\n' "$REMOTE_PORT" >"$PORT_FILE"
-      printf 'external\\n' >"$MANAGED_FILE"
-      REMOTE_PID=""
-      REMOTE_MANAGED="external"
-    fi
-  else
-    REMOTE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
-    REMOTE_PORT="$(cat "$PORT_FILE" 2>/dev/null || true)"
-    REMOTE_MANAGED="$(cat "$MANAGED_FILE" 2>/dev/null || true)"
-  fi
+  REMOTE_MANAGED="external"
 fi
-if [ "$REMOTE_MANAGED" = "external" ]; then
+if [ -n "$REMOTE_PID" ] && kill -0 "$REMOTE_PID" 2>/dev/null; then
   if [ -z "$REMOTE_PORT" ] || ! wait_ready "@@T3_REUSE_READY_TIMEOUT_MS@@"; then
-    REMOTE_PID=""
-    REMOTE_PORT=""
-    REMOTE_MANAGED=""
+    printf 'A T3 server is already running with PID %s but is not ready. Refusing to start another server against %s. Retry the connection when it is ready.\\n' "$REMOTE_PID" "$DEFAULT_SERVER_HOME" >&2
+    exit 1
   fi
-elif [ -n "$REMOTE_PID" ] && [ -n "$REMOTE_PORT" ] && kill -0 "$REMOTE_PID" 2>/dev/null; then
-  if [ "$RUNNER_CHANGED" -eq 1 ]; then
-    kill "$REMOTE_PID" 2>/dev/null || true
-    wait_for_pid_exit "$REMOTE_PID"
-    REMOTE_PID=""
-    REMOTE_PORT=""
-    REMOTE_MANAGED=""
-  elif ! wait_ready "@@T3_REUSE_READY_TIMEOUT_MS@@"; then
-    kill "$REMOTE_PID" 2>/dev/null || true
-    wait_for_pid_exit "$REMOTE_PID"
-    REMOTE_PID=""
-    REMOTE_PORT=""
-    REMOTE_MANAGED=""
-  fi
+  printf '%s\\n' "$REMOTE_PID" >"$PID_FILE"
+  printf '%s\\n' "$REMOTE_PORT" >"$PORT_FILE"
+  printf '%s\\n' "\${REMOTE_MANAGED:-managed}" >"$MANAGED_FILE"
+elif [ "$REMOTE_MANAGED" = "external" ] && [ -n "$REMOTE_PORT" ] && wait_ready "@@T3_REUSE_READY_TIMEOUT_MS@@"; then
+  REMOTE_PID=""
 else
   REMOTE_PID=""
   REMOTE_PORT=""
@@ -603,6 +648,7 @@ if [ -z "$REMOTE_PORT" ]; then
     exit 1
   fi
 fi
+resolve_default_runtime_port remember >/dev/null || exit 1
 printf '{"remotePort":%s,"serverKind":"%s"}\\n' "$REMOTE_PORT" "\${REMOTE_MANAGED:-managed}"
 `;
 
@@ -624,6 +670,7 @@ STATE_DIR="$HOME/.t3/ssh-launch/@@T3_STATE_KEY@@"
 PID_FILE="$STATE_DIR/pid"
 PORT_FILE="$STATE_DIR/port"
 MANAGED_FILE="$STATE_DIR/managed"
+GUARDED_RUNTIME_FILE="$STATE_DIR/guarded-runtime.json"
 REMOTE_MANAGED="$(cat "$MANAGED_FILE" 2>/dev/null || true)"
 REMOTE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
 if [ "$REMOTE_MANAGED" != "external" ] && [ -n "$REMOTE_PID" ] && kill -0 "$REMOTE_PID" 2>/dev/null; then
@@ -638,7 +685,7 @@ if [ "$REMOTE_MANAGED" != "external" ] && [ -n "$REMOTE_PID" ] && kill -0 "$REMO
     exit 1
   fi
 fi
-rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE"
+rm -f "$PID_FILE" "$PORT_FILE" "$MANAGED_FILE" "$GUARDED_RUNTIME_FILE"
 printf '{"stopped":true}\\n'
 `;
 

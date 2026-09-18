@@ -2,15 +2,29 @@ import {
   AcpRegistryOperationError,
   AcpRegistrySettings,
   ProviderInstanceId,
+  type TextGenerationError,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
+import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
+import * as ServerConfig from "../../config.ts";
+import * as IdAllocator from "../../orchestration-v2/IdAllocator.ts";
+import * as ServerSettings from "../../serverSettings.ts";
+import { writeFakeCli } from "../../testUtils/fakeCli.ts";
+import type { TextGeneration } from "../../textGeneration/TextGeneration.ts";
+import { NoOpProviderEventLoggers, ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
 import { AcpRegistryCatalog, type AcpRegistryInspection } from "../acp/AcpRegistrySupport.ts";
 import {
   acpRegistrySnapshotReadiness,
+  AcpRegistryDriver,
   applyAcpRegistryAvailableCommands,
   applyAcpRegistryLiveConfiguration,
   buildCheckedAcpRegistrySnapshot,
@@ -45,6 +59,159 @@ function catalogWithInspection(inspection: AcpRegistryInspection): AcpRegistryCa
 }
 
 describe("acpRegistrySnapshotReadiness", () => {
+  it.effect("binds Copilot helpers to each instance without enabling unrelated ACP helpers", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({
+        directory: process.cwd(),
+        prefix: ".copilot-driver-test-",
+      });
+      const commandPath = writeFakeCli({
+        directory,
+        name: "configured-copilot",
+        source: `
+          import assert from "node:assert/strict";
+          const args = process.argv.slice(2);
+          assert.equal(args.includes("--acp"), false);
+          const model = args[args.indexOf("--model") + 1];
+          assert.equal(process.env.COPILOT_GITHUB_TOKEN, "synthetic-" + model);
+          const prompt = args[args.indexOf("--prompt") + 1];
+          if (prompt.includes("Staged patch:")) console.log('{"subject":"Repair state","body":""}');
+          else if (prompt.includes("Base branch:")) console.log('{"title":"Repair state","body":"Summary"}');
+          else if (prompt.includes("key: branch")) console.log('{"branch":"repair-state"}');
+          else console.log('{"title":"Repair state"}');
+        `,
+      });
+      const catalog = AcpRegistryCatalog.of({
+        ...catalogWithInspection({
+          status: "unprepared",
+          agentId: "github-copilot-cli",
+          version: "1.0.83",
+          distribution: "binary",
+        }),
+        resolve: (config, cwd, environment) => {
+          expect(config.commandPath).toBe(commandPath);
+          return Effect.succeed({
+            agent: {
+              id: "github-copilot-cli",
+              name: "Copilot",
+              version: "1.0.83",
+              description: "",
+              distribution: {},
+            },
+            distribution: "binary" as const,
+            spawn: { command: commandPath, args: ["--acp"], cwd, env: environment ?? {} },
+          });
+        },
+      });
+      yield* Effect.gen(function* () {
+        for (const [id, agentId] of [
+          ["copilot_personal", "github-copilot-cli"],
+          ["copilot_work", "github-copilot-cli"],
+          ["gemini", "gemini-cli"],
+        ] as const) {
+          const instanceId = ProviderInstanceId.make(id);
+          const instance = yield* AcpRegistryDriver.create({
+            ...identity,
+            instanceId,
+            enabled: true,
+            config: decodeSettings({ agentId, commandPath }),
+            environment: [
+              { name: "COPILOT_GITHUB_TOKEN", value: `synthetic-${id}`, sensitive: true },
+            ],
+          });
+          const common = {
+            cwd: "/untrusted-workspace",
+            modelSelection: { instanceId, model: id },
+          };
+          const operations: ReadonlyArray<{
+            readonly effect: Effect.Effect<
+              Effect.Success<
+                ReturnType<TextGeneration["Service"][keyof TextGeneration["Service"]]>
+              >,
+              TextGenerationError
+            >;
+            readonly expected: unknown;
+          }> = [
+            {
+              effect: instance.textGeneration.generateThreadTitle({
+                ...common,
+                message: "Repair state",
+              }),
+              expected: { title: "Repair state" },
+            },
+            {
+              effect: instance.textGeneration.generateBranchName({
+                ...common,
+                message: "Repair state",
+              }),
+              expected: { branch: "repair-state" },
+            },
+            {
+              effect: instance.textGeneration.generateCommitMessage({
+                ...common,
+                branch: "main",
+                stagedSummary: "",
+                stagedPatch: "",
+              }),
+              expected: { subject: "Repair state", body: "" },
+            },
+            {
+              effect: instance.textGeneration.generatePrContent({
+                ...common,
+                baseBranch: "main",
+                headBranch: "fix",
+                commitSummary: "",
+                diffSummary: "",
+                diffPatch: "",
+              }),
+              expected: { title: "Repair state", body: "Summary" },
+            },
+          ];
+          for (const operation of operations) {
+            if (agentId === "github-copilot-cli") {
+              expect(yield* operation.effect).toEqual(operation.expected);
+            } else {
+              expect((yield* Effect.flip(operation.effect)).detail).toContain(
+                "do not provide application text generation",
+              );
+            }
+          }
+        }
+      }).pipe(
+        Effect.provideService(AcpRegistryCatalog, catalog),
+        Effect.provideService(ProviderEventLoggers, NoOpProviderEventLoggers),
+        Effect.provideService(HostProcessEnvironment, {
+          PATH: process.env.PATH,
+          COPILOT_GITHUB_TOKEN: "synthetic-host-token",
+        }),
+        Effect.provide(
+          Layer.mergeAll(
+            ServerConfig.layerTest(directory, path.join(directory, "t3-home")),
+            ServerSettings.layerTest(),
+            IdAllocator.layer,
+            Layer.mock(BackgroundPolicy.BackgroundPolicy)({
+              shouldRunScopeWork: () => Effect.succeed(false),
+            }),
+          ),
+        ),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it("offers app text generation only for the Copilot registry agent", () => {
+    for (const agentId of ["github-copilot-cli", "gemini-cli", ""]) {
+      const snapshot = buildCheckedAcpRegistrySnapshot({
+        ...identity,
+        settings: decodeSettings({ agentId }),
+        checkedAt: "2026-09-13T00:00:00.000Z",
+        inspection: { status: "ready", agentId, version: "1.0.83", distribution: "binary" },
+      });
+      expect(snapshot.supportsTextGeneration).toBe(agentId === "github-copilot-cli");
+    }
+  });
+
   it("treats a live empty command advertisement as an authoritative replacement", () => {
     const provider = buildCheckedAcpRegistrySnapshot({
       ...identity,

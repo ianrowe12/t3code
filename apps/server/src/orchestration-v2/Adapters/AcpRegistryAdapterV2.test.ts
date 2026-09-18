@@ -1,6 +1,12 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
-import { ProviderInstanceId, ProviderSessionId, ThreadId } from "@t3tools/contracts";
+import {
+  CheckpointId,
+  EnvironmentId,
+  ProviderInstanceId,
+  ProviderSessionId,
+  ThreadId,
+} from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Crypto from "effect/Crypto";
@@ -13,6 +19,7 @@ import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import type {
   AcpRegistryAvailableCommands,
   AcpRegistryLiveConfiguration,
@@ -79,7 +86,349 @@ const testLayer = Layer.mergeAll(
   registryLayer,
 );
 
+const SpawnRecord = Schema.Struct({
+  args: Schema.Array(Schema.String),
+  endpoint: Schema.optionalKey(Schema.String),
+  authorization: Schema.optionalKey(Schema.String),
+  node: Schema.optionalKey(Schema.String),
+  entrypoint: Schema.optionalKey(Schema.String),
+  providerVariable: Schema.optionalKey(Schema.String),
+});
+
+const existingAgentArgs = ["--acp", "--existing-fixture-argument"];
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+
+function assertNativeMcpArgs(args: ReadonlyArray<string>, mcpBridgeArgs: ReadonlyArray<string>) {
+  assert.lengthOf(args, existingAgentArgs.length + 2);
+  assert.deepEqual(args.slice(0, -1), [...existingAgentArgs, "--additional-mcp-config"]);
+  assert.deepEqual(decodeJson(args.at(-1)), {
+    mcpServers: {
+      "t3-code": {
+        command: process.execPath,
+        args: mcpBridgeArgs,
+        env: { ELECTRON_RUN_AS_NODE: "1" },
+      },
+    },
+  });
+}
+
+const AcpRequestRecord = Schema.Struct({
+  method: Schema.optionalKey(Schema.String),
+  params: Schema.optionalKey(
+    Schema.Struct({
+      sessionId: Schema.optionalKey(Schema.String),
+      mcpServers: Schema.optionalKey(Schema.Array(Schema.Unknown)),
+    }),
+  ),
+});
+const decodeSpawnRecords = Schema.decodeUnknownEffect(
+  Schema.Array(Schema.fromJsonString(SpawnRecord)),
+);
+const decodeRequestRecords = Schema.decodeUnknownEffect(
+  Schema.Array(Schema.fromJsonString(AcpRequestRecord)),
+);
+
+const makeMcpLaunchFixture = Effect.fnUntraced(function* (agentId: string) {
+  const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const fileSystem = yield* FileSystem.FileSystem;
+  const idAllocator = yield* IdAllocatorV2;
+  const path = yield* Path.Path;
+  const mcpBridgeArgs = [
+    process.argv[1] === undefined ? "t3" : path.resolve(process.argv[1]),
+    "acp-mcp-bridge",
+  ];
+  const serverConfig = yield* ServerConfig;
+  const mockAgentPath = yield* path.fromFileUrl(
+    new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+  );
+  const spawnLog = path.join(serverConfig.providerStatusCacheDir, "mcp-spawns.jsonl");
+  const requestLog = path.join(serverConfig.providerStatusCacheDir, "mcp-requests.jsonl");
+  yield* fileSystem.makeDirectory(serverConfig.providerStatusCacheDir, { recursive: true });
+  const recordSpawn = `import { appendFileSync } from "node:fs";
+    appendFileSync(process.env.T3_TEST_MCP_SPAWN_LOG, JSON.stringify({
+      args: process.argv.slice(2),
+      endpoint: process.env.T3_ACP_MCP_ENDPOINT,
+      authorization: process.env.T3_ACP_MCP_AUTHORIZATION,
+      node: process.env.T3_ACP_MCP_NODE,
+      entrypoint: process.env.T3_ACP_MCP_ENTRYPOINT,
+      providerVariable: process.env.T3_TEST_PROVIDER_VARIABLE
+    }) + "\\n");`;
+  const args = [
+    "--import",
+    `data:text/javascript,${encodeURIComponent(recordSpawn)}`,
+    mockAgentPath,
+    ...existingAgentArgs,
+  ];
+  const instanceId = ProviderInstanceId.make("acp-registry-mcp-launch");
+  const settings = yield* decodeAcpRegistryAdapterSettings({ agentId });
+  const adapter = makeAcpRegistryAdapterV2({
+    crypto: yield* Crypto.Crypto,
+    instanceId,
+    settings,
+    environment: {},
+    childProcessSpawner,
+    fileSystem,
+    idAllocator,
+    resolver: {
+      resolve: (_settings, cwd) =>
+        Effect.succeed({
+          agent: {
+            id: agentId,
+            name: "MCP launch fixture",
+            version: "1.0.83",
+            description: "Records the native process MCP configuration",
+            distribution: { npx: { package: "fixture", args: ["--acp"] } },
+          },
+          distribution: "npx",
+          spawn: {
+            command: process.execPath,
+            args,
+            cwd,
+            env: {
+              T3_ACP_SESSION_LIFECYCLE: "1",
+              T3_TEST_MCP_SPAWN_LOG: spawnLog,
+              T3_ACP_REQUEST_LOG_PATH: requestLog,
+              T3_ACP_MCP_ENDPOINT: "http://127.0.0.1:1/stale",
+              T3_ACP_MCP_AUTHORIZATION: "stale-provider-authorization",
+              T3_TEST_PROVIDER_VARIABLE: "private-provider-setting",
+            },
+          },
+        }),
+    },
+    serverConfig,
+  });
+  const runtimePolicy = ProviderAdapterV2RuntimePolicy.make({
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    cwd: process.cwd(),
+  });
+  const modelSelection = { instanceId, model: "default" } as const;
+  const registerMcp = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    authorization: string,
+    endpoint = "http://127.0.0.1:43123/mcp",
+  ) {
+    McpProviderSession.setMcpProviderSession({
+      environmentId: EnvironmentId.make("environment-registry-mcp-launch"),
+      threadId,
+      providerSessionId: `mcp-${threadId}`,
+      providerInstanceId: instanceId,
+      endpoint,
+      authorizationHeader: authorization,
+      browserToolsAvailable: false,
+    });
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId)),
+    );
+  });
+  const readSpawns = fileSystem
+    .readFileString(spawnLog)
+    .pipe(Effect.flatMap((text) => decodeSpawnRecords(text.trim().split("\n"))));
+  const readRequests = fileSystem
+    .readFileString(requestLog)
+    .pipe(Effect.flatMap((text) => decodeRequestRecords(text.trim().split("\n"))));
+  return {
+    adapter,
+    instanceId,
+    modelSelection,
+    runtimePolicy,
+    registerMcp,
+    readSpawns,
+    readRequests,
+    mcpBridgeArgs,
+  };
+});
+
 describe("AcpRegistryAdapterV2", () => {
+  it.effect("exposes T3 MCP to the native Copilot process without credentials in argv", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeMcpLaunchFixture("github-copilot-cli");
+      const threadId = ThreadId.make("thread-copilot-native-mcp");
+      yield* fixture.registerMcp(threadId, "******");
+      yield* fixture.adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("session-copilot-native-mcp"),
+        modelSelection: fixture.modelSelection,
+        runtimePolicy: fixture.runtimePolicy,
+      });
+      const spawns = yield* fixture.readSpawns;
+      assert.lengthOf(spawns, 1);
+      const spawn = spawns[0]!;
+      assertNativeMcpArgs(spawn.args, fixture.mcpBridgeArgs);
+      assert.equal(spawn.node, process.execPath);
+      assert.equal(spawn.entrypoint, fixture.mcpBridgeArgs[0]);
+      assert.equal(spawn.providerVariable, "private-provider-setting");
+      assert.equal(spawn.endpoint, "http://127.0.0.1:43123/mcp");
+      assert.equal(spawn.authorization, "******");
+      assert.notInclude(spawn.args.join("\n"), "fixture-scoped-authorization");
+      assert.notInclude(spawn.args.join("\n"), "http://127.0.0.1:43123/mcp");
+      const requests = yield* fixture.readRequests;
+      assert.deepEqual(
+        requests.find((request) => request.method === "session/new")?.params?.mcpServers,
+        [
+          {
+            type: "stdio",
+            name: "t3-code",
+            command: process.execPath,
+            args: fixture.mcpBridgeArgs,
+            env: [
+              { name: "ELECTRON_RUN_AS_NODE", value: "1" },
+              { name: "T3_ACP_MCP_ENDPOINT", value: "http://127.0.0.1:43123/mcp" },
+              { name: "T3_ACP_MCP_AUTHORIZATION", value: "******" },
+            ],
+          },
+        ],
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("does not inject native MCP without T3 context", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-copilot-without-mcp");
+      const fixture = yield* makeMcpLaunchFixture("github-copilot-cli");
+      yield* fixture.adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("session-copilot-without-mcp"),
+        modelSelection: fixture.modelSelection,
+        runtimePolicy: fixture.runtimePolicy,
+      });
+      const spawns = yield* fixture.readSpawns;
+      assert.lengthOf(spawns, 1);
+      assert.deepEqual(spawns[0]!.args, existingAgentArgs);
+      assert.equal(spawns[0]!.providerVariable, "private-provider-setting");
+      assert.equal(spawns[0]!.endpoint, "http://127.0.0.1:1/stale");
+      assert.equal(spawns[0]!.authorization, "stale-provider-authorization");
+      const requests = yield* fixture.readRequests;
+      assert.deepEqual(
+        requests.find((request) => request.method === "session/new")?.params?.mcpServers,
+        [],
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("keeps other registry agents on the normal ACP MCP configuration", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeMcpLaunchFixture("fixture-agent");
+      const threadId = ThreadId.make("thread-other-agent-mcp");
+      const authorization = "other-agent-credential";
+      const endpoint = "http://127.0.0.1:43124/mcp";
+      yield* fixture.registerMcp(threadId, authorization, endpoint);
+      yield* fixture.adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("session-other-agent-mcp"),
+        modelSelection: fixture.modelSelection,
+        runtimePolicy: fixture.runtimePolicy,
+      });
+      const spawns = yield* fixture.readSpawns;
+      assert.lengthOf(spawns, 1);
+      assert.deepEqual(spawns[0]!.args, existingAgentArgs);
+      assert.equal(spawns[0]!.authorization, authorization);
+      assert.equal(spawns[0]!.endpoint, endpoint);
+      const requests = yield* fixture.readRequests;
+      assert.deepEqual(
+        requests.find((request) => request.method === "session/new")?.params?.mcpServers,
+        [
+          {
+            type: "stdio",
+            name: "t3-code",
+            command: process.execPath,
+            args: fixture.mcpBridgeArgs,
+            env: [
+              { name: "ELECTRON_RUN_AS_NODE", value: "1" },
+              { name: "T3_ACP_MCP_ENDPOINT", value: endpoint },
+              { name: "T3_ACP_MCP_AUTHORIZATION", value: authorization },
+            ],
+          },
+        ],
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("refreshes inherited MCP credentials when cold-resuming a Copilot session", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeMcpLaunchFixture("github-copilot-cli");
+      const threadId = ThreadId.make("thread-copilot-cold-resume");
+      const selection = {
+        threadId,
+        modelSelection: fixture.modelSelection,
+        runtimePolicy: fixture.runtimePolicy,
+      };
+      yield* fixture.registerMcp(threadId, "first-session-credential");
+      const providerThread = yield* Effect.gen(function* () {
+        const runtime = yield* fixture.adapter.openSession({
+          ...selection,
+          providerSessionId: ProviderSessionId.make("session-copilot-before-resume"),
+        });
+        return yield* runtime.ensureThread(selection);
+      }).pipe(Effect.scoped);
+      const nativeThreadId = providerThread.nativeThreadRef?.nativeId;
+      if (nativeThreadId === null || nativeThreadId === undefined) {
+        assert.fail("Expected a persisted native session ID");
+      }
+      const endpoint = "http://127.0.0.1:43125/mcp";
+      yield* fixture.registerMcp(threadId, "resumed-session-credential", endpoint);
+      yield* fixture.adapter.openSession({
+        ...selection,
+        providerSessionId: ProviderSessionId.make("session-copilot-after-resume"),
+        initialNativeThreadId: nativeThreadId,
+      });
+      const spawns = yield* fixture.readSpawns;
+      assert.lengthOf(spawns, 2);
+      for (const spawn of spawns) assertNativeMcpArgs(spawn.args, fixture.mcpBridgeArgs);
+      assert.equal(spawns[0]!.authorization, "first-session-credential");
+      assert.equal(spawns[1]!.authorization, "resumed-session-credential");
+      assert.equal(spawns[1]!.endpoint, endpoint);
+      const requests = yield* fixture.readRequests;
+      assert.deepInclude(requests.find((request) => request.method === "session/resume")?.params, {
+        sessionId: nativeThreadId,
+      });
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("uses the target thread's MCP credentials for a Copilot replacement process", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeMcpLaunchFixture("github-copilot-cli");
+      const sourceThreadId = ThreadId.make("thread-copilot-replacement-source");
+      const targetThreadId = ThreadId.make("thread-copilot-replacement-target");
+      yield* fixture.registerMcp(sourceThreadId, "source-thread-credential");
+      yield* fixture.registerMcp(
+        targetThreadId,
+        "target-thread-credential",
+        "http://127.0.0.1:43126/mcp",
+      );
+      const selection = {
+        threadId: sourceThreadId,
+        modelSelection: fixture.modelSelection,
+        runtimePolicy: fixture.runtimePolicy,
+      };
+      const runtime = yield* fixture.adapter.openSession({
+        ...selection,
+        providerSessionId: ProviderSessionId.make("session-copilot-replacement"),
+      });
+      const providerThread = yield* runtime.ensureThread(selection);
+      yield* runtime.rollbackThread({
+        providerThread: { ...providerThread, appThreadId: targetThreadId },
+        providerThreadTurns: [],
+        target: {
+          type: "thread_start",
+          checkpointId: CheckpointId.make("checkpoint-copilot-replacement"),
+          appRunOrdinal: 0,
+        },
+      });
+      const spawns = yield* fixture.readSpawns;
+      assert.lengthOf(spawns, 2);
+      for (const spawn of spawns) assertNativeMcpArgs(spawn.args, fixture.mcpBridgeArgs);
+      assert.equal(spawns[0]!.authorization, "source-thread-credential");
+      assert.equal(spawns[1]!.authorization, "target-thread-credential");
+      assert.equal(spawns[1]!.endpoint, "http://127.0.0.1:43126/mcp");
+      const requests = yield* fixture.readRequests;
+      assert.lengthOf(
+        requests.filter((request) => request.method === "session/new"),
+        2,
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it("is registered as a generic provider driver with schema defaults", () => {
     assert.isTrue(BUILT_IN_PROVIDER_ADAPTER_DRIVER_KINDS_V2.has(ACP_REGISTRY_PROVIDER));
     assert.equal(AcpRegistryAdapterV2Driver.driverKind, ACP_REGISTRY_PROVIDER);

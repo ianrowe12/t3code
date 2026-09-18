@@ -10,10 +10,13 @@ import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import { assert, describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as TestConsole from "effect/testing/TestConsole";
 import { Command } from "effect/unstable/cli";
 
 import { cli } from "../binCli.ts";
+import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
+import { acquireServerStateLock } from "../serverStateLock.ts";
 import {
   SERVICE_LAUNCHER_CONTEXT_ENV,
   SERVICE_LAUNCHER_PROTOCOL,
@@ -143,6 +146,17 @@ const withDescriptorServer = <A, E, R>(run: (origin: string) => Effect.Effect<A,
     (server) => Effect.sync(() => server.close()),
   );
 
+const ownInitializedState = Effect.fn("PairTest.ownInitializedState")(function* (
+  statePath: string,
+) {
+  const stateDir = NodePath.dirname(statePath);
+  yield* acquireServerStateLock({ stateDir, serverRuntimeStatePath: statePath });
+  yield* SqlClient.SqlClient.pipe(
+    Effect.asVoid,
+    Effect.provide(makeSqlitePersistenceLive(NodePath.join(stateDir, "state.sqlite"))),
+  );
+});
+
 describe("t3 pair", () => {
   it.effect("mints a token and prints a QR pairing URL for a live server", () =>
     withDescriptorServer((origin) =>
@@ -150,11 +164,13 @@ describe("t3 pair", () => {
         const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pair-test-"));
         const port = Number(new URL(origin).port);
         const statePath = NodePath.join(baseDir, "userdata", "server-runtime.json");
+        yield* ownInitializedState(statePath);
         yield* persistServerRuntimeState({
           path: statePath,
           state: yield* makePersistedServerRuntimeState({
             config: { host: "127.0.0.1", devUrl: undefined },
             port,
+            stateLockVersion: 1,
           }),
         });
 
@@ -185,10 +201,13 @@ describe("t3 pair", () => {
         [SERVICE_LAUNCHER_CONTEXT_ENV]: JSON.stringify({
           protocol: SERVICE_LAUNCHER_PROTOCOL,
           childVersion: packageJson.version,
+          stateDir: "/test-state",
+          launcherPid: 123,
         }),
       }),
       Effect.provideService(ServiceLauncherClient.ServiceLauncherHostProcess, {
         connected: false,
+        parentPid: 123,
         send: () => false,
         on: () => undefined,
         off: () => undefined,
@@ -202,11 +221,13 @@ describe("t3 pair", () => {
         const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pair-dev-test-"));
         const port = Number(new URL(origin).port);
         const statePath = NodePath.join(baseDir, "dev", "server-runtime.json");
+        yield* ownInitializedState(statePath);
         yield* persistServerRuntimeState({
           path: statePath,
           state: yield* makePersistedServerRuntimeState({
             config: { host: undefined, devUrl: new URL("http://localhost:5733") },
             port,
+            stateLockVersion: 1,
           }),
         });
 

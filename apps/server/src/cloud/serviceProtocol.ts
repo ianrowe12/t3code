@@ -1,7 +1,7 @@
 import type { ServerSelfUpdateOutcome } from "@t3tools/contracts";
 
-/** Protocol 2 snapshots SQLite before trials so migrations can be rolled back safely. */
-export const SERVICE_LAUNCHER_PROTOCOL = 2 as const;
+/** Protocol 3 owns the state launch gate across children, snapshots, and rollback. */
+export const SERVICE_LAUNCHER_PROTOCOL = 3 as const;
 export const SERVICE_LAUNCHER_CONTEXT_ENV = "T3_SERVICE_LAUNCHER_CONTEXT";
 export const SERVICE_LAUNCHER_FILE = "service-launcher.mjs";
 export const SERVICE_STATE_FILE = "service-state.json";
@@ -30,6 +30,8 @@ export interface ServiceState {
 export interface ServiceLauncherContext {
   readonly protocol: typeof SERVICE_LAUNCHER_PROTOCOL;
   readonly childVersion: string;
+  readonly stateDir: string;
+  readonly launcherPid: number;
   readonly update?: ServiceUpdateRecord;
 }
 
@@ -208,6 +210,11 @@ export function decodeServiceLauncherContext(value: string): ServiceLauncherCont
   if (
     !isRecord(parsed) ||
     parsed.protocol !== SERVICE_LAUNCHER_PROTOCOL ||
+    typeof parsed.stateDir !== "string" ||
+    parsed.stateDir.trim() === "" ||
+    typeof parsed.launcherPid !== "number" ||
+    !Number.isInteger(parsed.launcherPid) ||
+    parsed.launcherPid <= 0 ||
     typeof parsed.childVersion !== "string" ||
     !isExactServiceVersion(parsed.childVersion)
   ) {
@@ -227,6 +234,8 @@ export function decodeServiceLauncherContext(value: string): ServiceLauncherCont
   return {
     protocol: SERVICE_LAUNCHER_PROTOCOL,
     childVersion: parsed.childVersion,
+    stateDir: parsed.stateDir,
+    launcherPid: parsed.launcherPid,
     ...(update === undefined ? {} : { update }),
   };
 }

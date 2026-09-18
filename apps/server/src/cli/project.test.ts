@@ -1,7 +1,9 @@
 // @effect-diagnostics nodeBuiltinImport:off - CLI integration uses temporary Node paths.
 import * as NodeFS from "node:fs";
+import * as NodeHttp from "node:http";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeSqlite from "node:sqlite";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
@@ -9,6 +11,8 @@ import {
   CommandId,
   EnvironmentInternalError,
   EventId,
+  Project,
+  ProjectSnapshot,
   ProviderInstanceId,
   ThreadId,
   type OrchestrationV2AppThread,
@@ -17,13 +21,19 @@ import {
 import * as NetService from "@t3tools/shared/Net";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as References from "effect/References";
+import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { Command } from "effect/unstable/cli";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { cli } from "../binCli.ts";
+import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerConfig from "../config.ts";
 import { EventSinkV2 } from "../orchestration-v2/EventSink.ts";
 import * as EventStore from "../orchestration-v2/EventStore.ts";
@@ -39,6 +49,13 @@ import * as ProjectService from "../project/ProjectService.ts";
 import * as RepositoryIdentityResolver from "../project/RepositoryIdentityResolver.ts";
 import * as T3ProjectFileLoader from "../project/T3ProjectFileLoader.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
+import { acquireServerStateLock } from "../serverStateLock.ts";
+import { acquireDatabaseAccess, acquireRuntimeStateOwnership } from "../serverStateOwnership.ts";
+import {
+  makePersistedServerRuntimeState,
+  persistServerRuntimeState,
+  readPersistedServerRuntimeState,
+} from "../serverRuntimeState.ts";
 import {
   ProjectLiveServerDeclaredResponseError,
   ProjectLiveServerRequestError,
@@ -46,6 +63,8 @@ import {
 } from "./project.ts";
 
 const CliRuntimeLayer = Layer.mergeAll(NodeServices.layer, NetService.layer);
+const encodeProjectSnapshot = Schema.encodeEffect(Schema.fromJsonString(ProjectSnapshot));
+const encodeProject = Schema.encodeEffect(Schema.fromJsonString(Project));
 const runCli = (args: ReadonlyArray<string>) =>
   Command.runWith(cli, { version: "0.0.0" })(args).pipe(Effect.provide(CliRuntimeLayer));
 
@@ -148,6 +167,243 @@ it.effect("adds, renames, and removes projects through the V2 project CLI domain
     yield* runCli(["project", "remove", added?.id ?? "", "--base-dir", baseDir]);
     assert.deepEqual((yield* readProjects(baseDir)).projects, []);
   }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("does not clear a live owner's discovery or fall back to offline mutations", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makeProjectLookupFixture();
+    const config = yield* makeConfig(fixture.baseDir);
+    const net = yield* NetService.NetService;
+    const port = yield* net.reserveLoopbackPort();
+    const state = yield* makePersistedServerRuntimeState({ config, port });
+    yield* persistServerRuntimeState({ path: config.serverRuntimeStatePath, state });
+
+    const result = yield* runCli([
+      "project",
+      "rename",
+      fixture.workspaceRoot,
+      "Must not change",
+      "--base-dir",
+      fixture.baseDir,
+    ]).pipe(Effect.result);
+
+    assert.equal(result._tag, "Failure");
+    assert.equal((yield* readProjects(fixture.baseDir)).projects[0]?.title, fixture.project.title);
+    assert.deepEqual(
+      Option.getOrThrow(yield* readPersistedServerRuntimeState(config.serverRuntimeStatePath)),
+      state,
+    );
+  }).pipe(Effect.provide(CliRuntimeLayer)),
+);
+
+it.effect("does not mutate offline while an owner has not published discovery yet", () =>
+  Effect.gen(function* () {
+    const fixture = yield* makeProjectLookupFixture();
+    const config = yield* makeConfig(fixture.baseDir);
+    yield* acquireServerStateLock(config);
+
+    const result = yield* runCli([
+      "project",
+      "rename",
+      fixture.workspaceRoot,
+      "Must not change",
+      "--base-dir",
+      fixture.baseDir,
+    ]).pipe(Effect.result);
+
+    assert.equal(result._tag, "Failure");
+    assert.equal((yield* readProjects(fixture.baseDir)).projects[0]?.title, fixture.project.title);
+  }).pipe(Effect.provide(CliRuntimeLayer)),
+);
+
+it.effect("does not initialize auth persistence before state ownership admission", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-project-auth-admission-" });
+    const config = yield* makeConfig(NodePath.join(root, "state"));
+    const workspace = NodePath.join(root, "workspace");
+    yield* fs.makeDirectory(workspace);
+    yield* acquireServerStateLock(config);
+    assert.isFalse(yield* fs.exists(config.dbPath));
+
+    const result = yield* runCli(["project", "add", workspace, "--base-dir", config.baseDir]).pipe(
+      Effect.result,
+    );
+
+    assert.equal(result._tag, "Failure");
+    assert.isFalse(
+      yield* fs.exists(config.dbPath),
+      "rejected CLI startup must not migrate SQLite for auth",
+    );
+  }).pipe(Effect.provide(CliRuntimeLayer)),
+);
+
+it.effect(
+  "uses offline ownership rather than auth when a guarded discovery PID has been recycled",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-project-recycled-pid-" });
+      const config = yield* makeConfig(NodePath.join(root, "state"));
+      const workspace = NodePath.join(root, "workspace");
+      yield* fs.makeDirectory(workspace);
+      yield* fs.makeDirectory(config.stateDir, { recursive: true });
+      const net = yield* NetService.NetService;
+      const port = yield* net.reserveLoopbackPort();
+      yield* persistServerRuntimeState({
+        path: config.serverRuntimeStatePath,
+        state: yield* makePersistedServerRuntimeState({ config, port, stateLockVersion: 1 }),
+      });
+
+      yield* runCli(["project", "add", workspace, "--base-dir", config.baseDir]);
+
+      assert.equal((yield* readProjects(config.baseDir)).projects.length, 1);
+      const database = new NodeSqlite.DatabaseSync(config.dbPath);
+      try {
+        assert.equal(
+          database.prepare("SELECT count(*) AS count FROM auth_sessions").get()?.count,
+          0,
+        );
+      } finally {
+        database.close();
+      }
+    }).pipe(Effect.provide(CliRuntimeLayer)),
+);
+
+it.effect("keeps live auth leased through cleanup and close after its server exits", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-auth-lease-lifetime-" });
+    const config = yield* makeConfig(root);
+    yield* fs.makeDirectory(config.stateDir, { recursive: true });
+    const serverScope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
+      Scope.close(scope, Exit.void),
+    );
+    yield* acquireServerStateLock(config).pipe(Effect.provideService(Scope.Scope, serverScope));
+    yield* SqlClient.SqlClient.pipe(
+      Effect.asVoid,
+      Effect.provide(SqlitePersistenceLayerLive.pipe(Layer.provide(ServerConfig.layer(config)))),
+    );
+    yield* persistServerRuntimeState({
+      path: config.serverRuntimeStatePath,
+      state: yield* makePersistedServerRuntimeState({ config, port: 3773, stateLockVersion: 1 }),
+    });
+    const maintenance = Effect.tryPromise(async () => {
+      const release = await acquireRuntimeStateOwnership(config.stateDir);
+      try {
+        const releaseDatabase = await acquireDatabaseAccess(config.stateDir, { exclusive: true });
+        releaseDatabase();
+      } finally {
+        release();
+      }
+    });
+    yield* Effect.gen(function* () {
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      yield* Scope.close(serverScope, Exit.void);
+      const session = yield* auth.issueSession({ label: "ownership regression" });
+      assert.equal((yield* maintenance.pipe(Effect.result))._tag, "Failure");
+      yield* auth.revokeSession(session.sessionId);
+      assert.equal((yield* maintenance.pipe(Effect.result))._tag, "Failure");
+    }).pipe(
+      Effect.provide(EnvironmentAuth.runtimeLayer.pipe(Layer.provide(ServerConfig.layer(config)))),
+    );
+    yield* maintenance;
+  }).pipe(Effect.provide(CliRuntimeLayer)),
+);
+
+it.effect(
+  "authenticates live project commands without running migrations or leaving sessions active",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeProjectLookupFixture();
+      const config = yield* makeConfig(fixture.baseDir);
+      yield* acquireServerStateLock(config);
+      const snapshot = yield* encodeProjectSnapshot({
+        projects: [fixture.project],
+        updatedAt: "2026-09-18T12:00:00.000Z",
+      });
+      const mutated = yield* encodeProject({
+        ...fixture.project,
+        title: "Through live server",
+      });
+      // Missing migration history makes an accidental migration observable even on a current schema.
+      const database = new NodeSqlite.DatabaseSync(config.dbPath);
+      try {
+        database.exec("DROP TABLE effect_sql_migrations");
+      } finally {
+        database.close();
+      }
+      const requests: Array<{ method: string | undefined; authenticated: boolean }> = [];
+      const server = yield* Effect.acquireRelease(
+        Effect.promise(
+          () =>
+            new Promise<NodeHttp.Server>((resolve) => {
+              const server = NodeHttp.createServer((request, response) => {
+                requests.push({
+                  method: request.method,
+                  authenticated: request.headers.authorization?.startsWith("Bearer ") === true,
+                });
+                request.resume();
+                response.setHeader("content-type", "application/json");
+                if (request.method === "GET") {
+                  response.end(snapshot);
+                } else {
+                  response.end(mutated);
+                }
+              });
+              server.listen(0, "127.0.0.1", () => resolve(server));
+            }),
+        ),
+        (server) =>
+          Effect.promise(() => new Promise<void>((resolve) => server.close(() => resolve()))),
+      );
+      const address = server.address();
+      assert.isNotNull(address);
+      assert.notEqual(typeof address, "string");
+      if (address === null || typeof address === "string") return;
+      yield* persistServerRuntimeState({
+        path: config.serverRuntimeStatePath,
+        state: yield* makePersistedServerRuntimeState({
+          config,
+          port: address.port,
+          stateLockVersion: 1,
+        }),
+      });
+
+      yield* runCli([
+        "project",
+        "rename",
+        fixture.project.id,
+        "Through live server",
+        "--base-dir",
+        config.baseDir,
+      ]);
+
+      assert.deepEqual(
+        requests.map((request) => request.method),
+        ["GET", "POST"],
+      );
+      assert.isTrue(requests.every((request) => request.authenticated));
+      const after = new NodeSqlite.DatabaseSync(config.dbPath);
+      try {
+        assert.equal(
+          after
+            .prepare(
+              "SELECT count(*) AS count FROM sqlite_schema WHERE name = 'effect_sql_migrations'",
+            )
+            .get()?.count,
+          0,
+        );
+        assert.equal(
+          after
+            .prepare("SELECT count(*) AS count FROM auth_sessions WHERE revoked_at IS NULL")
+            .get()?.count,
+          0,
+        );
+      } finally {
+        after.close();
+      }
+    }).pipe(Effect.provide(CliRuntimeLayer)),
 );
 
 const makeProjectLookupFixture = Effect.fn("ProjectCliTest.makeProjectLookupFixture")(function* () {

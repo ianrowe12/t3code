@@ -5,6 +5,8 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
 import { Launcher, readServiceState, writeServiceState } from "./serviceLauncher.ts";
+import { acquireServerStateLock } from "./serverStateLock.ts";
+import { acquireDatabaseAccess, acquireRuntimeStateOwnership } from "./serverStateOwnership.ts";
 import {
   compareExactServiceVersions,
   decodeServiceState,
@@ -76,6 +78,174 @@ it("rejects contradictory service state", () => {
 });
 
 it.layer(NodeServices.layer)("service state persistence", (it) => {
+  it.effect("starts a child while a CLI retains database access but no runtime ownership", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-launch-with-auth-" });
+      yield* Effect.acquireRelease(
+        Effect.promise(() => acquireDatabaseAccess(path.join(root, "userdata"))),
+        (release) => Effect.sync(release),
+      );
+      const versionDir = path.join(root, "runtime", "versions", "1.0.0");
+      const entryPath = path.join(versionDir, "node_modules", "t3", "dist", "bin.mjs");
+      yield* fs.makeDirectory(path.dirname(entryPath), { recursive: true });
+      yield* fs.writeFileString(
+        entryPath,
+        `
+import { writeFileSync } from "node:fs";
+writeFileSync(new URL("../../../../../../child-started", import.meta.url), "started");
+process.exit(0);
+`,
+      );
+      yield* fs.writeFileString(path.join(versionDir, ".install-complete"), "1.0.0\n");
+      const state = { protocol: SERVICE_LAUNCHER_PROTOCOL, activeVersion: "1.0.0" } as const;
+      yield* Effect.promise(() =>
+        writeServiceState(path.join(root, "runtime", "service-state.json"), state),
+      );
+      yield* Effect.tryPromise(() => new Launcher(root, state).run()).pipe(Effect.result);
+      assert.isTrue(yield* fs.exists(path.join(root, "child-started")));
+    }),
+  );
+
+  for (const target of ["outside", "database-symlink", "wal-symlink"] as const) {
+    it.effect(`rejects a pending restore through an unowned ${target}`, () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-unowned-rollback-" });
+        const otherDatabase = path.join(root, "other-state", "state.sqlite");
+        yield* fs.makeDirectory(path.dirname(otherDatabase), { recursive: true });
+        yield* fs.writeFileString(otherDatabase, "other owner's work");
+        const stateDir = path.join(root, "userdata");
+        yield* fs.makeDirectory(stateDir, { recursive: true });
+        const databasePath =
+          target === "outside" ? otherDatabase : path.join(stateDir, "state.sqlite");
+        if (target === "database-symlink") yield* fs.symlink(otherDatabase, databasePath);
+        if (target === "wal-symlink") {
+          yield* fs.writeFileString(databasePath, "owned database");
+          yield* fs.symlink(otherDatabase, `${databasePath}-wal`);
+        }
+        const backup = path.join(root, "runtime", "db-backup", "pending-1");
+        yield* fs.makeDirectory(backup, { recursive: true });
+        yield* fs.writeFileString(path.join(backup, "database"), "older backup");
+        yield* fs.writeFileString(path.join(backup, "database-wal"), "older wal");
+        const state = {
+          protocol: SERVICE_LAUNCHER_PROTOCOL,
+          activeVersion: "1.0.0",
+          update: {
+            id: "pending-1",
+            fromVersion: "1.0.0",
+            targetVersion: "1.1.0",
+            dbPath: databasePath,
+            status: "pending",
+          },
+        } as const;
+        const statePath = path.join(root, "runtime", "service-state.json");
+        yield* Effect.promise(() => writeServiceState(statePath, state));
+
+        const result = yield* Effect.tryPromise(() => new Launcher(root, state).run()).pipe(
+          Effect.result,
+        );
+
+        assert.equal(result._tag, "Failure");
+        assert.equal(yield* fs.readFileString(otherDatabase), "other owner's work");
+        assert.deepEqual(yield* Effect.promise(() => readServiceState(statePath)), state);
+      }),
+    );
+  }
+
+  it.effect("rejects an unowned update request without scheduling a handoff", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-unowned-request-" });
+      const outside = path.join(root, "other-state", "state.sqlite");
+      yield* fs.makeDirectory(path.dirname(outside), { recursive: true });
+      yield* fs.writeFileString(outside, "other owner's work");
+      const responsePath = path.join(root, "response");
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - embeds a path in fake child source.
+      const encodedResponse = JSON.stringify(responsePath);
+      // @effect-diagnostics-next-line preferSchemaOverJson:off - embeds a path in fake child source.
+      const encodedOutside = JSON.stringify(outside);
+      const childSource = `
+import { writeFileSync } from "node:fs";
+process.on("SIGTERM", () => { writeFileSync(${encodedResponse}, "terminated"); process.exit(1); });
+process.on("message", (message) => {
+  writeFileSync(${encodedResponse}, message.type);
+  process.exit(0);
+});
+process.send({ type: "request-update", targetVersion: "1.1.0", dbPath: ${encodedOutside} });
+`;
+      for (const version of ["1.0.0", "1.1.0"]) {
+        const versionDir = path.join(root, "runtime", "versions", version);
+        const entryPath = path.join(versionDir, "node_modules", "t3", "dist", "bin.mjs");
+        yield* fs.makeDirectory(path.dirname(entryPath), { recursive: true });
+        yield* fs.writeFileString(entryPath, childSource);
+        yield* fs.writeFileString(path.join(versionDir, ".install-complete"), `${version}\n`);
+      }
+      const state = { protocol: SERVICE_LAUNCHER_PROTOCOL, activeVersion: "1.0.0" } as const;
+      const statePath = path.join(root, "runtime", "service-state.json");
+      yield* Effect.promise(() => writeServiceState(statePath, state));
+      yield* Effect.tryPromise(() => new Launcher(root, state).run()).pipe(Effect.result);
+      assert.equal(yield* fs.readFileString(responsePath), "update-rejected");
+      assert.deepEqual(yield* Effect.promise(() => readServiceState(statePath)), state);
+      assert.equal(yield* fs.readFileString(outside), "other owner's work");
+    }),
+  );
+
+  for (const owner of ["standalone", "orphan-child", "sqlite-access"] as const) {
+    it.effect(`does not restore a pending backup over a ${owner}'s work`, () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-owned-rollback-" });
+        const stateDir = path.join(root, "userdata");
+        const databasePath = path.join(stateDir, "state.sqlite");
+        if (owner === "standalone") {
+          yield* acquireServerStateLock({
+            stateDir,
+            serverRuntimeStatePath: path.join(stateDir, "server-runtime.json"),
+          });
+        } else {
+          yield* Effect.acquireRelease(
+            Effect.promise(() =>
+              owner === "sqlite-access"
+                ? acquireDatabaseAccess(stateDir)
+                : acquireRuntimeStateOwnership(stateDir),
+            ),
+            (release) => Effect.sync(release),
+          );
+        }
+        yield* fs.writeFileString(databasePath, "new owner's work");
+        const backup = path.join(root, "runtime", "db-backup", "pending-1");
+        yield* fs.makeDirectory(backup, { recursive: true });
+        yield* fs.writeFileString(path.join(backup, "database"), "older backup");
+        const state = {
+          protocol: SERVICE_LAUNCHER_PROTOCOL,
+          activeVersion: "1.0.0",
+          update: {
+            id: "pending-1",
+            fromVersion: "1.0.0",
+            targetVersion: "1.1.0",
+            dbPath: databasePath,
+            status: "pending",
+          },
+        } as const;
+        const statePath = path.join(root, "runtime", "service-state.json");
+        yield* Effect.promise(() => writeServiceState(statePath, state));
+
+        const result = yield* Effect.tryPromise(() => new Launcher(root, state).run()).pipe(
+          Effect.result,
+        );
+
+        assert.equal(result._tag, "Failure");
+        assert.equal(yield* fs.readFileString(databasePath), "new owner's work");
+        assert.deepEqual(yield* Effect.promise(() => readServiceState(statePath)), state);
+      }),
+    );
+  }
+
   it.effect("durably replaces and strictly reads one state document", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

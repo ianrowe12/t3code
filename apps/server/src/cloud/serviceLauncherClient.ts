@@ -21,6 +21,7 @@ export class ServiceLauncherClientError extends Schema.TaggedError<ServiceLaunch
       "decode-context",
       "version-mismatch",
       "ipc-unavailable",
+      "launcher-mismatch",
       "unmanaged",
       "send",
       "disconnect",
@@ -37,6 +38,8 @@ export class ServiceLauncherClientError extends Schema.TaggedError<ServiceLaunch
         return "The service launcher started a different t3 version.";
       case "ipc-unavailable":
         return "The service launcher IPC channel is unavailable.";
+      case "launcher-mismatch":
+        return "The service launcher parent does not match the startup context.";
       case "unmanaged":
         return "This server is not managed by the launcher.";
       case "send":
@@ -63,6 +66,7 @@ export class ServiceLauncherRejectedError extends Schema.TaggedError<ServiceLaun
 
 interface ServiceLauncherProcess {
   readonly connected: boolean;
+  readonly parentPid: number;
   readonly send: (
     message: ServiceLauncherChildMessage,
     callback?: (error: Error | null) => void,
@@ -81,7 +85,12 @@ export const ServiceLauncherHostProcess = Context.Reference<ServiceLauncherProce
   "t3/cloud/serviceLauncherHostProcess",
   {
     defaultValue: () => ({
-      connected: process.connected && process.send !== undefined,
+      get connected() {
+        return process.connected === true && process.send !== undefined;
+      },
+      get parentPid() {
+        return process.ppid;
+      },
       send: (message, callback) => {
         if (process.send === undefined) return false;
         return callback === undefined ? process.send(message) : process.send(message, callback);
@@ -130,6 +139,9 @@ const resolveStartup = Effect.fn("cloud.service_launcher_client.resolve_startup"
     if (context !== undefined && !managed) {
       return yield* new ServiceLauncherClientError({ operation: "ipc-unavailable" });
     }
+    if (context !== undefined && host.parentPid !== context.launcherPid) {
+      return yield* new ServiceLauncherClientError({ operation: "launcher-mismatch" });
+    }
 
     return { host, context, managed };
   },
@@ -137,8 +149,8 @@ const resolveStartup = Effect.fn("cloud.service_launcher_client.resolve_startup"
 
 export const resolveServiceLauncherMode = Effect.fn("cloud.service_launcher_client.resolve_mode")(
   function* () {
-    const { managed } = yield* resolveStartup();
-    return { managed };
+    const { managed, context } = yield* resolveStartup();
+    return { managed, stateDir: context?.stateDir };
   },
 );
 

@@ -24,7 +24,10 @@ import * as HttpApiClient from "effect/unstable/httpapi/HttpApiClient";
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 
 import * as ServerConfig from "../config.ts";
-import { layerConfig as SqlitePersistenceLayerLive } from "../persistence/Layers/Sqlite.ts";
+import {
+  layerConfig as SqlitePersistenceLayerLive,
+  SqliteMigrationsEnabled,
+} from "../persistence/Layers/Sqlite.ts";
 import { ProjectServiceLayerLive } from "../orchestration-v2/runtimeLayer.ts";
 import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
@@ -34,9 +37,15 @@ import { projectMutationOperation } from "../project/ProjectMutation.ts";
 import * as T3ProjectFileLoader from "../project/T3ProjectFileLoader.ts";
 import {
   clearPersistedServerRuntimeState,
+  isProcessAlive,
   readPersistedServerRuntimeState,
 } from "../serverRuntimeState.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
+import {
+  acquireServerDatabaseAccess,
+  acquireServerStateLock,
+  serverStateHasOwner,
+} from "../serverStateLock.ts";
 import { type CliAuthLocationFlags, projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
 
 type ProjectMutationTarget = {
@@ -343,38 +352,6 @@ const getOfflineSnapshot = Effect.fn("getOfflineSnapshot")(function* () {
   return yield* projects.snapshot;
 });
 
-const tryResolveLiveProjectExecutionMode = Effect.fn("tryResolveLiveProjectExecutionMode")(
-  function* (
-    environmentAuth: EnvironmentAuth.EnvironmentAuth["Service"],
-    config: ServerConfig.ServerConfig["Service"],
-  ) {
-    const runtimeState = yield* readPersistedServerRuntimeState(config.serverRuntimeStatePath);
-    if (Option.isNone(runtimeState)) {
-      return Option.none<{ readonly origin: string }>();
-    }
-
-    const attempt = withProjectCliSessionToken(environmentAuth, (token) =>
-      fetchLiveOrchestrationSnapshot(runtimeState.value.origin, token).pipe(
-        Effect.as({
-          origin: runtimeState.value.origin,
-        }),
-      ),
-    );
-
-    const attempted = yield* Effect.result(attempt);
-    if (attempted._tag === "Success") {
-      return Option.some(attempted.success);
-    }
-
-    yield* Effect.logDebug("Failed to connect to the persisted project CLI server.", {
-      origin: runtimeState.value.origin,
-      cause: attempted.failure,
-    });
-    yield* clearPersistedServerRuntimeState(config.serverRuntimeStatePath);
-    return Option.none<{ readonly origin: string }>();
-  },
-);
-
 const runProjectMutation = Effect.fn("runProjectMutation")(function* (
   flags: CliAuthLocationFlags,
   run: (input: {
@@ -398,22 +375,43 @@ const runProjectMutation = Effect.fn("runProjectMutation")(function* (
   const minimumLogLevel = config.logLevel;
 
   return yield* Effect.gen(function* () {
-    const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
-    const liveMode = yield* tryResolveLiveProjectExecutionMode(environmentAuth, config);
-
-    if (Option.isSome(liveMode)) {
-      return yield* withProjectCliSessionToken(environmentAuth, (token) =>
+    const discovery = yield* readPersistedServerRuntimeState(config.serverRuntimeStatePath);
+    if (
+      Option.isSome(discovery) &&
+      discovery.value.stateLockVersion === 1 &&
+      isProcessAlive(discovery.value.pid)
+    ) {
+      const usedLiveServer = yield* Effect.scoped(
         Effect.gen(function* () {
-          const snapshot = yield* fetchLiveOrchestrationSnapshot(liveMode.value.origin, token);
-          const output = yield* run({
-            snapshot,
-            dispatch: (command) =>
-              dispatchLiveOrchestrationCommand(liveMode.value.origin, token, command),
-            mode: "live",
-          });
-          yield* Console.log(output);
+          yield* acquireServerDatabaseAccess(config.stateDir);
+          if (!(yield* serverStateHasOwner(config.stateDir))) return false;
+          return yield* Effect.gen(function* () {
+            const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
+            yield* withProjectCliSessionToken(environmentAuth, (token) =>
+              Effect.gen(function* () {
+                const snapshot = yield* fetchLiveOrchestrationSnapshot(
+                  discovery.value.origin,
+                  token,
+                );
+                const output = yield* run({
+                  snapshot,
+                  dispatch: (command) =>
+                    dispatchLiveOrchestrationCommand(discovery.value.origin, token, command),
+                  mode: "live",
+                });
+                yield* Console.log(output);
+              }),
+            );
+            return true;
+          }).pipe(
+            Effect.provide(
+              EnvironmentAuth.runtimeLayer.pipe(Layer.provide(ServerConfig.layer(config))),
+            ),
+            Effect.provideService(SqliteMigrationsEnabled, false),
+          );
         }),
       );
+      if (usedLiveServer) return;
     }
 
     const offlineRuntimeLayer = ProjectCliRuntimeLive.pipe(
@@ -421,19 +419,28 @@ const runProjectMutation = Effect.fn("runProjectMutation")(function* (
       Layer.provide(Layer.succeed(References.MinimumLogLevel, minimumLogLevel)),
     );
 
-    return yield* Effect.gen(function* () {
-      const snapshot = yield* getOfflineSnapshot();
-      const projects = yield* ProjectService.ProjectService;
-      const output = yield* run({
-        snapshot,
-        dispatch: (command) => projectMutationOperation(projects, command).pipe(Effect.asVoid),
-        mode: "offline",
-      });
-      yield* Console.log(output);
-    }).pipe(Effect.provide(offlineRuntimeLayer));
+    return yield* Effect.scoped(
+      Effect.gen(function* () {
+        yield* acquireServerStateLock(config);
+        const stale = yield* readPersistedServerRuntimeState(config.serverRuntimeStatePath);
+        if (Option.isSome(stale)) {
+          yield* clearPersistedServerRuntimeState(config.serverRuntimeStatePath, stale.value);
+        }
+        return yield* Effect.gen(function* () {
+          const snapshot = yield* getOfflineSnapshot();
+          const projects = yield* ProjectService.ProjectService;
+          const output = yield* run({
+            snapshot,
+            dispatch: (command) => projectMutationOperation(projects, command).pipe(Effect.asVoid),
+            mode: "offline",
+          });
+          yield* Console.log(output);
+        }).pipe(Effect.provide(offlineRuntimeLayer));
+      }),
+    );
   }).pipe(
     Effect.provide(
-      Layer.mergeAll(EnvironmentAuth.runtimeLayer, WorkspacePaths.layer).pipe(
+      WorkspacePaths.layer.pipe(
         Layer.provideMerge(FetchHttpClient.layer),
         Layer.provide(ServerConfig.layer(config)),
         Layer.provide(Layer.succeed(References.MinimumLogLevel, minimumLogLevel)),

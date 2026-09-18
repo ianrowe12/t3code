@@ -139,6 +139,7 @@ import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
 import { disableTailscaleServe, ensureTailscaleServe } from "@t3tools/tailscale";
 import { forkParked, ServerActivation } from "./serverActivation.ts";
+import { acquireServerStateLock } from "./serverStateLock.ts";
 
 // MCP handoff thread IDs include escaped provenance and can exceed find-my-way's
 // 100-character default for one path segment.
@@ -633,6 +634,7 @@ const makeServerLayer = Layer.unwrap(
           const state = yield* makePersistedServerRuntimeState({
             config,
             port: address.port,
+            stateLockVersion: 1,
           });
           yield* persistServerRuntimeState({
             path: config.serverRuntimeStatePath,
@@ -642,13 +644,16 @@ const makeServerLayer = Layer.unwrap(
               Effect.logWarning("Failed to persist server runtime state", { cause }),
             ),
           );
+          return state;
         }),
-        () =>
-          clearPersistedServerRuntimeState(config.serverRuntimeStatePath).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("Failed to clear server runtime state", { cause }),
-            ),
-          ),
+        (state) =>
+          state === undefined
+            ? Effect.void
+            : clearPersistedServerRuntimeState(config.serverRuntimeStatePath, state).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("Failed to clear server runtime state", { cause }),
+                ),
+              ),
       ),
     );
     const tailscaleServeLayer = config.tailscaleServeEnabled
@@ -817,4 +822,12 @@ const makeServerLayer = Layer.unwrap(
 );
 
 // The CLI supplies configuration.
-export const runServer = Layer.launch(makeServerLayer);
+export const runServer = Effect.gen(function* () {
+  const config = yield* ServerConfig.ServerConfig;
+  const launcher = yield* ServiceLauncherClient.resolveServiceLauncherMode();
+  yield* acquireServerStateLock(
+    config,
+    launcher.stateDir === undefined ? undefined : { launcherStateDir: launcher.stateDir },
+  );
+  return yield* Layer.launch(makeServerLayer);
+}).pipe(Effect.provide(PlatformServicesLive), Effect.scoped);

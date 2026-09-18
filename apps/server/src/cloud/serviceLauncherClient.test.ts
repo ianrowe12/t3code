@@ -13,12 +13,19 @@ import * as ServiceLauncherClient from "./serviceLauncherClient.ts";
 
 class FakeLauncherProcess {
   readonly connected = true;
+  readonly parentPid = 123;
   readonly env: Record<string, string | undefined>;
   readonly sent: ServiceLauncherChildMessage[] = [];
   readonly #listeners = new Map<string, Set<(...args: ReadonlyArray<unknown>) => void>>();
 
   constructor(context: unknown) {
-    this.env = { [SERVICE_LAUNCHER_CONTEXT_ENV]: JSON.stringify(context) };
+    this.env = {
+      [SERVICE_LAUNCHER_CONTEXT_ENV]: JSON.stringify({
+        stateDir: "/test-state",
+        launcherPid: this.parentPid,
+        ...(typeof context === "object" && context !== null ? context : {}),
+      }),
+    };
   }
 
   send = (message: ServiceLauncherChildMessage, callback?: (error: Error | null) => void) => {

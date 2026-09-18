@@ -1,12 +1,19 @@
 import * as Effect from "effect/Effect";
+import * as Context from "effect/Context";
 import * as Layer from "effect/Layer";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
-import type { SqlError } from "effect/unstable/sql/SqlError";
+import { ConnectionError, SqlError } from "effect/unstable/sql/SqlError";
 
 import { runMigrations } from "../Migrations.ts";
 import { ServerConfig } from "../../config.ts";
+import { acquireDatabaseAccess } from "../../serverStateOwnership.ts";
+
+export const SqliteMigrationsEnabled = Context.Reference<boolean>(
+  "t3/persistence/SqliteMigrationsEnabled",
+  { defaultValue: () => true },
+);
 
 type RuntimeSqliteLayerConfig = {
   readonly filename: string;
@@ -36,8 +43,10 @@ const setup = Layer.effectDiscard(
     // CLI and server write from separate processes; wait rather than fail with SQLITE_BUSY.
     yield* sql`PRAGMA busy_timeout = 5000;`;
     yield* sql`PRAGMA foreign_keys = ON;`;
-    yield* sql`PRAGMA journal_mode = WAL;`;
-    yield* runMigrations();
+    if (yield* SqliteMigrationsEnabled) {
+      yield* sql`PRAGMA journal_mode = WAL;`;
+      yield* runMigrations();
+    }
   }),
 );
 
@@ -47,6 +56,22 @@ export const makeSqlitePersistenceLive = Effect.fn("makeSqlitePersistenceLive")(
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   yield* fs.makeDirectory(path.dirname(dbPath), { recursive: true });
+  const accessLayer = Layer.effectDiscard(
+    Effect.acquireRelease(
+      Effect.tryPromise({
+        try: () => acquireDatabaseAccess(path.dirname(dbPath)),
+        catch: (cause) =>
+          new SqlError({
+            reason: new ConnectionError({
+              cause,
+              operation: "acquire-state-access",
+              message: "Application SQLite is unavailable during state maintenance.",
+            }),
+          }),
+      }),
+      (release) => Effect.sync(release),
+    ),
+  );
 
   return Layer.provideMerge(
     setup,
@@ -57,7 +82,7 @@ export const makeSqlitePersistenceLive = Effect.fn("makeSqlitePersistenceLive")(
         "service.name": "t3-server",
       },
     }),
-  );
+  ).pipe(Layer.provide(accessLayer));
 }, Layer.unwrap);
 
 export const SqlitePersistenceMemory = Layer.provideMerge(

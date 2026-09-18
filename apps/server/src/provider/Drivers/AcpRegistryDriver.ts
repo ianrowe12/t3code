@@ -15,6 +15,7 @@ import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
@@ -29,6 +30,7 @@ import {
 } from "../../orchestration-v2/Adapters/AcpRegistryAdapterV2.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import type { TextGeneration } from "../../textGeneration/TextGeneration.ts";
+import { makeCopilotTextGeneration } from "../../textGeneration/CopilotTextGeneration.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
@@ -203,10 +205,7 @@ function baseSnapshot(
     ...(input.accentColor ? { accentColor: input.accentColor } : {}),
     ...(iconUrl ? { iconUrl } : {}),
     continuation: { groupKey: input.continuationKey },
-    // The registry driver rejects every application text-generation operation,
-    // so selectors must not offer these instances for commit, PR, branch, or
-    // title generation.
-    supportsTextGeneration: false,
+    supportsTextGeneration: input.settings.agentId === "github-copilot-cli",
     enabled: input.settings.enabled,
     installed: input.installed,
     version: input.version,
@@ -436,6 +435,7 @@ export const checkAcpRegistryProviderReadiness = Effect.fn(
 
 export type AcpRegistryDriverEnv =
   | AcpRegistryAdapterV2DriverEnv
+  | Path.Path
   | BackgroundPolicy.BackgroundPolicy
   | ServerSettingsService;
 
@@ -465,6 +465,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const hostEnvironment = yield* HostProcessEnvironment;
       const serverConfig = yield* ServerConfig;
+      const path = yield* Path.Path;
       const serverSettings = yield* ServerSettingsService;
       const continuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,
@@ -478,6 +479,14 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
       };
       const effectiveConfig = { ...config, enabled } satisfies AcpRegistrySettings;
       const processEnvironment = mergeProviderInstanceEnvironment(environment, hostEnvironment);
+      const textGeneration =
+        effectiveConfig.agentId === "github-copilot-cli"
+          ? yield* makeCopilotTextGeneration({
+              settings: effectiveConfig,
+              environment: processEnvironment,
+              helperDirectory: path.join(serverConfig.providerStatusCacheDir, "text-generation"),
+            })
+          : makeUnsupportedTextGeneration();
       const orchestrationAdapter = yield* AcpRegistryAdapterV2Driver.create({
         instanceId,
         displayName,
@@ -719,7 +728,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
         enabled,
         snapshot,
         orchestrationAdapter,
-        textGeneration: makeUnsupportedTextGeneration(),
+        textGeneration,
         acpSessionManagement: {
           listSessions: ({ cwd, cursor }) =>
             provideAcpManagementServices(

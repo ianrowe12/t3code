@@ -81,6 +81,13 @@ context meter and cumulative cost metadata. Text resources and links render as a
 binary resources, images, and audio that T3 Code cannot render yet appear as explicit placeholders
 instead of disappearing.
 
+When Copilot finishes the main task with a summary but no later reply, that summary appears in
+chat. Delegated-task summaries and other tool results stay in their tool entries.
+
+If Copilot reports that its session host is unavailable, T3 shows the error with sensitive details
+removed. Your next explicit retry starts a replacement Copilot process while keeping the saved
+conversation. T3 does not automatically resend the failed request.
+
 ## Permissions and terminals
 
 Registry agents follow the thread's approval mode at the T3 client boundary: full-access threads
@@ -104,9 +111,18 @@ Checkpoint rollback restores your files as usual. ACP agents cannot rewind their
 so the next turn after a rollback starts a fresh agent session that no longer remembers the
 conversation from before the checkpoint.
 
-Registry instances are not used for T3's app-owned text generation, such as thread titles, commit
-messages, branch names, or pull request descriptions. Configure a text-generation-capable provider
-for those actions.
+GitHub Copilot CLI supports app-owned text generation, including thread titles, commit messages,
+branch names, and pull request descriptions. Select your Copilot instance under **Settings → Text
+generation** on the environment running the thread. This is separate from the conversation model.
+If the selected provider is disabled or unsupported, T3 chooses another enabled text-generation
+provider, including Copilot when no built-in provider is enabled. A valid selection stays unchanged.
+
+Use an authenticated Copilot CLI 1.0.83 or newer on that host, or set an authentication token on the
+Copilot provider instance. The helper uses the instance's executable and authentication without
+workspace access, tools, hooks, plugins, MCP servers, or profile model overrides. Its private session
+files are removed afterward. **Default** uses the CLI's default model. Other ACP Registry agents do
+not support these helpers. T3 does not switch providers when a generation request fails. Check the
+selected host's executable and sign-in if titles are not generated.
 
 ## Advanced configuration
 

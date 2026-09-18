@@ -29,6 +29,7 @@ import { resolveProviderInstanceTerminalEnvironment } from "./terminal/Manager.t
 
 const decodeSettingsPatch = Schema.decodeUnknownEffect(ServerSettingsPatch);
 const decodeServerSettings = Schema.decodeUnknownEffect(ServerSettings);
+const encodeUnknownJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 const makeServerSettingsLayer = () =>
   ServerSettingsModule.layer.pipe(
@@ -464,6 +465,141 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       assert.deepEqual(next.textGenerationModelSelection, {
         instanceId: ProviderInstanceId.make("claude_openrouter"),
         model: "openai/gpt-5.5",
+      });
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("persists Copilot text generation selection and rejects unrelated ACP instances", () =>
+    Effect.gen(function* () {
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const instanceId = ProviderInstanceId.make("copilot_personal");
+      const selection = createModelSelection(instanceId, "gpt-5.6-luna", [
+        { id: "reasoning_effort", value: "medium" },
+      ]);
+      const next = yield* service.updateSettings({
+        providerInstances: {
+          [instanceId]: {
+            driver: ProviderDriverKind.make("acpRegistry"),
+            enabled: true,
+            config: { agentId: "github-copilot-cli" },
+          },
+        },
+        textGenerationModelSelection: selection,
+      });
+      assert.deepEqual(next.textGenerationModelSelection, selection);
+      assert.deepEqual((yield* service.getSettings).textGenerationModelSelection, selection);
+      const unsupported = yield* service.updateSettings({
+        providerInstances: {
+          [instanceId]: {
+            driver: ProviderDriverKind.make("acpRegistry"),
+            enabled: true,
+            config: { agentId: "gemini-cli" },
+          },
+        },
+      });
+      assert.equal(unsupported.textGenerationModelSelection.instanceId, "codex");
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("falls back from an unsupported saved host selection to its enabled Copilot", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const config = yield* ServerConfig.ServerConfig;
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const copilotId = ProviderInstanceId.make("copilot_personal");
+      const unsupportedId = ProviderInstanceId.make("unrelated_acp");
+      const saved = {
+        providers: {
+          codex: { enabled: false },
+          claudeAgent: { enabled: false },
+          cursor: { enabled: false },
+          grok: { enabled: false },
+          opencode: { enabled: false },
+          pi: { enabled: false },
+        },
+        providerInstances: {
+          [unsupportedId]: {
+            driver: "acpRegistry",
+            enabled: true,
+            config: { agentId: "gemini-cli" },
+          },
+          [copilotId]: {
+            driver: "acpRegistry",
+            enabled: true,
+            config: { agentId: "github-copilot-cli" },
+          },
+        },
+        textGenerationModelSelection: {
+          instanceId: unsupportedId,
+          model: "unsupported-model",
+          options: [{ id: "unsupported-option", value: true }],
+        },
+      };
+      const raw = yield* encodeUnknownJson(saved);
+      yield* fs.writeFileString(config.settingsPath, raw);
+      assert.deepEqual((yield* service.getSettings).textGenerationModelSelection, {
+        instanceId: copilotId,
+        model: "default",
+      });
+      assert.equal(yield* fs.readFileString(config.settingsPath), raw);
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("keeps valid defaults and falls back when the selected Copilot is disabled", () =>
+    Effect.gen(function* () {
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const instanceId = ProviderInstanceId.make("copilot_personal");
+      const next = yield* service.updateSettings({
+        providerInstances: {
+          [instanceId]: {
+            driver: ProviderDriverKind.make("acpRegistry"),
+            enabled: true,
+            config: { agentId: "github-copilot-cli" },
+          },
+        },
+      });
+      assert.deepEqual(
+        next.textGenerationModelSelection,
+        DEFAULT_SERVER_SETTINGS.textGenerationModelSelection,
+      );
+      yield* service.updateSettings({
+        textGenerationModelSelection: { instanceId, model: "gpt-5.6-luna" },
+      });
+      const disabled = yield* service.updateSettings({
+        providerInstances: {
+          [instanceId]: {
+            driver: ProviderDriverKind.make("acpRegistry"),
+            enabled: false,
+            config: { agentId: "github-copilot-cli" },
+          },
+        },
+      });
+      assert.equal(disabled.textGenerationModelSelection.instanceId, "codex");
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("ignores legacy defaults when every built-in instance is explicitly disabled", () =>
+    Effect.gen(function* () {
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const copilotId = ProviderInstanceId.make("copilot_personal");
+      const next = yield* service.updateSettings({
+        providerInstances: {
+          ...Object.fromEntries(
+            Object.keys(DEFAULT_SERVER_SETTINGS.providers).map((driver) => [
+              ProviderInstanceId.make(driver),
+              { driver: ProviderDriverKind.make(driver), enabled: false, config: {} },
+            ]),
+          ),
+          [copilotId]: {
+            driver: ProviderDriverKind.make("acpRegistry"),
+            enabled: true,
+            config: { agentId: "github-copilot-cli" },
+          },
+        },
+      });
+      assert.deepEqual(next.textGenerationModelSelection, {
+        instanceId: copilotId,
+        model: "default",
       });
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );

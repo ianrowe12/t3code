@@ -386,13 +386,19 @@ function restoreUsedProviders(
 }
 
 const ACP_REGISTRY_DRIVER = ProviderDriverKind.make("acpRegistry");
+const isCopilotRegistryConfig = Schema.is(
+  Schema.Struct({
+    agentId: Schema.Literal("github-copilot-cli"),
+  }),
+);
 
-/** ACP Registry instances reject every application text-generation operation. */
+/** Only Copilot has a dedicated tool-free app helper among registry agents. */
 function selectionSupportsTextGeneration(
   settings: ServerSettings,
   selection: ModelSelection,
 ): boolean {
-  return settings.providerInstances[selection.instanceId]?.driver !== ACP_REGISTRY_DRIVER;
+  const instance = settings.providerInstances[selection.instanceId];
+  return instance?.driver !== ACP_REGISTRY_DRIVER || isCopilotRegistryConfig(instance.config);
 }
 
 function resolveTextGenerationProvider(settings: ServerSettings): ServerSettings {
@@ -408,11 +414,31 @@ function fallbackTextGenerationProvider(settings: ServerSettings): ServerSetting
   // (codex enabled) when the Providers UI has only written providerInstances.
   const fallbackEntry = Object.entries(settings.providers).find(([driver, provider]) => {
     const instance = settings.providerInstances[ProviderInstanceId.make(driver)];
-    return instance === undefined ? provider.enabled : resolveProviderInstanceEnabled(instance);
+    return (
+      (instance === undefined ? provider.enabled : resolveProviderInstanceEnabled(instance)) &&
+      selectionSupportsTextGeneration(settings, {
+        instanceId: ProviderInstanceId.make(driver),
+        model: "default",
+      })
+    );
   });
   const fallback = fallbackEntry ? ProviderDriverKind.make(fallbackEntry[0]) : undefined;
   if (!fallback) {
-    return settings;
+    const copilot = Object.entries(settings.providerInstances).find(
+      ([, instance]) =>
+        instance.driver === ACP_REGISTRY_DRIVER &&
+        resolveProviderInstanceEnabled(instance) &&
+        isCopilotRegistryConfig(instance.config),
+    );
+    return copilot
+      ? {
+          ...settings,
+          textGenerationModelSelection: {
+            instanceId: ProviderInstanceId.make(copilot[0]),
+            model: "default",
+          },
+        }
+      : settings;
   }
 
   return {

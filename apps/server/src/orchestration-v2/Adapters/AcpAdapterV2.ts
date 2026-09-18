@@ -194,7 +194,7 @@ export interface AcpAdapterV2ExtensionContext {
 export interface AcpAdapterV2Flavor {
   readonly driver: ProviderDriverKind;
   readonly capabilities: OrchestrationV2ProviderCapabilities;
-  readonly clientCapabilitiesMeta?: Record<string, boolean>;
+  readonly clientCapabilitiesMeta?: NonNullable<EffectAcpSchema.ClientCapabilities["_meta"]>;
   readonly normalizeSessionUpdate?: (
     notification: EffectAcpSchema.SessionNotification,
   ) => EffectAcpSchema.SessionNotification;
@@ -258,6 +258,8 @@ export interface AcpAdapterV2Flavor {
   ) => Effect.Effect<void>;
   /** Batch launches without child completion signals become idle when the root turn ends. */
   readonly subagentsIdleOnTurnCompletion?: boolean;
+  /** Keep native child identities addressable for later reads and follow-up messages. */
+  readonly retainSubagentsAcrossTurns?: boolean;
   readonly supportsCompaction?: boolean;
   readonly runtimeHarness?: string;
   readonly registerExtensions?: (
@@ -266,6 +268,10 @@ export interface AcpAdapterV2Flavor {
   readonly extractSubagentUpdate?: (
     toolCall: AcpToolCallState,
   ) => AcpAdapterV2SubagentUpdate | undefined;
+  /** Native tools that can address multiple children in one call. */
+  readonly extractSubagentUpdates?: (
+    toolCall: AcpToolCallState,
+  ) => ReadonlyArray<AcpAdapterV2SubagentUpdate>;
   /**
    * Optional Grok-style rewrite before tool projection (e.g. keep monitor start
    * ACKs in the running state until stream end).
@@ -301,8 +307,9 @@ export interface AcpAdapterV2Flavor {
    */
   readonly extractSubagentEndNotice?: (text: string) =>
     | {
+        /** Native child session id, or native task id for providers without child ACP sessions. */
         readonly childSessionId: string;
-        readonly status: "completed" | "failed";
+        readonly status: "idle" | "completed" | "failed" | "cancelled" | "interrupted";
       }
     | undefined;
   /**
@@ -333,6 +340,13 @@ export interface AcpAdapterV2Flavor {
    * user interrupt. Grok can keep `task_already_running` state until the process exits.
    */
   readonly restartRuntimeAfterInterrupt?: boolean;
+  /** Reload the saved session on the next turn after a provider-specific session failure. */
+  readonly restartRuntimeOnPromptError?: (error: unknown) => boolean;
+  readonly formatPromptError?: (error: unknown) => string | undefined;
+  /** Explicit provider completion text that was not streamed as an assistant message. */
+  readonly extractPromptFinalAnswer?: (
+    response: EffectAcpSchema.PromptResponse,
+  ) => string | undefined;
   /**
    * When true, every interrupt restarts the runtime, not just those carrying
    * `requestRuntimeRestart` (user Stop). Leave unset to keep non-Stop
@@ -396,6 +410,12 @@ export function acpProviderItemNativeId(input: {
 
 export interface AcpAdapterV2SubagentUpdate {
   readonly nativeTaskId: string;
+  /** Correlates a pending launch with its subsequently returned native agent id. */
+  readonly launchToolCallId?: string;
+  /** An authoritative new read or accepted follow-up may reopen a settled child. */
+  readonly resumeToolCallId?: string;
+  readonly followupPrompt?: string;
+  readonly resultMessageId?: string;
   readonly prompt: string;
   readonly title: string | null;
   readonly model: string | null;
@@ -414,6 +434,15 @@ export interface AcpAdapterV2SubagentUpdate {
    * (hydration tools like get_command_or_subagent_output). Defaults to true.
    */
   readonly suppressNormalTool?: boolean;
+}
+
+function extractSubagentUpdates(
+  flavor: Pick<AcpAdapterV2Flavor, "extractSubagentUpdate" | "extractSubagentUpdates">,
+  tool: AcpToolCallState,
+): ReadonlyArray<AcpAdapterV2SubagentUpdate> {
+  if (flavor.extractSubagentUpdates !== undefined) return flavor.extractSubagentUpdates(tool);
+  const update = flavor.extractSubagentUpdate?.(tool);
+  return update === undefined ? [] : [update];
 }
 
 export interface AcpAdapterV2Options {
@@ -1204,16 +1233,21 @@ export function acpPostSettleMonitorPromptShouldSuppress(
 
 export function acpCompletedTurnShouldTerminalizeTool(
   tool: AcpToolCallState,
-  flavor: Pick<AcpAdapterV2Flavor, "extractBackgroundTaskId" | "extractSubagentUpdate">,
+  flavor: Pick<
+    AcpAdapterV2Flavor,
+    "extractBackgroundTaskId" | "extractSubagentUpdate" | "extractSubagentUpdates"
+  >,
 ): boolean {
   const status = toolStatus(tool.status);
   if (status !== "pending" && status !== "running") return false;
   if (flavor.extractBackgroundTaskId?.(tool) !== undefined) return false;
-  return flavor.extractSubagentUpdate?.(tool) === undefined;
+  return extractSubagentUpdates(flavor, tool).length === 0;
 }
 
 interface ActiveAcpSubagent {
   task: OrchestrationV2Subagent;
+  readonly launchToolCallId?: string;
+  readonly appliedResumeToolCallIds: Set<string>;
   readonly childThreadId: ThreadId;
   readonly childRootNodeId: OrchestrationV2ExecutionNode["id"];
   readonly turnItemId: OrchestrationV2TurnItem["id"];
@@ -1262,6 +1296,7 @@ type AcpCarryoverSubagents = {
   readonly sessionId: string;
   readonly rootTerminalStatus: "completed" | "interrupted" | "failed" | "cancelled";
   readonly subagents: ReadonlyArray<ActiveAcpSubagent>;
+  readonly tools?: Map<string, AcpToolCallState>;
 };
 
 type PendingRuntimeRequest = {
@@ -2410,12 +2445,21 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
             context.subagents.get(update.nativeTaskId) ??
             (update.childSessionId !== null
               ? context.subagentsBySessionId.get(update.childSessionId)
-              : undefined);
+              : undefined) ??
+            (update.launchToolCallId === undefined
+              ? undefined
+              : [...context.subagents.values()].find(
+                  (subagent) => subagent.launchToolCallId === update.launchToolCallId,
+                ));
+          const resumes =
+            update.resumeToolCallId !== undefined &&
+            !existing?.appliedResumeToolCallIds.has(update.resumeToolCallId);
           const updateIsTerminal = acpSubagentStatusIsTerminal(update.status);
           if (
             existing !== undefined &&
             acpSubagentStatusIsTerminal(existing.task.status) &&
-            !updateIsTerminal
+            !updateIsTerminal &&
+            !resumes
           ) {
             return;
           }
@@ -2423,7 +2467,10 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
             existing !== undefined &&
             existing.task.status === update.status &&
             updateIsTerminal &&
-            existing.terminalStatusProjected
+            existing.terminalStatusProjected &&
+            (flavor.retainSubagentsAcrossTurns !== true ||
+              update.result === null ||
+              update.result === existing.task.result)
           ) {
             return;
           }
@@ -2438,7 +2485,10 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
             }
           }
           const now = yield* DateTime.now;
-          const nativeTaskId = existing?.task.nativeTaskRef?.nativeId ?? update.nativeTaskId;
+          const nativeTaskId =
+            update.launchToolCallId !== undefined && update.nativeTaskId !== update.launchToolCallId
+              ? update.nativeTaskId
+              : (existing?.task.nativeTaskRef?.nativeId ?? update.nativeTaskId);
           const nativeItemRef = {
             driver,
             nativeId: nativeTaskId,
@@ -2457,7 +2507,12 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
           const turnItemId = existing?.turnItemId ?? providerTurnItemId(nativeTaskId);
           const turnItemOrdinal =
             existing?.turnItemOrdinal ?? (yield* resolveItemOrdinal(context, nativeTaskId));
-          const taskStatus = update.status;
+          const taskStatus =
+            update.resumeToolCallId !== undefined &&
+            update.status === "pending" &&
+            existing?.task.status === "running"
+              ? "running"
+              : update.status;
           const task: OrchestrationV2Subagent = {
             ...(existing?.task ?? {
               id: nodeId,
@@ -2477,13 +2532,18 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
               result: null,
               startedAt: now,
             }),
+            nativeTaskRef: nativeItemRef,
             status: taskStatus,
-            result: update.result ?? existing?.task.result ?? null,
+            result: resumes ? update.result : (update.result ?? existing?.task.result ?? null),
             completedAt: acpSubagentStatusIsTerminal(taskStatus) ? now : null,
             updatedAt: now,
           };
           const subagent: ActiveAcpSubagent = existing ?? {
             task,
+            ...(update.launchToolCallId === undefined
+              ? {}
+              : { launchToolCallId: update.launchToolCallId }),
+            appliedResumeToolCallIds: new Set(),
             childThreadId,
             childRootNodeId,
             turnItemId,
@@ -2496,7 +2556,16 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
             nextChildOrdinal: 101,
             terminalStatusProjected: false,
           };
+          const previousNativeId = existing?.task.nativeTaskRef?.nativeId;
+          if (previousNativeId != null && previousNativeId !== nativeTaskId) {
+            context.subagents.delete(previousNativeId);
+          }
           subagent.task = task;
+          if (resumes && update.result === null) subagent.assistantText = "";
+          if (update.resumeToolCallId !== undefined) {
+            subagent.appliedResumeToolCallIds.add(update.resumeToolCallId);
+          }
+          subagent.terminalStatusProjected = false;
           context.subagents.set(nativeTaskId, subagent);
 
           if (existing === undefined) {
@@ -2550,6 +2619,33 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
             });
           }
 
+          if (resumes && update.followupPrompt) {
+            const nativeItemId = `${nativeTaskId}:followup:${update.resumeToolCallId}`;
+            const artifacts = makeSubagentConversationArtifacts({
+              messageId: providerMessageId(nativeItemId),
+              turnItemId: providerTurnItemId(nativeItemId),
+              threadId: childThreadId,
+              rootNodeId: childRootNodeId,
+              providerThreadId: subagent.task.providerThreadId,
+              providerTurnId: null,
+              nativeItemRef: { driver, nativeId: nativeItemId, strength: "weak" },
+              role: "user",
+              text: update.followupPrompt,
+              ordinal: subagent.nextChildOrdinal++,
+              now,
+            });
+            yield* emitProviderEvent({
+              type: "message.updated",
+              driver,
+              message: artifacts.message,
+            });
+            yield* emitProviderEvent({
+              type: "turn_item.updated",
+              driver,
+              turnItem: artifacts.turnItem,
+            });
+          }
+
           const childSessionId = update.childSessionId;
           if (childSessionId !== null && subagent.childSessionId === null) {
             subagent.childSessionId = childSessionId;
@@ -2587,13 +2683,26 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
           }
 
           if (
+            flavor.retainSubagentsAcrossTurns === true &&
+            subagent.childSessionId === null &&
+            update.result !== null
+          ) {
+            yield* emitSubagentAssistant(
+              subagent,
+              update.result,
+              "replace",
+              update.resultMessageId,
+            );
+          } else if (
             taskStatus !== "running" &&
             subagent.assistantText.length === 0 &&
             update.result !== null
           ) {
             yield* emitSubagentAssistant(subagent, update.result);
           }
-          const result = update.result ?? subagent.task.result ?? (subagent.assistantText || null);
+          const result = resumes
+            ? update.result
+            : (update.result ?? subagent.task.result ?? (subagent.assistantText || null));
           subagent.task = {
             ...subagent.task,
             status: taskStatus,
@@ -2927,15 +3036,15 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
 
           // Monitor TaskOutput shares the get_command tool shape with subagent
           // hydration; do not spawn a phantom subagent for a registered monitor.
-          const subagentUpdate = hydratedRegisteredMonitor
-            ? undefined
-            : flavor.extractSubagentUpdate?.(toolCall);
-          if (subagentUpdate !== undefined) {
+          const subagentUpdates = hydratedRegisteredMonitor
+            ? []
+            : extractSubagentUpdates(flavor, toolCall);
+          for (const subagentUpdate of subagentUpdates) {
             yield* emitSubagent(context, subagentUpdate);
-            if (subagentUpdate.suppressNormalTool !== false) {
-              yield* rearmDeferredFinalize(context);
-              return;
-            }
+          }
+          if (subagentUpdates.some((update) => update.suppressNormalTool !== false)) {
+            yield* rearmDeferredFinalize(context);
+            return;
           }
           const status = projectedStatus ?? toolStatus(toolCall.status);
           const now = yield* DateTime.now;
@@ -3850,37 +3959,47 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
             const projectCarryover = rootTerminalCanStillProject;
             let carryoverTerminalized = false;
             if (
-              flavor.extractSubagentUpdate !== undefined &&
+              (flavor.extractSubagentUpdate !== undefined ||
+                flavor.extractSubagentUpdates !== undefined) &&
               (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update")
             ) {
               for (const event of parseSessionUpdateEvent(notification).events) {
                 if (event._tag !== "ToolCallUpdated") continue;
-                const toolCall = flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall;
-                const subagentUpdate = flavor.extractSubagentUpdate(toolCall);
-                if (subagentUpdate === undefined) continue;
-                if (!acpSubagentStatusIsTerminal(subagentUpdate.status)) {
-                  continue;
-                }
-                if (
-                  yield* updateCarryoverSubagentStatus(
-                    subagentUpdate.nativeTaskId,
-                    subagentUpdate.status,
-                    subagentUpdate.result,
-                    { project: projectCarryover },
-                  )
-                ) {
-                  carryoverTerminalized = true;
-                }
-                if (
-                  subagentUpdate.childSessionId !== null &&
-                  (yield* updateCarryoverSubagentStatus(
-                    subagentUpdate.childSessionId,
-                    subagentUpdate.status,
-                    subagentUpdate.result,
-                    { project: projectCarryover },
-                  ))
-                ) {
-                  carryoverTerminalized = true;
+                const merged = mergeToolCallState(
+                  carryover?.tools?.get(event.toolCall.toolCallId),
+                  event.toolCall,
+                );
+                const toolCall = flavor.normalizeToolCall?.(merged) ?? merged;
+                carryover?.tools?.set(toolCall.toolCallId, toolCall);
+                for (const subagentUpdate of extractSubagentUpdates(flavor, toolCall)) {
+                  if (!acpSubagentStatusIsTerminal(subagentUpdate.status)) continue;
+                  const projection = {
+                    project: projectCarryover,
+                    ...(subagentUpdate.resultMessageId === undefined
+                      ? {}
+                      : { resultMessageId: subagentUpdate.resultMessageId }),
+                  };
+                  if (
+                    yield* updateCarryoverSubagentStatus(
+                      subagentUpdate.nativeTaskId,
+                      subagentUpdate.status,
+                      subagentUpdate.result,
+                      projection,
+                    )
+                  ) {
+                    carryoverTerminalized = true;
+                  }
+                  if (
+                    subagentUpdate.childSessionId !== null &&
+                    (yield* updateCarryoverSubagentStatus(
+                      subagentUpdate.childSessionId,
+                      subagentUpdate.status,
+                      subagentUpdate.result,
+                      projection,
+                    ))
+                  ) {
+                    carryoverTerminalized = true;
+                  }
                 }
               }
             }
@@ -4007,7 +4126,11 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
           if (notification.sessionId !== (yield* Ref.get(activeSessionId))) {
             // Finalize may have completed during the activeSessionId yield.
             if (context.finalized) return;
-            if (flavor.extractSubagentUpdate === undefined) return;
+            if (
+              flavor.extractSubagentUpdate === undefined &&
+              flavor.extractSubagentUpdates === undefined
+            )
+              return;
             const subagent = context.subagentsBySessionId.get(notification.sessionId);
             if (
               update.sessionUpdate === "tool_call" ||
@@ -4019,13 +4142,15 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
               for (const event of parseSessionUpdateEvent(notification).events) {
                 if (event._tag !== "ToolCallUpdated") continue;
                 const toolCall = flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall;
-                const subagentUpdate = flavor.extractSubagentUpdate(toolCall);
-                if (subagentUpdate !== undefined) {
-                  if (
-                    subagentUpdate.nativeTaskId === nativeTaskId ||
-                    subagentUpdate.childSessionId === notification.sessionId
-                  ) {
-                    yield* emitSubagent(context, subagentUpdate);
+                const subagentUpdates = extractSubagentUpdates(flavor, toolCall);
+                if (subagentUpdates.length > 0) {
+                  for (const subagentUpdate of subagentUpdates) {
+                    if (
+                      subagentUpdate.nativeTaskId === nativeTaskId ||
+                      subagentUpdate.childSessionId === notification.sessionId
+                    ) {
+                      yield* emitSubagent(context, subagentUpdate);
+                    }
                   }
                   continue;
                 }
@@ -4253,7 +4378,8 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
                 const notice = flavor.extractSubagentEndNotice(update.content.text);
                 const subagent =
                   notice !== undefined
-                    ? context.subagentsBySessionId.get(notice.childSessionId)
+                    ? (context.subagentsBySessionId.get(notice.childSessionId) ??
+                      context.subagents.get(notice.childSessionId))
                     : undefined;
                 if (
                   notice !== undefined &&
@@ -4269,7 +4395,7 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
                     title: subagent.task.title,
                     model: subagent.task.model,
                     status: notice.status,
-                    childSessionId: notice.childSessionId,
+                    childSessionId: subagent.childSessionId,
                     result: null,
                     suppressNormalTool: true,
                   });
@@ -4704,8 +4830,16 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
           subagent: ActiveAcpSubagent,
           status: OrchestrationV2Subagent["status"],
           resultOverride?: string | null,
+          resultMessageId?: string,
         ) {
           yield* mutateCarryoverSubagentStatus(subagent, status, resultOverride);
+          if (
+            flavor.retainSubagentsAcrossTurns === true &&
+            subagent.childSessionId === null &&
+            resultOverride
+          ) {
+            yield* emitSubagentAssistant(subagent, resultOverride, "replace", resultMessageId);
+          }
           const now = subagent.task.updatedAt;
           const nativeTaskId = subagent.task.nativeTaskRef?.nativeId ?? subagent.task.id;
           const nativeItemRef = {
@@ -4809,7 +4943,7 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
           nativeIdOrChildSessionId: string,
           status: OrchestrationV2Subagent["status"],
           result?: string | null,
-          options?: { readonly project?: boolean },
+          options?: { readonly project?: boolean; readonly resultMessageId?: string },
         ) {
           const carryover = yield* Ref.get(carryoverSubagents);
           if (carryover === null) return false;
@@ -4824,20 +4958,30 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
           const shouldProject = options?.project !== false;
           if (match.task.status === status) {
             // Already at this status: only project if requested and not yet done.
-            if (!shouldProject || match.terminalStatusProjected) {
+            if (
+              !shouldProject ||
+              (match.terminalStatusProjected &&
+                (flavor.retainSubagentsAcrossTurns !== true ||
+                  result == null ||
+                  result === match.task.result))
+            ) {
               return true;
             }
-            yield* projectCarryoverSubagentStatus(match, status, result);
+            yield* projectCarryoverSubagentStatus(match, status, result, options?.resultMessageId);
             return true;
           }
           // Only advance nonterminal entries; do not resurrect a terminal one.
-          if (match.task.status !== "running" && match.task.status !== "pending") {
+          if (
+            match.task.status !== "running" &&
+            match.task.status !== "pending" &&
+            !(flavor.retainSubagentsAcrossTurns && match.task.status === "idle")
+          ) {
             return false;
           }
           if (!shouldProject) {
             yield* mutateCarryoverSubagentStatus(match, status, result);
           } else {
-            yield* projectCarryoverSubagentStatus(match, status, result);
+            yield* projectCarryoverSubagentStatus(match, status, result, options?.resultMessageId);
           }
           return true;
         });
@@ -4846,7 +4990,11 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
           context: ActiveAcpTurn,
           notification: EffectAcpSchema.SessionNotification,
         ) {
-          if (flavor.extractSubagentUpdate === undefined) return false;
+          if (
+            flavor.extractSubagentUpdate === undefined &&
+            flavor.extractSubagentUpdates === undefined
+          )
+            return false;
 
           const applyTerminal = Effect.fnUntraced(function* (
             subagent: ActiveAcpSubagent,
@@ -4854,7 +5002,13 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
           ) {
             if (!acpSubagentStatusIsTerminal(update.status)) return false;
             if (acpSubagentStatusIsTerminal(subagent.task.status)) {
-              if (subagent.terminalStatusProjected || context.finalizedStatus !== "completed") {
+              if (
+                (subagent.terminalStatusProjected &&
+                  (flavor.retainSubagentsAcrossTurns !== true ||
+                    (subagent.task.status === update.status &&
+                      (update.result === null || update.result === subagent.task.result)))) ||
+                context.finalizedStatus !== "completed"
+              ) {
                 return true;
               }
             }
@@ -4873,32 +5027,35 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
           ) {
             for (const event of parseSessionUpdateEvent(notification).events) {
               if (event._tag !== "ToolCallUpdated") continue;
-              const toolCall = flavor.normalizeToolCall?.(event.toolCall) ?? event.toolCall;
-              const subagentUpdate = flavor.extractSubagentUpdate(toolCall);
-              if (
-                subagentUpdate === undefined ||
-                !acpSubagentStatusIsTerminal(subagentUpdate.status)
-              ) {
-                continue;
+              const merged = mergeToolCallState(
+                flavor.retainSubagentsAcrossTurns === true
+                  ? context.tools.get(event.toolCall.toolCallId)
+                  : undefined,
+                event.toolCall,
+              );
+              const toolCall = flavor.normalizeToolCall?.(merged) ?? merged;
+              context.tools.set(toolCall.toolCallId, toolCall);
+              for (const subagentUpdate of extractSubagentUpdates(flavor, toolCall)) {
+                if (!acpSubagentStatusIsTerminal(subagentUpdate.status)) continue;
+                const subagent =
+                  context.subagents.get(subagentUpdate.nativeTaskId) ??
+                  (subagentUpdate.childSessionId === null
+                    ? undefined
+                    : context.subagentsBySessionId.get(subagentUpdate.childSessionId)) ??
+                  context.subagentsBySessionId.get(notification.sessionId);
+                if (subagent === undefined) continue;
+                const nativeTaskId =
+                  subagent.task.nativeTaskRef?.nativeId ?? String(subagent.task.id);
+                if (
+                  subagentUpdate.nativeTaskId !== nativeTaskId &&
+                  (subagentUpdate.childSessionId === null ||
+                    (subagentUpdate.childSessionId !== subagent.childSessionId &&
+                      subagentUpdate.childSessionId !== notification.sessionId))
+                ) {
+                  continue;
+                }
+                if (yield* applyTerminal(subagent, subagentUpdate)) return true;
               }
-              const subagent =
-                context.subagents.get(subagentUpdate.nativeTaskId) ??
-                (subagentUpdate.childSessionId === null
-                  ? undefined
-                  : context.subagentsBySessionId.get(subagentUpdate.childSessionId)) ??
-                context.subagentsBySessionId.get(notification.sessionId);
-              if (subagent === undefined) continue;
-              const nativeTaskId =
-                subagent.task.nativeTaskRef?.nativeId ?? String(subagent.task.id);
-              if (
-                subagentUpdate.nativeTaskId !== nativeTaskId &&
-                (subagentUpdate.childSessionId === null ||
-                  (subagentUpdate.childSessionId !== subagent.childSessionId &&
-                    subagentUpdate.childSessionId !== notification.sessionId))
-              ) {
-                continue;
-              }
-              if (yield* applyTerminal(subagent, subagentUpdate)) return true;
             }
           }
 
@@ -4911,7 +5068,8 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
             const subagent =
               notice === undefined
                 ? undefined
-                : context.subagentsBySessionId.get(notice.childSessionId);
+                : (context.subagentsBySessionId.get(notice.childSessionId) ??
+                  context.subagents.get(notice.childSessionId));
             if (notice !== undefined && subagent !== undefined) {
               return yield* applyTerminal(subagent, {
                 nativeTaskId: subagent.task.nativeTaskRef?.nativeId ?? String(subagent.task.id),
@@ -4919,7 +5077,7 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
                 title: subagent.task.title,
                 model: subagent.task.model,
                 status: notice.status,
-                childSessionId: notice.childSessionId,
+                childSessionId: subagent.childSessionId,
                 result: null,
                 suppressNormalTool: true,
               });
@@ -6178,7 +6336,9 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
                 },
           );
           const subagentsRequiringCarryover = [...context.subagents.values()].filter(
-            acpSubagentHasPendingBackgroundWork,
+            (subagent) =>
+              flavor.retainSubagentsAcrossTurns === true ||
+              acpSubagentHasPendingBackgroundWork(subagent),
           );
           // Direct Stop must not carry residual subagents into a later run.
           if (subagentsRequiringCarryover.length > 0 && !directStopQuarantine) {
@@ -6188,6 +6348,7 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
                 sessionId,
                 rootTerminalStatus: settledStatus,
                 subagents: subagentsRequiringCarryover,
+                ...(flavor.retainSubagentsAcrossTurns === true ? { tools: context.tools } : {}),
               });
             }
           }
@@ -6577,8 +6738,8 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
             yield* projectDeferredCarryoverTerminals(rehydratedCarryoverSubagents);
             // Keep projected terminals addressable through the wake drain so
             // emitSubagent's monotonic guard can reject replayed spawn frames.
-            // Finalize carries only entries with pending background work, so a
-            // terminal-and-projected lineage still expires with this turn.
+            // Unless the provider supports follow-up messages, finalize carries
+            // only pending work and terminal-and-projected lineages expire here.
             if (isContinuationTurn) {
               yield* Ref.set(continuationRequested, false);
               const drainedWakeCount = yield* Ref.modify(wakeBuffer, (current) => {
@@ -6653,6 +6814,11 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
                           ? "interrupted"
                           : "cancelled"
                         : "completed";
+                    const finalAnswer = flavor.extractPromptFinalAnswer?.(result);
+                    if (status === "completed" && finalAnswer !== undefined) {
+                      yield* closeTextStreams(context);
+                      yield* appendText(context, "assistant", finalAnswer);
+                    }
                     // Grok monitors (and async subagents) keep working after the root
                     // prompt RPC returns. Defer finalize so their later updates and
                     // wake-turn traffic still project onto this run.
@@ -6676,12 +6842,24 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
                   promptGeneration,
                   Effect.gen(function* () {
                     if (context.finalized) return;
+                    const promptError = Cause.squash(cause);
+                    const restartRequired =
+                      !context.interrupted &&
+                      flavor.restartRuntimeOnPromptError?.(promptError) === true;
+                    if (restartRequired) {
+                      yield* Ref.set(runtimeRestartRequired, true);
+                    }
                     yield* finalizeTurn(
                       context,
                       context.interrupted ? "interrupted" : "failed",
                       makeProviderFailure({
-                        cause: Cause.squash(cause),
+                        cause: promptError,
                         class: "provider_error",
+                        message:
+                          flavor.formatPromptError?.(promptError) ??
+                          (restartRequired
+                            ? "The provider lost its active session. Send your message again to reload the saved conversation."
+                            : undefined),
                       }),
                     ).pipe(
                       Effect.andThen(
@@ -6781,7 +6959,7 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
           providerSessionId: input.providerSessionId,
           providerSession,
           events: Stream.fromEffectRepeat(Queue.take(events)),
-          ...(postSettleContinuationEnabled
+          ...(postSettleContinuationEnabled || flavor.retainSubagentsAcrossTurns === true
             ? {
                 hasPendingBackgroundWork: Effect.gen(function* () {
                   if ((yield* Ref.get(wakeBuffer)).length > 0) return true;

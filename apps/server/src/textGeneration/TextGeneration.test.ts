@@ -5,7 +5,7 @@ import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import { describe, expect } from "vite-plus/test";
 
-import { ProviderInstanceId } from "@t3tools/contracts";
+import { ProviderInstanceId, TextGenerationError } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 
 import type { ProviderInstance } from "../provider/ProviderDriver.ts";
@@ -60,6 +60,48 @@ const makeStubRegistry = (
 };
 
 describe("makeTextGenerationFromRegistry", () => {
+  it.effect("does not switch providers when the selected title helper fails authentication", () =>
+    Effect.gen(function* () {
+      const selectedId = ProviderInstanceId.make("copilot_personal");
+      const calls: ProviderInstanceId[] = [];
+      const failure = new TextGenerationError({
+        operation: "generateThreadTitle",
+        detail: "Copilot authentication failed.",
+      });
+      const selected = makeStubInstance(
+        selectedId,
+        makeStubTextGeneration({
+          generateThreadTitle: () => {
+            calls.push(selectedId);
+            return Effect.fail(failure);
+          },
+        }),
+      );
+      const fallbackId = ProviderInstanceId.make("codex");
+      const fallback = makeStubInstance(
+        fallbackId,
+        makeStubTextGeneration({
+          generateThreadTitle: () => {
+            calls.push(fallbackId);
+            return Effect.succeed({ title: "Wrong provider title" });
+          },
+        }),
+      );
+      const generation = TextGeneration.makeTextGenerationFromRegistry(
+        makeStubRegistry([selected, fallback]),
+      );
+      const actual = yield* Effect.flip(
+        generation.generateThreadTitle({
+          cwd: "/repo",
+          message: "Fix reconnect",
+          modelSelection: createModelSelection(selectedId, "default"),
+        }),
+      );
+      expect(actual).toBe(failure);
+      expect(calls).toEqual([selectedId]);
+    }),
+  );
+
   it.effect("delegates to the matching instance's textGeneration closure", () =>
     Effect.gen(function* () {
       const personalId = ProviderInstanceId.make("codex_personal");
