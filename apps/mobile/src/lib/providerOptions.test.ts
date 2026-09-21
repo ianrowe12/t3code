@@ -30,6 +30,32 @@ const CODEX_CAPABILITIES: ModelCapabilities = {
 };
 
 describe("mobile provider options", () => {
+  it("selects the advertised empty default without changing other options", () => {
+    const descriptors = resolveProviderOptionDescriptors({
+      capabilities: {
+        optionDescriptors: [
+          ...(CODEX_CAPABILITIES.optionDescriptors ?? []),
+          {
+            id: "agent",
+            label: "Agent",
+            type: "select",
+            currentValue: "researcher",
+            options: [
+              { id: "researcher", label: "Researcher" },
+              { id: "", label: "Copilot" },
+            ],
+          },
+        ],
+      },
+      selections: undefined,
+    });
+    expect(applyProviderOptionSelection(descriptors, { id: "agent", value: "" })).toEqual([
+      { id: "reasoningEffort", value: "medium" },
+      { id: "serviceTier", value: "default" },
+      { id: "agent", value: "" },
+    ]);
+  });
+
   it("updates generic select options without knowing provider-specific ids", () => {
     const descriptors = resolveProviderOptionDescriptors({
       capabilities: CODEX_CAPABILITIES,

@@ -7,8 +7,11 @@ import { ProviderDriverKind } from "./providerInstance.ts";
 export const ProviderOptionDescriptorType = Schema.Literals(["select", "boolean"]);
 export type ProviderOptionDescriptorType = typeof ProviderOptionDescriptorType.Type;
 
+// An empty provider-owned value can explicitly select the default, unlike omission.
+const ProviderOptionStringValue = Schema.Union([Schema.Literal(""), TrimmedNonEmptyString]);
+
 export const ProviderOptionChoice = Schema.Struct({
-  id: TrimmedNonEmptyString,
+  id: ProviderOptionStringValue,
   label: TrimmedNonEmptyString,
   description: Schema.optional(TrimmedNonEmptyString),
   isDefault: Schema.optional(Schema.Boolean),
@@ -25,8 +28,8 @@ export const SelectProviderOptionDescriptor = Schema.Struct({
   ...ProviderOptionDescriptorBase,
   type: Schema.Literal("select"),
   options: Schema.Array(ProviderOptionChoice),
-  currentValue: Schema.optional(TrimmedNonEmptyString),
-  promptInjectedValues: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
+  currentValue: Schema.optional(ProviderOptionStringValue),
+  promptInjectedValues: Schema.optional(Schema.Array(ProviderOptionStringValue)),
 });
 export type SelectProviderOptionDescriptor = typeof SelectProviderOptionDescriptor.Type;
 
@@ -43,7 +46,10 @@ export const ProviderOptionDescriptor = Schema.Union([
 ]);
 export type ProviderOptionDescriptor = typeof ProviderOptionDescriptor.Type;
 
-export const ProviderOptionSelectionValue = Schema.Union([TrimmedNonEmptyString, Schema.Boolean]);
+export const ProviderOptionSelectionValue = Schema.Union([
+  ProviderOptionStringValue,
+  Schema.Boolean,
+]);
 export type ProviderOptionSelectionValue = typeof ProviderOptionSelectionValue.Type;
 
 export const ProviderOptionSelection = Schema.Struct({
@@ -102,7 +108,7 @@ function coerceLegacyOptionsObjectToArray(
     if (id.length === 0) continue;
     if (typeof rawValue === "string") {
       const trimmed = rawValue.trim();
-      if (trimmed.length > 0) entries.push({ id, value: trimmed });
+      if (rawValue === "" || trimmed.length > 0) entries.push({ id, value: trimmed });
     } else if (typeof rawValue === "boolean") {
       entries.push({ id, value: rawValue });
     }

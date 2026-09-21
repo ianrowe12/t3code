@@ -96,14 +96,18 @@ function modelsFromDiscovery(
     | Pick<AcpRegistryLiveConfiguration, "models" | "currentModelId" | "configOptions">
     | undefined,
   customModels: ReadonlyArray<string>,
+  agentId?: string,
 ): ReadonlyArray<ServerProviderModel> {
   const discovered = discovery?.models ?? [];
+  const optionDescriptors = (discovery?.configOptions ?? []).filter(
+    (option) => agentId !== "github-copilot-cli" || option.id !== "agent",
+  );
   // Discovered session config options and modes ride on every model so the
   // composer's generic option controls can drive them per thread.
   const capabilities =
-    discovery === undefined || discovery.configOptions.length === 0
+    optionDescriptors.length === 0
       ? EMPTY_CAPABILITIES
-      : createModelCapabilities({ optionDescriptors: discovery.configOptions });
+      : createModelCapabilities({ optionDescriptors });
   const builtInModels: ReadonlyArray<ServerProviderModel> =
     discovered.length === 0
       ? [
@@ -213,7 +217,11 @@ function baseSnapshot(
     auth: input.auth,
     checkedAt: input.checkedAt,
     ...(input.message ? { message: input.message } : {}),
-    models: modelsFromDiscovery(input.probe?.probe, input.settings.customModels),
+    models: modelsFromDiscovery(
+      input.probe?.probe,
+      input.settings.customModels,
+      input.settings.agentId,
+    ),
     ...(input.probe === undefined
       ? {}
       : {
@@ -244,13 +252,14 @@ export function applyAcpRegistryLiveConfiguration(
   provider: ServerProvider,
   configuration: AcpRegistryLiveConfiguration,
   customModels: ReadonlyArray<string>,
+  agentId?: string,
 ): ServerProvider {
   const { message: _staleProbeMessage, ...snapshot } = provider;
   return {
     ...snapshot,
     status: provider.enabled ? "ready" : provider.status,
     auth: { ...provider.auth, status: "authenticated" },
-    models: modelsFromDiscovery(configuration, customModels),
+    models: modelsFromDiscovery(configuration, customModels, agentId),
   };
 }
 
@@ -527,6 +536,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
                       withCommands,
                       liveConfiguration,
                       effectiveConfig.customModels,
+                      effectiveConfig.agentId,
                     ),
                 });
                 return applyAcpRegistryUrlAuthAction(withConfiguration, authAction);
@@ -654,6 +664,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
                         current,
                         configuration,
                         effectiveConfig.customModels,
+                        effectiveConfig.agentId,
                       ),
                     ),
                   ),

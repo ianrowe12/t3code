@@ -59,6 +59,65 @@ function catalogWithInspection(inspection: AcpRegistryInspection): AcpRegistryCa
 }
 
 describe("acpRegistrySnapshotReadiness", () => {
+  it.each(["github-copilot-cli", "other-agent"])(
+    "publishes only user-selectable options for %s after discovery and live refresh",
+    (agentId) => {
+      const configOptions = [
+        {
+          id: "agent",
+          label: "Agent",
+          type: "select" as const,
+          currentValue: "researcher",
+          options: [
+            { id: "", label: "Copilot" },
+            { id: "researcher", label: "Researcher" },
+          ],
+        },
+        {
+          id: "reasoning_effort",
+          label: "Reasoning Effort",
+          type: "select" as const,
+          currentValue: "max",
+          options: [{ id: "max", label: "Max" }],
+        },
+      ];
+      const configuration = {
+        models: [{ id: "gpt-6-astra", name: "GPT-6 Astra", description: null }],
+        currentModelId: "gpt-6-astra",
+        configOptions,
+      };
+      const provider = buildCheckedAcpRegistrySnapshot({
+        ...identity,
+        settings: decodeSettings({ agentId }),
+        checkedAt: "2026-09-21T20:00:00.000Z",
+        inspection: { status: "ready", agentId, version: "1.0.87", distribution: "npx" },
+        probe: {
+          probe: {
+            ...configuration,
+            instanceId: identity.instanceId,
+            ready: true,
+            icon: null,
+            authMethods: [],
+            sessionManagement: noSessionManagement,
+          },
+          slashCommands: [],
+          skills: [],
+        },
+      });
+      for (const snapshot of [
+        provider,
+        applyAcpRegistryLiveConfiguration(provider, configuration, [], agentId),
+      ]) {
+        expect(
+          snapshot.models[0]?.capabilities?.optionDescriptors?.map((option) => option.id),
+        ).toEqual(
+          agentId === "github-copilot-cli" ? ["reasoning_effort"] : ["agent", "reasoning_effort"],
+        );
+        expect(snapshot.models[0]?.slug).toBe("gpt-6-astra");
+      }
+    },
+  );
+
   it.effect("binds Copilot helpers to each instance without enabling unrelated ACP helpers", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

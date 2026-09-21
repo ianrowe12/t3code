@@ -10,6 +10,8 @@ import {
   getModelSelectionBooleanOptionValue,
   getModelSelectionStringOptionValue,
   getProviderOptionDescriptors,
+  getProviderOptionCurrentLabel,
+  getProviderOptionCurrentValue,
   readCustomModelEntries,
   toCustomModelSetting,
   getProviderOptionBooleanSelectionValue,
@@ -78,6 +80,48 @@ const claudeCaps: ModelCapabilities = createModelCapabilities({
 });
 
 describe("descriptor helpers", () => {
+  it("keeps an explicit default distinct from an omitted selection", () => {
+    const caps: ModelCapabilities = {
+      optionDescriptors: [
+        {
+          id: "agent",
+          label: "Agent",
+          type: "select",
+          currentValue: "researcher",
+          options: [
+            { id: "researcher", label: "Researcher" },
+            { id: "", label: "Copilot" },
+          ],
+        },
+      ],
+    };
+    const selections = [{ id: "agent", value: "" }];
+    const descriptors = getProviderOptionDescriptors({ caps, selections });
+    expect(getProviderOptionCurrentValue(descriptors[0])).toBe("");
+    expect(getProviderOptionCurrentLabel(descriptors[0])).toBe("Copilot");
+    expect(buildProviderOptionSelectionsFromDescriptors(descriptors)).toEqual(selections);
+    expect(buildExplicitProviderOptionSelectionsFromDescriptors(descriptors, selections)).toEqual(
+      selections,
+    );
+    expect(
+      buildExplicitProviderOptionSelectionsFromDescriptors(descriptors, undefined),
+    ).toBeUndefined();
+    expect(getProviderOptionDescriptors({ caps })[0]?.currentValue).toBe("researcher");
+    const unresolved = getProviderOptionDescriptors({
+      caps: {
+        optionDescriptors: [
+          {
+            id: "agent",
+            label: "Agent",
+            type: "select",
+            options: [{ id: "researcher", label: "Researcher" }],
+          },
+        ],
+      },
+    });
+    expect(buildProviderOptionSelectionsFromDescriptors(unresolved)).toBeUndefined();
+  });
+
   it("applies selection values to capability descriptors", () => {
     expect(
       getProviderOptionDescriptors({

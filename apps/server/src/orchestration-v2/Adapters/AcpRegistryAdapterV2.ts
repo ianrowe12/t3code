@@ -202,6 +202,7 @@ export function makeAcpRegistryAdapterV2(options: AcpRegistryAdapterV2Options) {
     capabilities: AcpProviderCapabilitiesV2,
     ...(isCopilot
       ? {
+          fixedConfigOptions: [{ id: "agent", value: "" }],
           clientCapabilitiesMeta: copilotCompletionCapabilities,
           extractSubagentUpdates: extractCopilotSubagentUpdates,
           extractSubagentEndNotice: extractCopilotSubagentEndNotice,

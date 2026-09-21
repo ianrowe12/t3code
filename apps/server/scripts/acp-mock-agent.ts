@@ -89,6 +89,7 @@ const initialGrokReasoningEffort =
   process.env.T3_ACP_INITIAL_GROK_REASONING_EFFORT?.trim() || undefined;
 const promptDelayMs = Number(process.env.T3_ACP_PROMPT_DELAY_MS ?? "0");
 const supportsSessionLifecycle = process.env.T3_ACP_SESSION_LIFECYCLE === "1";
+let currentAgent = process.env.T3_ACP_CUSTOM_AGENT;
 const supportsAcpMcp = process.env.T3_ACP_MCP_ACP === "1";
 const supportsV2Management = process.env.T3_ACP_V2_MANAGEMENT === "1";
 const omitSessionListHandler = process.env.T3_ACP_OMIT_SESSION_LIST_HANDLER === "1";
@@ -302,6 +303,20 @@ function configOptions(): ReadonlyArray<AcpSchema.SessionConfigOption> {
   }
 
   return [
+    ...(currentAgent === undefined
+      ? []
+      : [
+          {
+            configId: "agent",
+            name: "Agent",
+            type: "select" as const,
+            currentValue: currentAgent,
+            options: [
+              { value: "", name: "Copilot" },
+              { value: "researcher", name: "Researcher" },
+            ],
+          },
+        ]),
     {
       configId: "mode",
       name: "Mode",
@@ -774,6 +789,9 @@ const program = Effect.gen(function* () {
       }
       if (request.configId === "mode" && typeof request.value === "string") {
         currentModeId = request.value;
+      }
+      if (request.configId === "agent" && typeof request.value === "string") {
+        currentAgent = request.value;
       }
       if (request.configId === "model" && typeof request.value === "string") {
         currentModelId = request.value;

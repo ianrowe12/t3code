@@ -61,6 +61,21 @@ function display(descriptors: ReadonlyArray<ProviderOptionDescriptor>) {
 }
 
 describe("buildTraitsTriggerDisplay", () => {
+  it("shows Copilot for an explicit empty default instead of a custom agent", () => {
+    expect(
+      display([
+        selectDescriptor(
+          "agent",
+          [
+            { id: "researcher", label: "Researcher" },
+            { id: "", label: "Copilot" },
+          ],
+          "",
+        ),
+      ]),
+    ).toEqual({ label: "Copilot", showFastModeIcon: false });
+  });
+
   it("omits fast mode from the label entirely when it is off", () => {
     expect(display([EFFORT, fastModeDescriptor(false), CONTEXT_WINDOW])).toEqual({
       label: "High · 1M",

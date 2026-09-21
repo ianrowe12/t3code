@@ -22,6 +22,7 @@ import {
   type ProviderApprovalOption,
   type ProviderInstanceId,
   type ProviderInteractionMode,
+  type ProviderOptionSelection,
   type ProviderDriverKind,
   type ProviderRequestKind,
   type ProviderThreadId,
@@ -194,6 +195,8 @@ export interface AcpAdapterV2ExtensionContext {
 export interface AcpAdapterV2Flavor {
   readonly driver: ProviderDriverKind;
   readonly capabilities: OrchestrationV2ProviderCapabilities;
+  /** Override saved selections when the provider exposes these options; rejection is fatal. */
+  readonly fixedConfigOptions?: ReadonlyArray<ProviderOptionSelection>;
   readonly clientCapabilitiesMeta?: NonNullable<EffectAcpSchema.ClientCapabilities["_meta"]>;
   readonly normalizeSessionUpdate?: (
     notification: EffectAcpSchema.SessionNotification,
@@ -5925,6 +5928,16 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
           modelSelection: ModelSelection,
           runtimePolicy: ProviderAdapterV2RuntimePolicy,
         ) {
+          const fixedConfigOptions = flavor.fixedConfigOptions ?? [];
+          const fixedConfigIds = new Set(fixedConfigOptions.map((option) => option.id));
+          if (fixedConfigOptions.length > 0) {
+            const available = yield* runtime.getConfigOptions;
+            for (const fixed of fixedConfigOptions) {
+              if (available.some((option) => option.id === fixed.id)) {
+                yield* runtime.setConfigOption(fixed.id, fixed.value);
+              }
+            }
+          }
           const requestedModel = flavor.resolveModelId?.(modelSelection) ?? modelSelection.model;
           let appliedModel: string | undefined;
           if (flavor.applyModelSelection !== undefined) {
@@ -5969,8 +5982,10 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
               };
             });
           }
-          const optionSelections = modelSelection.options ?? [];
           const configOptions = yield* runtime.getConfigOptions;
+          const optionSelections = (modelSelection.options ?? []).filter(
+            (option) => !fixedConfigIds.has(option.id),
+          );
           const availableConfigIds = new Set(configOptions.map((option) => option.id));
           const hasNativeConfigWithSyntheticModeId = availableConfigIds.has(
             ACP_SESSION_MODE_OPTION_ID,

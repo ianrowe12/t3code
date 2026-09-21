@@ -63,6 +63,11 @@ composer's model options menu like they do for built-in providers. Agents with t
 build modes follow T3 Code's Plan and Build toggle. Models and options that change while an agent
 is running update the picker without waiting for another provider probe.
 
+In this Copilot build, threads use the standard coding assistant and the custom Agent picker is
+not shown. Resuming an older custom-agent session restores the standard assistant without
+changing the thread's model, reasoning effort, permissions, or conversation. Installed skills,
+custom-agent files, and built-in subagents remain available.
+
 ## Commands and skills
 
 Slash commands the agent provides appear under **Provider** in the `/` menu while a session is
