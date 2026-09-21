@@ -2076,7 +2076,8 @@ export const make = (
           Ref.get(configOptionsRef).pipe(
             Effect.flatMap((configOptions) => {
               const existing = findSessionConfigOption(configOptions, configId);
-              if (existing && configOptionCurrentValueMatches(existing, value)) {
+              // Empty values are explicit resets, including for a resumed persona.
+              if (value !== "" && existing && configOptionCurrentValueMatches(existing, value)) {
                 return Effect.succeed({
                   configOptions,
                 } satisfies EffectAcpSchema.SetSessionConfigOptionResponse);

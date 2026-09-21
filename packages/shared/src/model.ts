@@ -125,8 +125,8 @@ function resolveDescriptorChoiceValue(
   descriptor: Extract<ProviderOptionDescriptor, { type: "select" }>,
   raw: string | null | undefined,
 ): string | undefined {
-  const trimmed = trimOrNull(raw);
-  if (!trimmed) {
+  const trimmed = raw === "" ? "" : trimOrNull(raw);
+  if (trimmed === null) {
     return descriptor.currentValue ?? descriptor.options.find((option) => option.isDefault)?.id;
   }
   if (descriptor.options.length === 0) {
@@ -177,7 +177,7 @@ function withDescriptorCurrentValue(
     typeof rawCurrentValue === "string"
       ? resolveDescriptorChoiceValue(descriptor, rawCurrentValue)
       : resolveDescriptorChoiceValue(descriptor, descriptor.currentValue);
-  if (!currentValue) {
+  if (currentValue === undefined) {
     const { currentValue: _unusedCurrentValue, ...rest } = descriptor;
     return rest;
   }
@@ -211,7 +211,7 @@ export function getProviderOptionCurrentValue(
   if (descriptor.type === "boolean") {
     return descriptor.currentValue;
   }
-  if (descriptor.currentValue) {
+  if (descriptor.currentValue !== undefined) {
     return descriptor.currentValue;
   }
   return descriptor.options.find((option) => option.isDefault)?.id;

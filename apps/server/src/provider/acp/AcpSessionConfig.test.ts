@@ -3,6 +3,37 @@ import { describe, expect, it } from "@effect/vitest";
 import { ACP_SESSION_MODE_OPTION_ID, acpProviderOptionDescriptors } from "./AcpSessionConfig.ts";
 
 describe("acpProviderOptionDescriptors", () => {
+  it("preserves the advertised Copilot default while rejecting empty option IDs", () => {
+    const agent = {
+      id: "agent",
+      name: "Agent",
+      type: "select" as const,
+      currentValue: "",
+      options: [
+        { value: "", name: "Copilot" },
+        { value: "researcher", name: "Researcher" },
+        { value: "", name: "Duplicate default" },
+      ],
+    };
+    expect(
+      acpProviderOptionDescriptors({
+        configOptions: [agent, { ...agent, id: "" }, { ...agent, id: " " }],
+        modeState: undefined,
+      }),
+    ).toEqual([
+      {
+        id: "agent",
+        label: "Agent",
+        type: "select",
+        currentValue: "",
+        options: [
+          { id: "", label: "Copilot" },
+          { id: "researcher", label: "Researcher" },
+        ],
+      },
+    ]);
+  });
+
   it("maps non-model select options and excludes model and collaboration categories", () => {
     const descriptors = acpProviderOptionDescriptors({
       configOptions: [

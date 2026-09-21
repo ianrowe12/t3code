@@ -12,7 +12,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
  * from before the reshape still have the object shape and fail to decode.
  *
  * For each value in the legacy object:
- *   - string values are kept if non-empty after trim
+ *   - string values are kept if explicitly empty or non-empty after trim
  *   - boolean values are always kept (true | false)
  *   - any other value type (number, null, nested object/array) is dropped,
  *     matching the permissive client-side normalizer in composerDraftStore.
@@ -46,7 +46,7 @@ export default Effect.gen(function* () {
           )
         )
         FROM json_each(json_extract(model_selection_json, '$.options'))
-        WHERE (type = 'text' AND trim(coalesce(atom, '')) != '')
+        WHERE (type = 'text' AND (atom = '' OR trim(coalesce(atom, '')) != ''))
            OR type IN ('true', 'false')
       )
     )
@@ -72,7 +72,7 @@ export default Effect.gen(function* () {
           )
         )
         FROM json_each(json_extract(default_model_selection_json, '$.options'))
-        WHERE (type = 'text' AND trim(coalesce(atom, '')) != '')
+        WHERE (type = 'text' AND (atom = '' OR trim(coalesce(atom, '')) != ''))
            OR type IN ('true', 'false')
       )
     )
@@ -98,7 +98,7 @@ export default Effect.gen(function* () {
           )
         )
         FROM json_each(json_extract(payload_json, '$.modelSelection.options'))
-        WHERE (type = 'text' AND trim(coalesce(atom, '')) != '')
+        WHERE (type = 'text' AND (atom = '' OR trim(coalesce(atom, '')) != ''))
            OR type IN ('true', 'false')
       )
     )
@@ -128,7 +128,7 @@ export default Effect.gen(function* () {
           )
         )
         FROM json_each(json_extract(payload_json, '$.defaultModelSelection.options'))
-        WHERE (type = 'text' AND trim(coalesce(atom, '')) != '')
+        WHERE (type = 'text' AND (atom = '' OR trim(coalesce(atom, '')) != ''))
            OR type IN ('true', 'false')
       )
     )

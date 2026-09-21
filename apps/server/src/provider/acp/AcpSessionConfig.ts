@@ -26,7 +26,7 @@ const boundedText = (value: string | null | undefined, maximumLength: number): s
   (value ?? "").trim().slice(0, maximumLength);
 
 const boundedOpaqueValue = (value: string, maximumLength: number): string | undefined =>
-  value.length > 0 && value === value.trim() && value.length <= maximumLength ? value : undefined;
+  value === value.trim() && value.length <= maximumLength ? value : undefined;
 
 function flattenSelectChoices(
   options: EffectAcpSchema.SessionConfigSelectOptions,
@@ -74,7 +74,7 @@ export function acpProviderOptionDescriptors(input: {
       continue;
     }
     const id = boundedOpaqueValue(option.id, MAX_TEXT_LENGTH);
-    if (id === undefined || seen.has(id)) continue;
+    if (id === undefined || id.length === 0 || seen.has(id)) continue;
     seen.add(id);
     const description = boundedText(option.description, MAX_DESCRIPTION_LENGTH);
     const base = {
@@ -106,9 +106,7 @@ export function acpProviderOptionDescriptors(input: {
       ...base,
       type: "select",
       options: choices,
-      ...(currentValue && choices.some((choice) => choice.id === currentValue)
-        ? { currentValue }
-        : {}),
+      ...(choices.some((choice) => choice.id === currentValue) ? { currentValue } : {}),
     });
     if (descriptors.length === MAX_OPTION_DESCRIPTORS) return descriptors;
   }
@@ -142,9 +140,7 @@ export function acpProviderOptionDescriptors(input: {
         description: "Session mode advertised by the ACP agent.",
         type: "select",
         options: choices,
-        ...(currentValue && choices.some((choice) => choice.id === currentValue)
-          ? { currentValue }
-          : {}),
+        ...(choices.some((choice) => choice.id === currentValue) ? { currentValue } : {}),
       });
     }
   }

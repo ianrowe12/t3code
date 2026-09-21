@@ -117,6 +117,8 @@ const AcpRequestRecord = Schema.Struct({
   params: Schema.optionalKey(
     Schema.Struct({
       sessionId: Schema.optionalKey(Schema.String),
+      configId: Schema.optionalKey(Schema.String),
+      value: Schema.optionalKey(Schema.Union([Schema.String, Schema.Boolean])),
       mcpServers: Schema.optionalKey(Schema.Array(Schema.Unknown)),
     }),
   ),
@@ -128,7 +130,11 @@ const decodeRequestRecords = Schema.decodeUnknownEffect(
   Schema.Array(Schema.fromJsonString(AcpRequestRecord)),
 );
 
-const makeMcpLaunchFixture = Effect.fnUntraced(function* (agentId: string) {
+const makeMcpLaunchFixture = Effect.fnUntraced(function* (
+  agentId: string,
+  customAgent?: string,
+  rejectConfig: boolean | "after-first-reset" = false,
+) {
   const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const fileSystem = yield* FileSystem.FileSystem;
   const idAllocator = yield* IdAllocatorV2;
@@ -186,6 +192,11 @@ const makeMcpLaunchFixture = Effect.fnUntraced(function* (agentId: string) {
             cwd,
             env: {
               T3_ACP_SESSION_LIFECYCLE: "1",
+              ...(customAgent === undefined ? {} : { T3_ACP_CUSTOM_AGENT: customAgent }),
+              ...(rejectConfig === true ? { T3_ACP_FAIL_SET_CONFIG_OPTION: "1" } : {}),
+              ...(rejectConfig === "after-first-reset"
+                ? { T3_ACP_REJECT_LATER_AGENT_RESETS: "1" }
+                : {}),
               T3_TEST_MCP_SPAWN_LOG: spawnLog,
               T3_ACP_REQUEST_LOG_PATH: requestLog,
               T3_ACP_MCP_ENDPOINT: "http://127.0.0.1:1/stale",
@@ -240,6 +251,146 @@ const makeMcpLaunchFixture = Effect.fnUntraced(function* (agentId: string) {
 });
 
 describe("AcpRegistryAdapterV2", () => {
+  it.effect("does not reuse successful configuration after a resumed persona reset fails", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeMcpLaunchFixture(
+        "github-copilot-cli",
+        "researcher",
+        "after-first-reset",
+      );
+      const selection = {
+        threadId: ThreadId.make("thread-rejected-resume"),
+        modelSelection: fixture.modelSelection,
+        runtimePolicy: fixture.runtimePolicy,
+      };
+      const runtime = yield* fixture.adapter.openSession({
+        ...selection,
+        providerSessionId: ProviderSessionId.make("session-rejected-resume"),
+      });
+      const original = yield* runtime.ensureThread(selection);
+      const providerThread = {
+        ...original,
+        nativeThreadRef: {
+          driver: original.driver,
+          nativeId: "mock-session-customized",
+          strength: "strong" as const,
+        },
+      };
+      const error = yield* Effect.flip(runtime.resumeThread({ providerThread }));
+      assert.equal(error._tag, "ProviderAdapterResumeThreadError");
+      const fallbackError = yield* Effect.flip(runtime.ensureThread(selection));
+      assert.equal(fallbackError._tag, "ProviderAdapterEnsureThreadError");
+      const retryError = yield* Effect.flip(runtime.resumeThread({ providerThread }));
+      assert.equal(retryError._tag, "ProviderAdapterResumeThreadError");
+      const requests = yield* fixture.readRequests;
+      assert.lengthOf(
+        requests.filter(
+          (request) =>
+            request.method === "session/set_config_option" && request.params?.configId === "agent",
+        ),
+        3,
+      );
+      assert.isFalse(requests.some((request) => request.method === "session/prompt"));
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("fails session activation if Copilot rejects the default reset", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeMcpLaunchFixture("github-copilot-cli", "researcher", true);
+      const error = yield* Effect.flip(
+        fixture.adapter.openSession({
+          threadId: ThreadId.make("thread-rejected-default"),
+          providerSessionId: ProviderSessionId.make("session-rejected-default"),
+          modelSelection: fixture.modelSelection,
+          runtimePolicy: fixture.runtimePolicy,
+        }),
+      );
+      assert.equal(error._tag, "ProviderAdapterOpenSessionError");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("sends an explicit default reset even when discovery already reports the default", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeMcpLaunchFixture("github-copilot-cli", "");
+      yield* fixture.adapter.openSession({
+        threadId: ThreadId.make("thread-explicit-default"),
+        providerSessionId: ProviderSessionId.make("session-explicit-default"),
+        modelSelection: fixture.modelSelection,
+        runtimePolicy: fixture.runtimePolicy,
+      });
+      const requests = yield* fixture.readRequests;
+      assert.deepInclude(
+        requests.find(
+          (request) =>
+            request.method === "session/set_config_option" && request.params?.configId === "agent",
+        )?.params,
+        { configId: "agent", value: "" },
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect(
+    "resets a customized Copilot session on open and cold resume without changing other options",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* makeMcpLaunchFixture("github-copilot-cli", "researcher");
+        const threadId = ThreadId.make("thread-copilot-default-agent");
+        const selection = {
+          threadId,
+          modelSelection: {
+            ...fixture.modelSelection,
+            options: [
+              { id: "agent", value: "researcher" },
+              { id: "mode", value: "code" },
+            ],
+          },
+          runtimePolicy: fixture.runtimePolicy,
+        };
+        yield* fixture.registerMcp(threadId, "test-default-agent-credential");
+        const providerThread = yield* Effect.gen(function* () {
+          const runtime = yield* fixture.adapter.openSession({
+            ...selection,
+            providerSessionId: ProviderSessionId.make("session-customized-copilot"),
+          });
+          return yield* runtime.ensureThread(selection);
+        }).pipe(Effect.scoped);
+        const nativeId = providerThread.nativeThreadRef?.nativeId;
+        if (nativeId == null) assert.fail("Expected the original native session");
+        yield* fixture.adapter.openSession({
+          ...selection,
+          modelSelection: {
+            ...fixture.modelSelection,
+            options: [{ id: "mode", value: "code" }],
+          },
+          providerSessionId: ProviderSessionId.make("session-resumed-copilot"),
+          initialNativeThreadId: nativeId,
+        });
+        const requests = yield* fixture.readRequests;
+        const configs = requests.filter(
+          (request) => request.method === "session/set_config_option",
+        );
+        assert.equal(configs[0]?.params?.configId, "agent");
+        assert.deepEqual(
+          configs
+            .filter((request) => request.params?.configId === "agent")
+            .map((request) => request.params?.value),
+          ["", ""],
+        );
+        assert.deepEqual(
+          configs
+            .filter((request) => request.params?.configId === "mode")
+            .map((request) => request.params?.value),
+          ["code", "code"],
+        );
+        assert.deepInclude(
+          requests.find((request) => request.method === "session/resume")?.params,
+          {
+            sessionId: nativeId,
+          },
+        );
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.effect("exposes T3 MCP to the native Copilot process without credentials in argv", () =>
     Effect.gen(function* () {
       const fixture = yield* makeMcpLaunchFixture("github-copilot-cli");

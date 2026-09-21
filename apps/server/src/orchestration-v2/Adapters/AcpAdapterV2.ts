@@ -22,6 +22,7 @@ import {
   type ProviderApprovalOption,
   type ProviderInstanceId,
   type ProviderInteractionMode,
+  type ProviderOptionSelection,
   type ProviderDriverKind,
   type ProviderRequestKind,
   type ProviderThreadId,
@@ -194,6 +195,8 @@ export interface AcpAdapterV2ExtensionContext {
 export interface AcpAdapterV2Flavor {
   readonly driver: ProviderDriverKind;
   readonly capabilities: OrchestrationV2ProviderCapabilities;
+  /** Override saved selections when the provider exposes these options; rejection is fatal. */
+  readonly fixedConfigOptions?: ReadonlyArray<ProviderOptionSelection>;
   readonly clientCapabilitiesMeta?: NonNullable<EffectAcpSchema.ClientCapabilities["_meta"]>;
   readonly normalizeSessionUpdate?: (
     notification: EffectAcpSchema.SessionNotification,
@@ -5920,208 +5923,233 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
           return activated;
         });
 
-        const configureSession = Effect.fnUntraced(function* (
-          startResult: AcpSessionRuntimeStartResult,
-          modelSelection: ModelSelection,
-          runtimePolicy: ProviderAdapterV2RuntimePolicy,
-        ) {
-          const requestedModel = flavor.resolveModelId?.(modelSelection) ?? modelSelection.model;
-          let appliedModel: string | undefined;
-          if (flavor.applyModelSelection !== undefined) {
-            appliedModel = yield* flavor.applyModelSelection({
-              runtime,
-              startResult,
-              modelSelection,
-            });
-          } else if (
-            requestedModel.length > 0 &&
-            requestedModel !== "auto" &&
-            requestedModel !== "default"
+        const configureSession = Effect.fnUntraced(
+          function* (
+            startResult: AcpSessionRuntimeStartResult,
+            modelSelection: ModelSelection,
+            runtimePolicy: ProviderAdapterV2RuntimePolicy,
           ) {
-            const hasModelConfig =
-              startResult.sessionSetupResult.configOptions?.some(
-                (option) => option.category === "model",
-              ) === true;
-            if (hasModelConfig) {
-              yield* runtime.setModel(requestedModel);
+            const fixedConfigOptions = flavor.fixedConfigOptions ?? [];
+            const fixedConfigIds = new Set(fixedConfigOptions.map((option) => option.id));
+            if (fixedConfigOptions.length > 0) {
+              const available = yield* runtime.getConfigOptions;
+              for (const fixed of fixedConfigOptions) {
+                if (available.some((option) => option.id === fixed.id)) {
+                  yield* runtime.setConfigOption(fixed.id, fixed.value);
+                }
+              }
             }
-          }
-          // Same-runtime switches compare against this stored setup, so keep
-          // its model metadata in sync with what the session now runs on;
-          // otherwise switching A -> B -> A would see the stale setup-time A
-          // and skip the final switch.
-          if (appliedModel !== undefined) {
-            const applied = appliedModel;
-            yield* Ref.update(activeSessionSetup, (setup) => {
-              if (setup === null) {
-                return setup;
-              }
-              const models = setup.sessionSetupResult.models;
-              if (models == null || models.currentModelId === applied) {
-                return setup;
-              }
-              return {
-                ...setup,
-                sessionSetupResult: {
-                  ...setup.sessionSetupResult,
-                  models: { ...models, currentModelId: applied },
-                },
-              };
-            });
-          }
-          const optionSelections = modelSelection.options ?? [];
-          const configOptions = yield* runtime.getConfigOptions;
-          const availableConfigIds = new Set(configOptions.map((option) => option.id));
-          const hasNativeConfigWithSyntheticModeId = availableConfigIds.has(
-            ACP_SESSION_MODE_OPTION_ID,
-          );
-          const modeSelection = hasNativeConfigWithSyntheticModeId
-            ? undefined
-            : optionSelections.find((selection) => selection.id === ACP_SESSION_MODE_OPTION_ID);
-          const configSelections = hasNativeConfigWithSyntheticModeId
-            ? optionSelections
-            : optionSelections.filter((selection) => selection.id !== ACP_SESSION_MODE_OPTION_ID);
-          // Probe-time descriptors are a per-model union, so a stored
-          // selection can reference an option the live session does not
-          // expose (Kilo advertises per-model "effort" descriptors while its
-          // session config omits them). Failing the open here wedges the run
-          // in a retry loop; skip like the out-of-range values below and let
-          // the agent default apply.
-          const unsupportedConfigIds = configSelections
-            .map((selection) => selection.id)
-            .filter((id) => !availableConfigIds.has(id));
-          if (unsupportedConfigIds.length > 0) {
-            yield* Effect.logWarning(
-              "ACP session does not expose requested configuration option(s)",
-              {
-                driver,
-                sessionId: startResult.sessionId,
-                optionIds: unsupportedConfigIds,
-              },
-            );
-          }
-          for (const selection of configSelections) {
-            if (!availableConfigIds.has(selection.id)) continue;
-            // Tuning knobs degrade instead of failing the session open: agents
-            // advertise the union of values across models but can reject a
-            // per-model invalid one at set time (codex-acp advertises "ultra"
-            // reasoning effort and then rejects it for most models). Skip
-            // values the session does not currently offer and downgrade an
-            // agent-side set rejection to a warning; the agent's default
-            // applies for that option.
-            const option = configOptions.find((candidate) => candidate.id === selection.id);
-            if (
-              option !== undefined &&
-              option.type === "select" &&
-              typeof selection.value === "string"
+            const requestedModel = flavor.resolveModelId?.(modelSelection) ?? modelSelection.model;
+            let appliedModel: string | undefined;
+            if (flavor.applyModelSelection !== undefined) {
+              appliedModel = yield* flavor.applyModelSelection({
+                runtime,
+                startResult,
+                modelSelection,
+              });
+            } else if (
+              requestedModel.length > 0 &&
+              requestedModel !== "auto" &&
+              requestedModel !== "default"
             ) {
-              const advertisedValues = option.options.flatMap((entry) =>
-                "value" in entry ? [entry.value] : entry.options.map((choice) => choice.value),
-              );
-              if (!advertisedValues.includes(selection.value)) continue;
+              const hasModelConfig =
+                startResult.sessionSetupResult.configOptions?.some(
+                  (option) => option.category === "model",
+                ) === true;
+              if (hasModelConfig) {
+                yield* runtime.setModel(requestedModel);
+              }
             }
-            yield* runtime.setConfigOption(selection.id, selection.value).pipe(
-              Effect.catchTags({
-                AcpRequestError: (error) =>
-                  Effect.logWarning("ACP session rejected a configuration option value", {
-                    optionId: selection.id,
-                    value: selection.value,
-                    detail: error.message,
-                  }),
-              }),
-            );
-          }
-          const policyMode = flavor.sessionModeForPolicy?.(runtimePolicy);
-          if (policyMode !== undefined) {
-            yield* runtime.setMode(policyMode);
-          }
-          const modeState = yield* runtime.getModeState;
-          // The synthetic mode selection is skipped rather than failed when the
-          // agent no longer advertises it: mode sets are volatile across agent
-          // versions and a stale persisted mode should not block the turn.
-          if (
-            modeSelection !== undefined &&
-            typeof modeSelection.value === "string" &&
-            modeState?.availableModes.some((mode) => mode.id === modeSelection.value) === true &&
-            modeState.currentModeId !== modeSelection.value
-          ) {
-            yield* runtime.setMode(modeSelection.value);
-          }
-          const effectiveModeState = yield* runtime.getModeState;
-          const effectiveConfigOptions = yield* runtime.getConfigOptions;
-          const planSensitiveOptions = effectiveConfigOptions.filter(
-            (
-              option,
-            ): option is Extract<
-              EffectAcpSchema.SessionConfigOption,
-              { readonly type: "select" }
-            > =>
-              option.type === "select" &&
-              (option.category === "mode" || option.category === "collaboration_mode"),
-          );
-          if (runtimePolicy.interactionMode === "plan") {
-            if (!nativeBuildConfigurationBySessionId.has(startResult.sessionId)) {
-              nativeBuildConfigurationBySessionId.set(startResult.sessionId, {
-                ...(effectiveModeState === undefined
-                  ? {}
-                  : { modeId: effectiveModeState.currentModeId }),
-                configOptions: planSensitiveOptions.map((option) => ({
-                  id: option.id,
-                  value: option.currentValue,
-                })),
+            // Same-runtime switches compare against this stored setup, so keep
+            // its model metadata in sync with what the session now runs on;
+            // otherwise switching A -> B -> A would see the stale setup-time A
+            // and skip the final switch.
+            if (appliedModel !== undefined) {
+              const applied = appliedModel;
+              yield* Ref.update(activeSessionSetup, (setup) => {
+                if (setup === null) {
+                  return setup;
+                }
+                const models = setup.sessionSetupResult.models;
+                if (models == null || models.currentModelId === applied) {
+                  return setup;
+                }
+                return {
+                  ...setup,
+                  sessionSetupResult: {
+                    ...setup.sessionSetupResult,
+                    models: { ...models, currentModelId: applied },
+                  },
+                };
               });
             }
-            const planMode = effectiveModeState?.availableModes.find(
-              (mode) => mode.id === "plan" || mode.id === "architect",
+            const configOptions = yield* runtime.getConfigOptions;
+            const optionSelections = (modelSelection.options ?? []).filter(
+              (option) => !fixedConfigIds.has(option.id),
             );
-            if (planMode !== undefined && effectiveModeState?.currentModeId !== planMode.id) {
-              yield* runtime.setMode(planMode.id);
-            }
-            for (const option of planSensitiveOptions) {
-              const choices = option.options.flatMap((entry) =>
-                "value" in entry ? [entry.value] : entry.options.map((choice) => choice.value),
+            const availableConfigIds = new Set(configOptions.map((option) => option.id));
+            const hasNativeConfigWithSyntheticModeId = availableConfigIds.has(
+              ACP_SESSION_MODE_OPTION_ID,
+            );
+            const modeSelection = hasNativeConfigWithSyntheticModeId
+              ? undefined
+              : optionSelections.find((selection) => selection.id === ACP_SESSION_MODE_OPTION_ID);
+            const configSelections = hasNativeConfigWithSyntheticModeId
+              ? optionSelections
+              : optionSelections.filter((selection) => selection.id !== ACP_SESSION_MODE_OPTION_ID);
+            // Probe-time descriptors are a per-model union, so a stored
+            // selection can reference an option the live session does not
+            // expose (Kilo advertises per-model "effort" descriptors while its
+            // session config omits them). Failing the open here wedges the run
+            // in a retry loop; skip like the out-of-range values below and let
+            // the agent default apply.
+            const unsupportedConfigIds = configSelections
+              .map((selection) => selection.id)
+              .filter((id) => !availableConfigIds.has(id));
+            if (unsupportedConfigIds.length > 0) {
+              yield* Effect.logWarning(
+                "ACP session does not expose requested configuration option(s)",
+                {
+                  driver,
+                  sessionId: startResult.sessionId,
+                  optionIds: unsupportedConfigIds,
+                },
               );
-              const requested = choices.find(
-                (choice) => choice === "plan" || choice === "architect",
-              );
-              if (requested !== undefined && option.currentValue !== requested) {
-                yield* runtime.setConfigOption(option.id, requested);
-              }
             }
-          } else {
-            const nativeBuild = nativeBuildConfigurationBySessionId.get(startResult.sessionId);
-            if (nativeBuild !== undefined) {
+            for (const selection of configSelections) {
+              if (!availableConfigIds.has(selection.id)) continue;
+              // Tuning knobs degrade instead of failing the session open: agents
+              // advertise the union of values across models but can reject a
+              // per-model invalid one at set time (codex-acp advertises "ultra"
+              // reasoning effort and then rejects it for most models). Skip
+              // values the session does not currently offer and downgrade an
+              // agent-side set rejection to a warning; the agent's default
+              // applies for that option.
+              const option = configOptions.find((candidate) => candidate.id === selection.id);
               if (
-                nativeBuild.modeId !== undefined &&
-                effectiveModeState?.currentModeId !== nativeBuild.modeId &&
-                effectiveModeState?.availableModes.some(
-                  (mode) => mode.id === nativeBuild.modeId,
-                ) === true
+                option !== undefined &&
+                option.type === "select" &&
+                typeof selection.value === "string"
               ) {
-                yield* runtime.setMode(nativeBuild.modeId);
-              }
-              for (const saved of nativeBuild.configOptions) {
-                const option = effectiveConfigOptions.find(
-                  (candidate) => candidate.type === "select" && candidate.id === saved.id,
+                const advertisedValues = option.options.flatMap((entry) =>
+                  "value" in entry ? [entry.value] : entry.options.map((choice) => choice.value),
                 );
-                if (option === undefined || option.type !== "select") continue;
+                if (!advertisedValues.includes(selection.value)) continue;
+              }
+              yield* runtime.setConfigOption(selection.id, selection.value).pipe(
+                Effect.catchTags({
+                  AcpRequestError: (error) =>
+                    Effect.logWarning("ACP session rejected a configuration option value", {
+                      optionId: selection.id,
+                      value: selection.value,
+                      detail: error.message,
+                    }),
+                }),
+              );
+            }
+            const policyMode = flavor.sessionModeForPolicy?.(runtimePolicy);
+            if (policyMode !== undefined) {
+              yield* runtime.setMode(policyMode);
+            }
+            const modeState = yield* runtime.getModeState;
+            // The synthetic mode selection is skipped rather than failed when the
+            // agent no longer advertises it: mode sets are volatile across agent
+            // versions and a stale persisted mode should not block the turn.
+            if (
+              modeSelection !== undefined &&
+              typeof modeSelection.value === "string" &&
+              modeState?.availableModes.some((mode) => mode.id === modeSelection.value) === true &&
+              modeState.currentModeId !== modeSelection.value
+            ) {
+              yield* runtime.setMode(modeSelection.value);
+            }
+            const effectiveModeState = yield* runtime.getModeState;
+            const effectiveConfigOptions = yield* runtime.getConfigOptions;
+            const planSensitiveOptions = effectiveConfigOptions.filter(
+              (
+                option,
+              ): option is Extract<
+                EffectAcpSchema.SessionConfigOption,
+                { readonly type: "select" }
+              > =>
+                option.type === "select" &&
+                (option.category === "mode" || option.category === "collaboration_mode"),
+            );
+            if (runtimePolicy.interactionMode === "plan") {
+              if (!nativeBuildConfigurationBySessionId.has(startResult.sessionId)) {
+                nativeBuildConfigurationBySessionId.set(startResult.sessionId, {
+                  ...(effectiveModeState === undefined
+                    ? {}
+                    : { modeId: effectiveModeState.currentModeId }),
+                  configOptions: planSensitiveOptions.map((option) => ({
+                    id: option.id,
+                    value: option.currentValue,
+                  })),
+                });
+              }
+              const planMode = effectiveModeState?.availableModes.find(
+                (mode) => mode.id === "plan" || mode.id === "architect",
+              );
+              if (planMode !== undefined && effectiveModeState?.currentModeId !== planMode.id) {
+                yield* runtime.setMode(planMode.id);
+              }
+              for (const option of planSensitiveOptions) {
                 const choices = option.options.flatMap((entry) =>
                   "value" in entry ? [entry.value] : entry.options.map((choice) => choice.value),
                 );
-                if (option.currentValue !== saved.value && choices.includes(saved.value)) {
-                  yield* runtime.setConfigOption(option.id, saved.value);
+                const requested = choices.find(
+                  (choice) => choice === "plan" || choice === "architect",
+                );
+                if (requested !== undefined && option.currentValue !== requested) {
+                  yield* runtime.setConfigOption(option.id, requested);
                 }
               }
-              nativeBuildConfigurationBySessionId.delete(startResult.sessionId);
+            } else {
+              const nativeBuild = nativeBuildConfigurationBySessionId.get(startResult.sessionId);
+              if (nativeBuild !== undefined) {
+                if (
+                  nativeBuild.modeId !== undefined &&
+                  effectiveModeState?.currentModeId !== nativeBuild.modeId &&
+                  effectiveModeState?.availableModes.some(
+                    (mode) => mode.id === nativeBuild.modeId,
+                  ) === true
+                ) {
+                  yield* runtime.setMode(nativeBuild.modeId);
+                }
+                for (const saved of nativeBuild.configOptions) {
+                  const option = effectiveConfigOptions.find(
+                    (candidate) => candidate.type === "select" && candidate.id === saved.id,
+                  );
+                  if (option === undefined || option.type !== "select") continue;
+                  const choices = option.options.flatMap((entry) =>
+                    "value" in entry ? [entry.value] : entry.options.map((choice) => choice.value),
+                  );
+                  if (option.currentValue !== saved.value && choices.includes(saved.value)) {
+                    yield* runtime.setConfigOption(option.id, saved.value);
+                  }
+                }
+                nativeBuildConfigurationBySessionId.delete(startResult.sessionId);
+              }
             }
-          }
-          yield* (
-            flavor.onSessionConfigurationUpdate?.(
-              yield* runtime.getConfigOptions,
-              yield* runtime.getModeState,
-            ) ?? Effect.void
-          );
-        });
+            yield* (
+              flavor.onSessionConfigurationUpdate?.(
+                yield* runtime.getConfigOptions,
+                yield* runtime.getModeState,
+              ) ?? Effect.void
+            );
+          },
+          (effect) =>
+            effect.pipe(
+              Effect.onError(() =>
+                Effect.gen(function* () {
+                  yield* Ref.set(activeSelection, null);
+                  yield* Ref.set(activeInteractionMode, null);
+                  yield* Ref.set(activeSessionSetup, null);
+                  yield* Ref.set(activeSessionId, null);
+                }),
+              ),
+            ),
+        );
 
         yield* configureSession(started, input.modelSelection, input.runtimePolicy);
         yield* Ref.set(activeSelection, input.modelSelection);

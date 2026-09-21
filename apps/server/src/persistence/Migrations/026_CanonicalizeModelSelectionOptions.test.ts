@@ -31,7 +31,7 @@ layer("026_CanonicalizeModelSelectionOptions", (it) => {
               'project-legacy',
               'Legacy options project',
               '/tmp/legacy',
-              '{"provider":"claudeAgent","model":"claude-opus-4-6","options":{"effort":"max","fastMode":true}}',
+              '{"provider":"claudeAgent","model":"claude-opus-4-6","options":{"effort":"max","fastMode":true,"agent":""}}',
               '[]',
               '2026-01-01T00:00:00.000Z',
               '2026-01-01T00:00:00.000Z',
@@ -94,7 +94,7 @@ layer("026_CanonicalizeModelSelectionOptions", (it) => {
               'thread-legacy',
               'project-legacy',
               'Legacy thread',
-              '{"provider":"claudeAgent","model":"claude-opus-4-6","options":{"effort":"max","thinking":false,"contextWindow":"1m"}}',
+              '{"provider":"claudeAgent","model":"claude-opus-4-6","options":{"effort":"max","thinking":false,"contextWindow":"1m","agent":""}}',
               NULL, NULL, NULL,
               '2026-01-01T00:00:00.000Z',
               '2026-01-01T00:00:00.000Z',
@@ -174,7 +174,7 @@ layer("026_CanonicalizeModelSelectionOptions", (it) => {
               NULL,
               'corr-pc',
               'user',
-              '{"projectId":"project-legacy","title":"Project","workspaceRoot":"/tmp/legacy","defaultModelSelection":{"provider":"claudeAgent","model":"claude-opus-4-6","options":{"effort":"max","fastMode":true}},"scripts":[],"createdAt":"2026-01-01T00:00:00.000Z","updatedAt":"2026-01-01T00:00:00.000Z"}',
+              '{"projectId":"project-legacy","title":"Project","workspaceRoot":"/tmp/legacy","defaultModelSelection":{"provider":"claudeAgent","model":"claude-opus-4-6","options":{"effort":"max","fastMode":true,"agent":""}},"scripts":[],"createdAt":"2026-01-01T00:00:00.000Z","updatedAt":"2026-01-01T00:00:00.000Z"}',
               '{}'
             ),
             (
@@ -216,7 +216,7 @@ layer("026_CanonicalizeModelSelectionOptions", (it) => {
               NULL,
               'corr-tc',
               'user',
-              '{"threadId":"thread-legacy","projectId":"project-legacy","title":"Thread","modelSelection":{"provider":"claudeAgent","model":"claude-opus-4-6","options":{"effort":"max","thinking":false}},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-01-01T00:00:00.000Z","updatedAt":"2026-01-01T00:00:00.000Z"}',
+              '{"threadId":"thread-legacy","projectId":"project-legacy","title":"Thread","modelSelection":{"provider":"claudeAgent","model":"claude-opus-4-6","options":{"effort":"max","thinking":false,"agent":""}},"runtimeMode":"full-access","interactionMode":"default","branch":null,"worktreePath":null,"createdAt":"2026-01-01T00:00:00.000Z","updatedAt":"2026-01-01T00:00:00.000Z"}',
               '{}'
             ),
             (
@@ -312,6 +312,7 @@ layer("026_CanonicalizeModelSelectionOptions", (it) => {
               options: [
                 { id: "effort", value: "max" },
                 { id: "fastMode", value: true },
+                { id: "agent", value: "" },
               ],
             },
           },
@@ -371,6 +372,7 @@ layer("026_CanonicalizeModelSelectionOptions", (it) => {
                 { id: "effort", value: "max" },
                 { id: "thinking", value: false },
                 { id: "contextWindow", value: "1m" },
+                { id: "agent", value: "" },
               ],
             },
           },
@@ -401,6 +403,7 @@ layer("026_CanonicalizeModelSelectionOptions", (it) => {
         options: [
           { id: "effort", value: "max" },
           { id: "fastMode", value: true },
+          { id: "agent", value: "" },
         ],
       });
 
@@ -418,6 +421,7 @@ layer("026_CanonicalizeModelSelectionOptions", (it) => {
         options: [
           { id: "effort", value: "max" },
           { id: "thinking", value: false },
+          { id: "agent", value: "" },
         ],
       });
 
