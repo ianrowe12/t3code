@@ -133,7 +133,7 @@ const decodeRequestRecords = Schema.decodeUnknownEffect(
 const makeMcpLaunchFixture = Effect.fnUntraced(function* (
   agentId: string,
   customAgent?: string,
-  rejectConfig = false,
+  rejectConfig: boolean | "after-first-reset" = false,
 ) {
   const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -193,7 +193,10 @@ const makeMcpLaunchFixture = Effect.fnUntraced(function* (
             env: {
               T3_ACP_SESSION_LIFECYCLE: "1",
               ...(customAgent === undefined ? {} : { T3_ACP_CUSTOM_AGENT: customAgent }),
-              ...(rejectConfig ? { T3_ACP_FAIL_SET_CONFIG_OPTION: "1" } : {}),
+              ...(rejectConfig === true ? { T3_ACP_FAIL_SET_CONFIG_OPTION: "1" } : {}),
+              ...(rejectConfig === "after-first-reset"
+                ? { T3_ACP_REJECT_LATER_AGENT_RESETS: "1" }
+                : {}),
               T3_TEST_MCP_SPAWN_LOG: spawnLog,
               T3_ACP_REQUEST_LOG_PATH: requestLog,
               T3_ACP_MCP_ENDPOINT: "http://127.0.0.1:1/stale",
@@ -248,6 +251,49 @@ const makeMcpLaunchFixture = Effect.fnUntraced(function* (
 });
 
 describe("AcpRegistryAdapterV2", () => {
+  it.effect("does not reuse successful configuration after a resumed persona reset fails", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeMcpLaunchFixture(
+        "github-copilot-cli",
+        "researcher",
+        "after-first-reset",
+      );
+      const selection = {
+        threadId: ThreadId.make("thread-rejected-resume"),
+        modelSelection: fixture.modelSelection,
+        runtimePolicy: fixture.runtimePolicy,
+      };
+      const runtime = yield* fixture.adapter.openSession({
+        ...selection,
+        providerSessionId: ProviderSessionId.make("session-rejected-resume"),
+      });
+      const original = yield* runtime.ensureThread(selection);
+      const providerThread = {
+        ...original,
+        nativeThreadRef: {
+          driver: original.driver,
+          nativeId: "mock-session-customized",
+          strength: "strong" as const,
+        },
+      };
+      const error = yield* Effect.flip(runtime.resumeThread({ providerThread }));
+      assert.equal(error._tag, "ProviderAdapterResumeThreadError");
+      const fallbackError = yield* Effect.flip(runtime.ensureThread(selection));
+      assert.equal(fallbackError._tag, "ProviderAdapterEnsureThreadError");
+      const retryError = yield* Effect.flip(runtime.resumeThread({ providerThread }));
+      assert.equal(retryError._tag, "ProviderAdapterResumeThreadError");
+      const requests = yield* fixture.readRequests;
+      assert.lengthOf(
+        requests.filter(
+          (request) =>
+            request.method === "session/set_config_option" && request.params?.configId === "agent",
+        ),
+        3,
+      );
+      assert.isFalse(requests.some((request) => request.method === "session/prompt"));
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.effect("fails session activation if Copilot rejects the default reset", () =>
     Effect.gen(function* () {
       const fixture = yield* makeMcpLaunchFixture("github-copilot-cli", "researcher", true);

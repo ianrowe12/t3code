@@ -90,6 +90,8 @@ const initialGrokReasoningEffort =
 const promptDelayMs = Number(process.env.T3_ACP_PROMPT_DELAY_MS ?? "0");
 const supportsSessionLifecycle = process.env.T3_ACP_SESSION_LIFECYCLE === "1";
 let currentAgent = process.env.T3_ACP_CUSTOM_AGENT;
+const rejectLaterAgentResets = process.env.T3_ACP_REJECT_LATER_AGENT_RESETS === "1";
+let agentResetCount = 0;
 const supportsAcpMcp = process.env.T3_ACP_MCP_ACP === "1";
 const supportsV2Management = process.env.T3_ACP_V2_MANAGEMENT === "1";
 const omitSessionListHandler = process.env.T3_ACP_OMIT_SESSION_LIST_HANDLER === "1";
@@ -778,7 +780,8 @@ const program = Effect.gen(function* () {
           process.exit(7);
         });
       }
-      if (failSetConfigOption) {
+      if (request.configId === "agent") agentResetCount += 1;
+      if (failSetConfigOption || (rejectLaterAgentResets && agentResetCount > 1)) {
         return yield* AcpError.AcpRequestError.invalidParams(
           "Mock invalid params for session/set_config_option",
           {
