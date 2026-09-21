@@ -93,9 +93,10 @@ Copilot cannot take a message mid-turn without cancelling its running background
 message you send while Copilot is working is queued instead of steered. It starts once Copilot and
 its background agents finish. Use **Interrupt** if you want to stop that work immediately.
 
-If Copilot reports that its session host is unavailable, T3 shows the error with sensitive details
-removed. Your next explicit retry starts a replacement Copilot process while keeping the saved
-conversation. T3 does not automatically resend the failed request.
+If Copilot reports that its session host is unavailable or its session-generation lock times out,
+T3 shows the error with sensitive details removed. Your next explicit retry starts a replacement
+Copilot process while keeping the saved conversation. T3 does not automatically resend the failed
+request.
 
 ## Permissions and terminals
 

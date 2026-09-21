@@ -678,6 +678,107 @@ describe("Copilot ACP settlement", () => {
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 
+  it.effect("recovers a Copilot session-lock timeout only on explicit retry", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeFixture();
+      yield* fixture.runtime.startTurn(fixture.turn(1));
+      const prompt = yield* Queue.take(fixture.prompts);
+      yield* fixture.respond(prompt, undefined, {
+        code: -32603,
+        message: "Internal error",
+        data: {
+          details:
+            "session lock unavailable during is_session_generation_current: acquisition timed out",
+        },
+      });
+      const failed = yield* fixture.terminal;
+      assert.equal(failed.status, "failed");
+      assert.include(
+        failed.failure?.message ?? "",
+        "session lock unavailable during is_session_generation_current: acquisition timed out",
+      );
+      assert.include(failed.failure?.message ?? "", "Send your message again");
+      assert.deepEqual(fixture.processLifecycle, ["spawn:1", "prompt:1"]);
+      assert.equal(
+        fixture.requests.filter((request) => request.method === "session/prompt").length,
+        1,
+        "a failed request must not be automatically replayed",
+      );
+
+      yield* fixture.runtime.startTurn(fixture.turn(2));
+      const next = yield* Queue.take(fixture.prompts);
+      assert.equal(fixture.spawns(), 2);
+      assert.deepEqual(fixture.processLifecycle, [
+        "spawn:1",
+        "prompt:1",
+        "kill:1",
+        "spawn:2",
+        "prompt:2",
+      ]);
+      assert.equal(next.params?.sessionId, "native-root");
+      const latestActivation = fixture.requests.findLast((request) =>
+        ["session/new", "session/load"].includes(request.method),
+      );
+      assert.equal(latestActivation?.method, "session/load");
+      assert.equal(latestActivation?.params?.sessionId, "native-root");
+      yield* fixture.lifecycle("user.message", { interactionId: "retry" });
+      yield* fixture.lifecycle("assistant.turn_start", { interactionId: "retry" });
+      yield* fixture.lifecycle("assistant.idle");
+      yield* fixture.respond(next, { stopReason: "end_turn" });
+      assert.equal((yield* fixture.terminal).status, "completed");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  for (const scenario of [
+    {
+      name: "another Registry agent",
+      agentId: "fixture-agent",
+      code: -32603,
+      details:
+        "session lock unavailable during is_session_generation_current: acquisition timed out",
+    },
+    {
+      name: "a different error code",
+      agentId: "github-copilot-cli",
+      code: -32602,
+      details:
+        "session lock unavailable during is_session_generation_current: acquisition timed out",
+    },
+    {
+      name: "a tool error quoting a lock timeout",
+      agentId: "github-copilot-cli",
+      code: -32603,
+      details:
+        "Tool failed: session lock unavailable during is_session_generation_current: acquisition timed out",
+    },
+  ]) {
+    it.effect(`does not replace the runtime for a lock error from ${scenario.name}`, () =>
+      Effect.gen(function* () {
+        const fixture = yield* makeFixture(scenario.agentId);
+        yield* fixture.runtime.startTurn(fixture.turn(1));
+        yield* fixture.respond(yield* Queue.take(fixture.prompts), undefined, {
+          code: scenario.code,
+          message: "Internal error",
+          data: { details: scenario.details },
+        });
+        const failed = yield* fixture.terminal;
+        assert.equal(failed.status, "failed");
+        assert.equal(failed.failure?.message, "Internal error");
+        yield* fixture.runtime.startTurn(fixture.turn(2));
+        const next = yield* Queue.take(fixture.prompts);
+        assert.equal(fixture.spawns(), 1);
+        assert.deepEqual(fixture.processLifecycle, ["spawn:1", "prompt:1", "prompt:1"]);
+        if (scenario.agentId === "github-copilot-cli") {
+          yield* fixture.lifecycle("user.message", { interactionId: "retry" });
+          yield* fixture.lifecycle("assistant.turn_start", { interactionId: "retry" });
+          yield* fixture.lifecycle("assistant.idle");
+        }
+        yield* fixture.respond(next, { stopReason: "end_turn" });
+        assert.equal((yield* fixture.terminal).status, "completed");
+      }).pipe(Effect.scoped, Effect.provide(testLayer)),
+    );
+  }
+
   for (const agentId of ["github-copilot-cli", "fixture-agent"]) {
     it.effect(`preserves ordinary prompt failures without replacing ${agentId}`, () =>
       Effect.gen(function* () {

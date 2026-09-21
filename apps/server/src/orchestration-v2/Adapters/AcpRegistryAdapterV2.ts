@@ -89,15 +89,17 @@ const encodeCopilotMcpConfig = Schema.encodeSync(
 const isAcpRequestError = Schema.is(EffectAcpErrors.AcpRequestError);
 const isCopilotSessionErrorData = Schema.is(Schema.Struct({ details: Schema.String }));
 
-function copilotLostSessionDetails(error: unknown): string | undefined {
+function copilotSessionRecoveryDetails(error: unknown): string | undefined {
   if (
     isAcpRequestError(error) &&
     error.method === "session/prompt" &&
     error.code === -32603 &&
     isCopilotSessionErrorData(error.data) &&
-    error.data.details.startsWith(
+    (error.data.details.startsWith(
       "Request session.send failed with message: session event delivery failed: session not found: ",
-    )
+    ) ||
+      error.data.details ===
+        "session lock unavailable during is_session_generation_current: acquisition timed out")
   ) {
     return error.data.details;
   }
@@ -223,9 +225,9 @@ export function makeAcpRegistryAdapterV2(options: AcpRegistryAdapterV2Options) {
           retainSubagentsAcrossTurns: true,
           extractPromptFinalAnswer: copilotPromptFinalAnswer,
           restartRuntimeOnPromptError: (error: unknown) =>
-            copilotLostSessionDetails(error) !== undefined,
+            copilotSessionRecoveryDetails(error) !== undefined,
           formatPromptError: (error: unknown) => {
-            const details = copilotLostSessionDetails(error);
+            const details = copilotSessionRecoveryDetails(error);
             return details === undefined
               ? undefined
               : `${details}\nSend your message again to reload the saved conversation in a new provider process.`;
