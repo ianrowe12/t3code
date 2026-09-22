@@ -19,6 +19,9 @@ export const copilotCompletionCapabilities = {
       "session.task_complete",
       "tool.execution_start",
       "tool.execution_complete",
+      "subagent.started",
+      "subagent.completed",
+      "subagent.failed",
     ],
   },
 };
@@ -114,6 +117,33 @@ export const makeCopilotPromptCompletionRuntime = Effect.fn("makeCopilotPromptCo
     const permit = yield* Semaphore.make(1);
     let pending: PendingPrompt | undefined;
     let cancellation: Deferred.Deferred<void> | undefined;
+    // Copilot's ACP prompt and cancel both call session.abort(), which cancels
+    // every running background agent. Track those agents outside T3 prompts so
+    // a new prompt waits for them instead of killing them.
+    let agentSessionId: string | undefined;
+    const runningAgents = new Set<string>();
+    let quietWaiter: Deferred.Deferred<boolean> | undefined;
+    const releaseQuietWaiter = Effect.suspend(() =>
+      quietWaiter !== undefined && runningAgents.size === 0
+        ? Deferred.succeed(quietWaiter, true)
+        : Effect.void,
+    );
+    const resetRunningAgents = Effect.suspend(() => {
+      runningAgents.clear();
+      return releaseQuietWaiter;
+    });
+    const awaitRunningAgents = Effect.gen(function* () {
+      if (runningAgents.size === 0) return true;
+      const waiter = yield* Deferred.make<boolean>();
+      quietWaiter = waiter;
+      return yield* Deferred.await(waiter).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (quietWaiter === waiter) quietWaiter = undefined;
+          }),
+        ),
+      );
+    });
     const invalidate = Effect.fnUntraced(function* (current: PendingPrompt) {
       if (current.invalidated) return;
       current.invalidated = true;
@@ -145,6 +175,14 @@ export const makeCopilotPromptCompletionRuntime = Effect.fn("makeCopilotPromptCo
       "github.com/copilot/sessionEvent",
       SessionEvent,
       Effect.fnUntraced(function* (event) {
+        const agent = event.agentId ?? event.data.toolCallId;
+        if (event.sessionId === agentSessionId && agent !== undefined) {
+          if (event.type === "subagent.started") runningAgents.add(agent);
+          if (event.type === "subagent.completed" || event.type === "subagent.failed") {
+            runningAgents.delete(agent);
+            yield* releaseQuietWaiter;
+          }
+        }
         const current = pending;
         if (
           current === undefined ||
@@ -299,10 +337,10 @@ export const makeCopilotPromptCompletionRuntime = Effect.fn("makeCopilotPromptCo
       getEvents: () =>
         runtime.getEvents().pipe(
           Stream.tap((event) => {
-            if (event._tag !== "ConnectionTerminated" || pending === undefined) {
-              return Effect.void;
-            }
+            if (event._tag !== "ConnectionTerminated") return Effect.void;
+            if (pending === undefined) return resetRunningAgents;
             return Effect.all([
+              resetRunningAgents,
               Deferred.fail(pending.started, event.error),
               Deferred.fail(pending.idle, event.error),
             ]);
@@ -313,6 +351,11 @@ export const makeCopilotPromptCompletionRuntime = Effect.fn("makeCopilotPromptCo
           Effect.gen(function* () {
             if (cancellation !== undefined) yield* Deferred.await(cancellation);
             const session = yield* runtime.start();
+            if (agentSessionId !== session.sessionId) {
+              agentSessionId = session.sessionId;
+              yield* resetRunningAgents;
+            }
+            if (!(yield* awaitRunningAgents)) return { stopReason: "cancelled" as const };
             const current: PendingPrompt = {
               sessionId: session.sessionId,
               started: yield* Deferred.make<void, AcpErrors.AcpError>(),
@@ -385,7 +428,15 @@ export const makeCopilotPromptCompletionRuntime = Effect.fn("makeCopilotPromptCo
         ),
       cancel: Effect.gen(function* () {
         const current = pending;
-        if (current === undefined) return yield* runtime.cancel;
+        if (current === undefined) {
+          // An explicit cancel also discards native-work tracking so a stale
+          // entry can never hold later prompts hostage.
+          if (quietWaiter !== undefined) {
+            yield* Deferred.succeed(quietWaiter, false);
+            yield* resetRunningAgents;
+          }
+          return yield* runtime.cancel;
+        }
         const barrier = yield* Deferred.make<void>();
         cancellation = barrier;
         current.cancelled = true;

@@ -121,8 +121,6 @@ export function resolveMessageDispatchIntent(
   requestedMode: MessageDispatchMode,
   deliveryIntent?: "auto" | "steer" | "restart",
 ): MessageDispatchMode {
-  if (deliveryIntent === undefined) return requestedMode;
-
   const activeRun = projection.runs.findLast(
     (run) =>
       run.status === "preparing" ||
@@ -130,16 +128,8 @@ export function resolveMessageDispatchIntent(
       run.status === "running" ||
       run.status === "waiting",
   );
-  if (activeRun === undefined) return { type: "start_immediately" };
-  if (deliveryIntent === "steer") {
-    return { type: "steer_active", targetRunId: activeRun.id };
-  }
-  if (deliveryIntent === "restart") {
-    return { type: "restart_active", targetRunId: activeRun.id };
-  }
-
   const providerThread = projection.providerThreads.find(
-    (candidate) => candidate.id === activeRun.providerThreadId,
+    (candidate) => candidate.id === activeRun?.providerThreadId,
   );
   const providerSession =
     providerThread?.providerSessionId == null
@@ -148,6 +138,25 @@ export function resolveMessageDispatchIntent(
           (candidate) => candidate.id === providerThread.providerSessionId,
         );
   const capabilities = providerSession?.capabilities.turns;
+  // Providers whose only interrupt tears down the whole native turn (Copilot
+  // cancels its background agents) cannot steer at all; queue instead.
+  const steerOrQueue = (mode: MessageDispatchMode): MessageDispatchMode =>
+    (mode.type === "steer_active" || mode.type === "restart_active") &&
+    capabilities?.supportsActiveSteering === false &&
+    capabilities.supportsSteeringByInterruptRestart === false &&
+    capabilities.supportsQueuedMessages
+      ? { type: "queue_after_active" }
+      : mode;
+
+  if (deliveryIntent === undefined) return steerOrQueue(requestedMode);
+  if (activeRun === undefined) return { type: "start_immediately" };
+  if (deliveryIntent === "steer") {
+    return steerOrQueue({ type: "steer_active", targetRunId: activeRun.id });
+  }
+  if (deliveryIntent === "restart") {
+    return steerOrQueue({ type: "restart_active", targetRunId: activeRun.id });
+  }
+
   if (capabilities?.supportsActiveSteering === true) {
     return { type: "steer_active", targetRunId: activeRun.id };
   }

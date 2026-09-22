@@ -95,7 +95,7 @@ const makeFixture = Effect.fnUntraced(function* (
     yield* event("user.message", { interactionId: "new" });
     yield* event("assistant.turn_start", { interactionId: "new" });
   });
-  return { runtime, rpc, events, event, start, accept, calls, loading, cancelling };
+  return { runtime, rpc, events, event, start, accept, calls, loading, cancelling, dispatched };
 });
 
 describe("Copilot prompt completion", () => {
@@ -196,6 +196,55 @@ describe("Copilot prompt completion", () => {
       assert.isUndefined(fiber.pollUnsafe());
       yield* fixture.event("assistant.idle");
       yield* Fiber.join(fiber);
+    }),
+  );
+
+  it.effect("holds a new prompt until Copilot's running background agents finish", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeFixture();
+      const first = yield* fixture.start();
+      yield* fixture.accept;
+      yield* fixture.event("subagent.started", { toolCallId: "task-1" }, { agentId: "bg-1" });
+      yield* fixture.event("subagent.started", { toolCallId: "task-2" }, { agentId: "bg-2" });
+      yield* fixture.event("assistant.idle");
+      yield* Deferred.succeed(fixture.rpc, { stopReason: "end_turn" });
+      yield* Fiber.join(first);
+
+      const next = yield* fixture.runtime
+        .prompt({ prompt: [{ type: "text", text: "Steer" }] })
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      assert.equal(yield* Queue.size(fixture.dispatched), 0);
+      yield* fixture.event("subagent.completed", { toolCallId: "task-2" }, { agentId: "bg-2" });
+      yield* Effect.yieldNow;
+      assert.equal(yield* Queue.size(fixture.dispatched), 0);
+      yield* fixture.event("subagent.failed", { toolCallId: "task-1" }, { agentId: "bg-1" });
+      yield* Queue.take(fixture.dispatched);
+      yield* fixture.accept;
+      yield* fixture.event("assistant.idle");
+      assert.equal((yield* Fiber.join(next)).stopReason, "end_turn");
+    }),
+  );
+
+  it.effect("cancels a held prompt without sending it into the busy session", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeFixture();
+      const first = yield* fixture.start();
+      yield* fixture.accept;
+      yield* fixture.event("subagent.started", {}, { agentId: "bg-1" });
+      yield* fixture.event("assistant.idle");
+      yield* Deferred.succeed(fixture.rpc, { stopReason: "end_turn" });
+      yield* Fiber.join(first);
+
+      const held = yield* fixture.runtime
+        .prompt({ prompt: [{ type: "text", text: "Steer" }] })
+        .pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* fixture.runtime.cancel;
+      yield* Effect.yieldNow;
+      assert.equal(yield* Queue.size(fixture.dispatched), 0);
+      assert.equal((yield* Fiber.join(held)).stopReason, "cancelled");
+      assert.deepEqual(fixture.calls, ["cancel"]);
     }),
   );
 

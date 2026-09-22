@@ -11,6 +11,8 @@ import {
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
+import { AcpProviderCapabilitiesV2 } from "./Adapters/AcpAdapterV2.ts";
+import { CopilotAcpProviderCapabilitiesV2 } from "./Adapters/AcpRegistryAdapterV2.ts";
 import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import { CursorProviderCapabilitiesV2 } from "./Adapters/CursorAdapterV2.ts";
 import { GrokProviderCapabilitiesV2 } from "./Adapters/GrokAdapterV2.ts";
@@ -116,6 +118,28 @@ it("targets the latest active run for explicit steer and restart intent", () => 
   assert.deepEqual(
     resolveMessageDispatchIntent(dispatchProjection(), { type: "start_immediately" }, "steer"),
     { type: "start_immediately" },
+  );
+});
+
+it("queues steering for Copilot, whose only interrupt cancels its background agents", () => {
+  const projection = dispatchProjection(CopilotAcpProviderCapabilitiesV2);
+  for (const deliveryIntent of ["auto", "steer", "restart"] as const) {
+    assert.deepEqual(
+      resolveMessageDispatchIntent(projection, { type: "start_immediately" }, deliveryIntent),
+      { type: "queue_after_active" },
+    );
+  }
+  assert.deepEqual(
+    resolveMessageDispatchIntent(projection, { type: "steer_active", targetRunId: activeRunId }),
+    { type: "queue_after_active" },
+  );
+  assert.deepEqual(
+    resolveMessageDispatchIntent(
+      dispatchProjection(AcpProviderCapabilitiesV2),
+      { type: "start_immediately" },
+      "steer",
+    ),
+    { type: "steer_active", targetRunId: activeRunId },
   );
 });
 

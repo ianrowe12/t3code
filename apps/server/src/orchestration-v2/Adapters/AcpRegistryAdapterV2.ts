@@ -7,6 +7,7 @@ import { extractCopilotSubagentEndNotice, extractCopilotSubagentUpdates } from "
 import {
   AcpRegistrySettings,
   defaultInstanceIdForDriver,
+  type OrchestrationV2ProviderCapabilities,
   ProviderDriverKind,
 } from "@t3tools/contracts";
 import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
@@ -52,6 +53,19 @@ import {
 
 export const ACP_REGISTRY_PROVIDER = ProviderDriverKind.make("acpRegistry");
 export const ACP_REGISTRY_DEFAULT_INSTANCE_ID = defaultInstanceIdForDriver(ACP_REGISTRY_PROVIDER);
+
+/**
+ * Copilot's ACP session/cancel and session/prompt both abort the whole native
+ * session, including running background agents, so it cannot steer by
+ * interrupt-and-restart. Messages sent during a turn queue behind it instead.
+ */
+export const CopilotAcpProviderCapabilitiesV2 = {
+  ...AcpProviderCapabilitiesV2,
+  turns: {
+    ...AcpProviderCapabilitiesV2.turns,
+    supportsSteeringByInterruptRestart: false,
+  },
+} satisfies OrchestrationV2ProviderCapabilities;
 
 const DEFAULT_ACP_REGISTRY_SETTINGS = Schema.decodeSync(AcpRegistrySettings)({});
 const CopilotMcpServer = Schema.Struct({
@@ -199,7 +213,7 @@ export function makeAcpRegistryAdapterV2(options: AcpRegistryAdapterV2Options) {
   const isCopilot = options.settings.agentId === "github-copilot-cli";
   const flavor: AcpAdapterV2Flavor = {
     driver: ACP_REGISTRY_PROVIDER,
-    capabilities: AcpProviderCapabilitiesV2,
+    capabilities: isCopilot ? CopilotAcpProviderCapabilitiesV2 : AcpProviderCapabilitiesV2,
     ...(isCopilot
       ? {
           fixedConfigOptions: [{ id: "agent", value: "" }],
