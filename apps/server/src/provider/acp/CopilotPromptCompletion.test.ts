@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
+import * as Scheduler from "effect/Scheduler";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as AcpErrors from "effect-acp/errors";
@@ -95,7 +96,49 @@ const makeFixture = Effect.fnUntraced(function* (
     yield* event("user.message", { interactionId: "new" });
     yield* event("assistant.turn_start", { interactionId: "new" });
   });
-  return { runtime, rpc, events, event, start, accept, calls, loading, cancelling };
+  // Envelope recorded from Copilot CLI 1.0.88 events.jsonl, trimmed to identifying fields.
+  const agentEvent = (
+    type: "subagent.started" | "subagent.completed" | "subagent.failed",
+    agentId: string,
+  ) =>
+    event(
+      type,
+      {
+        toolCallId: `toolu_${agentId}`,
+        agentName: "general-purpose",
+        agentDisplayName: "sleeper",
+        ...(type === "subagent.started" ? { executionMode: "background" } : {}),
+      },
+      { agentId, id: `${type}:${agentId}`, parentId: "parent-event" },
+    );
+  // A run that settled while its background agents keep running.
+  const settleWithAgents = (...agentIds: ReadonlyArray<string>) =>
+    Effect.gen(function* () {
+      const first = yield* start();
+      yield* accept;
+      for (const agentId of agentIds) yield* agentEvent("subagent.started", agentId);
+      yield* event("assistant.idle");
+      yield* Deferred.succeed(rpc, { stopReason: "end_turn" });
+      yield* Fiber.join(first);
+    });
+  const promptNext = runtime
+    .prompt({ prompt: [{ type: "text", text: "Steer" }] })
+    .pipe(Effect.forkChild);
+  return {
+    runtime,
+    rpc,
+    events,
+    event,
+    agentEvent,
+    settleWithAgents,
+    promptNext,
+    start,
+    accept,
+    calls,
+    loading,
+    cancelling,
+    dispatched,
+  };
 });
 
 describe("Copilot prompt completion", () => {
@@ -196,6 +239,131 @@ describe("Copilot prompt completion", () => {
       assert.isUndefined(fiber.pollUnsafe());
       yield* fixture.event("assistant.idle");
       yield* Fiber.join(fiber);
+    }),
+  );
+
+  it.effect("holds a new prompt until Copilot's running background agents finish", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeFixture();
+      yield* fixture.settleWithAgents("bg-1", "bg-2");
+
+      const next = yield* fixture.promptNext;
+      yield* Effect.yieldNow;
+      assert.equal(yield* Queue.size(fixture.dispatched), 0);
+      yield* fixture.agentEvent("subagent.completed", "bg-2");
+      yield* Effect.yieldNow;
+      assert.equal(yield* Queue.size(fixture.dispatched), 0);
+      yield* fixture.agentEvent("subagent.failed", "bg-1");
+      yield* Queue.take(fixture.dispatched);
+      yield* fixture.accept;
+      yield* fixture.event("assistant.idle");
+      assert.equal((yield* Fiber.join(next)).stopReason, "end_turn");
+    }),
+  );
+
+  it.effect("cancels a held prompt without sending it into the busy session", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeFixture();
+      yield* fixture.settleWithAgents("bg-1");
+
+      const held = yield* fixture.promptNext;
+      yield* Effect.yieldNow;
+      yield* fixture.runtime.cancel;
+      yield* Effect.yieldNow;
+      assert.equal(yield* Queue.size(fixture.dispatched), 0);
+      assert.equal((yield* Fiber.join(held)).stopReason, "cancelled");
+      assert.deepEqual(fixture.calls, ["cancel"]);
+    }),
+  );
+
+  it.effect("drops background-agent tracking when stopped with no prompt waiting", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeFixture();
+      yield* fixture.settleWithAgents("bg-1");
+      yield* fixture.runtime.cancel;
+      assert.deepEqual(fixture.calls, ["cancel"]);
+
+      yield* fixture.promptNext;
+      yield* Effect.yieldNow;
+      assert.equal(yield* Queue.size(fixture.dispatched), 1);
+    }),
+  );
+
+  it.effect("drops background-agent tracking when a stop closes and reloads the session", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeFixture();
+      const first = yield* fixture.start();
+      yield* fixture.agentEvent("subagent.started", "bg-1");
+      yield* Deferred.succeed(fixture.rpc, { stopReason: "end_turn" });
+      yield* fixture.runtime.cancel;
+      assert.deepEqual(fixture.calls, ["cancel", "close:root", "load:root"]);
+      assert.equal((yield* Fiber.join(first)).stopReason, "cancelled");
+
+      yield* fixture.promptNext;
+      yield* Effect.yieldNow;
+      assert.equal(yield* Queue.size(fixture.dispatched), 1);
+    }),
+  );
+
+  it.effect("drops background-agent tracking when a missed start closes and reloads", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeFixture();
+      const first = yield* fixture.start();
+      yield* fixture.agentEvent("subagent.started", "bg-1");
+      yield* Deferred.succeed(fixture.rpc, { stopReason: "end_turn" });
+      yield* TestClock.adjust("15 seconds");
+      const error = yield* Fiber.join(first).pipe(Effect.flip);
+      assert.include(error.message, "before acknowledging the new turn");
+      assert.deepEqual(fixture.calls, ["close:root", "load:root"]);
+
+      yield* fixture.promptNext;
+      yield* Effect.yieldNow;
+      assert.equal(yield* Queue.size(fixture.dispatched), 1);
+    }),
+  );
+
+  it.effect("keeps the next prompt out until a stop has dropped agent tracking", () =>
+    Effect.gen(function* () {
+      const release = yield* Deferred.make<void>();
+      const fixture = yield* makeFixture({ cancel: Deferred.await(release) });
+      yield* fixture.settleWithAgents("bg-1");
+      const cancel = yield* fixture.runtime.cancel.pipe(Effect.forkChild);
+      yield* Deferred.await(fixture.cancelling);
+      yield* fixture.agentEvent("subagent.completed", "bg-1");
+
+      const second = yield* fixture.promptNext;
+      yield* Effect.yieldNow;
+      assert.equal(yield* Queue.size(fixture.dispatched), 0);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(cancel);
+      yield* Queue.take(fixture.dispatched);
+      yield* fixture.accept;
+      yield* fixture.agentEvent("subagent.started", "bg-2");
+      yield* fixture.event("assistant.idle");
+      yield* Deferred.succeed(fixture.rpc, { stopReason: "end_turn" });
+      yield* Fiber.join(second);
+
+      yield* fixture.promptNext;
+      yield* Effect.yieldNow;
+      assert.equal(yield* Queue.size(fixture.dispatched), 0, "held behind running bg-2");
+    }),
+  );
+
+  it.effect("releases a prompt whose last background agent finishes as it begins waiting", () =>
+    Effect.gen(function* () {
+      // Preempt the prompt fiber after every operation and land the completion
+      // at each point in its path to the wait.
+      for (let delay = 0; delay < 40; delay++) {
+        const fixture = yield* makeFixture();
+        yield* fixture.settleWithAgents("bg-1");
+        yield* fixture.promptNext.pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 3));
+        yield* Effect.yieldNow.pipe(
+          Effect.repeat({ times: delay }),
+          Effect.andThen(fixture.agentEvent("subagent.completed", "bg-1")),
+        );
+        yield* Effect.yieldNow.pipe(Effect.repeat({ times: 100 }));
+        assert.equal(yield* Queue.size(fixture.dispatched), 1, `completion after ${delay} yields`);
+      }
     }),
   );
 

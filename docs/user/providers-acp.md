@@ -89,6 +89,10 @@ instead of disappearing.
 When Copilot finishes the main task with a summary but no later reply, that summary appears in
 chat. Delegated-task summaries and other tool results stay in their tool entries.
 
+Copilot cannot take a message mid-turn without cancelling its running background agents, so a
+message you send while Copilot is working is queued instead of steered. It starts once Copilot and
+its background agents finish. Use **Interrupt** if you want to stop that work immediately.
+
 If Copilot reports that its session host is unavailable, T3 shows the error with sensitive details
 removed. Your next explicit retry starts a replacement Copilot process while keeping the saved
 conversation. T3 does not automatically resend the failed request.
