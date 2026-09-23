@@ -115,6 +115,8 @@ export interface OrchestrationEventStoreShape {
   readonly streamProjectedApplicationEvents: <A extends { readonly sequence: number }>(input: {
     readonly afterSequence?: number;
     readonly project: (event: ApplicationStoredEvent) => A;
+    /** Let a newer live event supersede a pending one with the same key. */
+    readonly coalesceKey?: (event: A) => string;
   }) => Stream.Stream<A, OrchestrationEventStoreError>;
   /**
    * Check whether an aggregate has an event after a sequence, optionally

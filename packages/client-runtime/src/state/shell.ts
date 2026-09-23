@@ -9,6 +9,7 @@ import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Predicate from "effect/Predicate";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
@@ -49,6 +50,29 @@ function shellStatusForSnapshot(
 }
 
 const SHELL_SYNCHRONIZATION_ERROR_MESSAGE = "Could not synchronize environment data.";
+const SHELL_OVERFLOW_RESUME_MAX_DELAY_MS = 8_000;
+
+/**
+ * The server closed the shell stream because this subscriber fell behind its
+ * live tail. The environment is healthy, so the client resumes from its cursor.
+ */
+export function isShellLiveBufferOverflow(cause: Cause.Cause<unknown>): boolean {
+  return (
+    cause.reasons.length > 0 &&
+    cause.reasons.every(
+      (reason) =>
+        reason._tag === "Fail" &&
+        Predicate.isTagged(reason.error, "OrchestrationV2GetShellSnapshotError") &&
+        (reason.error as { readonly reason?: unknown }).reason === "liveBufferFull",
+    )
+  );
+}
+
+/** Extra wait before the Nth consecutive overflow resume, on top of the base retry delay. */
+export function shellOverflowResumeDelayMs(consecutiveOverflows: number): number {
+  if (consecutiveOverflows <= 1) return 0;
+  return Math.min(250 * 2 ** (consecutiveOverflows - 1), SHELL_OVERFLOW_RESUME_MAX_DELAY_MS) - 250;
+}
 
 export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")(function* () {
   const supervisor = yield* EnvironmentSupervisor;
@@ -73,6 +97,8 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
     error: Option.none(),
   });
   const awaitingCompletion = yield* Ref.make(false);
+  const resumingAfterOverflow = yield* Ref.make(false);
+  const consecutiveOverflows = yield* Ref.make(0);
   const lastAuthoritativeSession = yield* Ref.make<RpcSession | null>(null);
   const activeSubscriptionSession = yield* Ref.make<RpcSession | null>(null);
   const latestLiveSnapshot = yield* Ref.make<Option.Option<OrchestrationV2ShellSnapshot>>(
@@ -162,6 +188,15 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
         })),
       ),
     );
+  const resumeAfterOverflow = Ref.updateAndGet(consecutiveOverflows, (count) => count + 1).pipe(
+    Effect.tap((count) =>
+      Effect.logInfo("Environment shell fell behind the live stream; resuming.").pipe(
+        Effect.annotateLogs({ environmentId, consecutiveOverflows: count }),
+      ),
+    ),
+    Effect.tap(() => Ref.set(resumingAfterOverflow, true)),
+    Effect.flatMap((count) => Effect.sleep(shellOverflowResumeDelayMs(count))),
+  );
 
   // Apply each received batch with one state write. The RPC client's bounded
   // buffer can split a server chunk, so a bulk action can still need several
@@ -176,6 +211,7 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
     for (const item of items) {
       if (item.kind === "synchronized") {
         waiting = false;
+        yield* Ref.set(consecutiveOverflows, 0);
         if (Option.isSome(next.snapshot)) {
           next = { ...next, status: "live", error: Option.none() };
         }
@@ -240,15 +276,28 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
           Effect.map((config) => config.shellResumeCompletionMarker === true),
           Effect.orElseSucceed(() => false),
         );
-        yield* Ref.set(awaitingCompletion, supportsCompletionMarker);
-        yield* setSynchronizing;
-
         // Foreground resubscriptions on the same live session can resume from
         // the in-memory cursor. A new session reloads the authoritative HTTP
         // snapshot so a valid cursor cannot preserve incomplete cached data.
         const hasAuthoritativeSnapshot = (yield* Ref.get(lastAuthoritativeSession)) === session;
-        let canResume = hasAuthoritativeSnapshot;
         let current = yield* SubscriptionRef.get(state);
+
+        // After an overflow the connection and data are still good. Catch up
+        // from the cursor without flipping the environment out of its status.
+        if (
+          (yield* Ref.getAndSet(resumingAfterOverflow, false)) &&
+          hasAuthoritativeSnapshot &&
+          Option.isSome(current.snapshot)
+        ) {
+          return {
+            afterSequence: current.snapshot.value.snapshotSequence,
+            ...(supportsCompletionMarker ? { requestCompletionMarker: true as const } : {}),
+          };
+        }
+
+        yield* Ref.set(awaitingCompletion, supportsCompletionMarker);
+        yield* setSynchronizing;
+        let canResume = hasAuthoritativeSnapshot;
         if (!hasAuthoritativeSnapshot || Option.isNone(current.snapshot)) {
           const prepared = yield* SubscriptionRef.get(supervisor.prepared).pipe(
             Effect.flatMap(
@@ -292,7 +341,10 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
         };
       }),
       {
-        onExpectedFailure: (cause) => setStreamError(Cause.squash(cause)),
+        onExpectedFailure: (cause) =>
+          isShellLiveBufferOverflow(cause)
+            ? resumeAfterOverflow
+            : setStreamError(Cause.squash(cause)),
         retryExpectedFailureAfter: "250 millis",
         resubscribe: foregroundResubscriptions,
       },

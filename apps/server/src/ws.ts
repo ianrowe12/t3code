@@ -117,15 +117,17 @@ import {
   coalesceShellApplicationEvents,
   coalesceStoredThreadEvents,
   composeShellStreamWithEnrichment,
+  shellApplicationEventKey,
   shellStreamItemFromEnrichmentRefresh,
   shellStreamItemFromThreadShell,
+  shellStreamItemKey,
   shellStreamItemsFromInitialSnapshot,
   shellStreamItemsFromResumeSnapshot,
   toShellApplicationEvent,
   type ShellApplicationEvent,
 } from "./orchestration-v2/ShellStream.ts";
 import { ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION } from "./orchestration-v2/ProjectionStore.ts";
-import { bufferLiveStream } from "./orchestration/LiveStreamBudget.ts";
+import { bufferLiveStream, isLiveStreamBufferError } from "./orchestration/LiveStreamBudget.ts";
 import { coalesceThreadLiveStream } from "./orchestration-v2/ThreadLiveEventCoalescer.ts";
 import {
   buildBoundedThreadStreamSnapshot,
@@ -1476,14 +1478,20 @@ const makeWsRpcLayer = (
               Stream.flatMap(Stream.fromIterable),
             );
 
+          // Busy threads emit far more events than the sidebar needs. Both
+          // buffers keep one pending entry per project/thread, so a stalled
+          // projection or client ACK is bounded by aggregates, not event rate.
           const liveFrom = (afterSequence: number) =>
             bufferLiveStream(
               toShellStream(
                 applicationEvents.streamProjectedApplicationEvents({
                   afterSequence,
                   project: toShellApplicationEvent,
+                  coalesceKey: shellApplicationEventKey,
                 }),
               ),
+              undefined,
+              shellStreamItemKey,
             );
 
           const enrichmentRefreshes = Stream.fromSubscription(enrichmentChanges).pipe(
@@ -1602,6 +1610,8 @@ const makeWsRpcLayer = (
                 new OrchestrationV2GetShellSnapshotError({
                   message: "Failed while streaming the application shell",
                   cause,
+                  // The client resumes from its cursor instead of reporting an outage.
+                  ...(isLiveStreamBufferError(cause) ? { reason: "liveBufferFull" as const } : {}),
                 }),
             ),
           );
