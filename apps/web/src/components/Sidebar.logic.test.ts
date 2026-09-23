@@ -488,7 +488,7 @@ describe("hasUnseenCompletion", () => {
 });
 
 describe("shouldRecedeSidebarThread", () => {
-  it.each(["working", "waiting"] as const)(
+  it.each(["working", "background"] as const)(
     "recedes an inactive %s thread even when it is unread and woke",
     (status) => {
       expect(
@@ -886,26 +886,38 @@ describe("resolveSidebarThreadStatus", () => {
         runtime: { ...runtime, status: "completed" as const, lastError: "persisted" },
       }),
     ).toBe("ready");
+    // An idle runtime without open background work is a thread that has not
+    // run yet, not one parked on background agents.
     expect(
       resolveSidebarThreadStatus({
         ...idle,
         runtime: { ...runtime, status: "idle" as const, lastError: "persisted" },
       }),
-    ).toBe("waiting");
+    ).toBe("ready");
+  });
+
+  it("reports background while agents the settled run will report back on still run", () => {
+    expect(
+      resolveSidebarThreadStatus({
+        ...idle,
+        pendingBackgroundTasks: [{ taskId: "agent-1", description: "Review" }],
+        runtime: { ...runtime, status: "idle" as const },
+      }),
+    ).toBe("background");
   });
 
   it("defaults to ready with no runtime", () => {
     expect(resolveSidebarThreadStatus(idle)).toBe("ready");
   });
 
-  it("keeps a waiting runtime visible ahead of unread and woke presentation", () => {
-    expect(resolveSidebarV2TopStatus({ status: "waiting", isUnread: true, isWoke: true })).toBe(
-      "waiting",
+  it("presents background work as Working ahead of unread and woke presentation", () => {
+    expect(resolveSidebarV2TopStatus({ status: "background", isUnread: true, isWoke: true })).toBe(
+      "working",
     );
   });
 
-  it("keeps Waiting static while Working shows elapsed duration", () => {
-    expect(shouldShowSidebarV2Duration("waiting")).toBe(false);
+  it("shows elapsed duration only for an open run", () => {
+    expect(shouldShowSidebarV2Duration("background")).toBe(false);
     expect(shouldShowSidebarV2Duration("working")).toBe(true);
   });
 });
@@ -1228,7 +1240,7 @@ describe("resolveThreadStatusPill", () => {
     ).toMatchObject({ label: "Working", pulse: true });
   });
 
-  it("shows waiting for an idle thread with pending background tasks", () => {
+  it("shows steady working for an idle thread with pending background tasks", () => {
     expect(
       resolveThreadStatusPill({
         thread: {
@@ -1241,12 +1253,7 @@ describe("resolveThreadStatusPill", () => {
           },
         },
       }),
-    ).toMatchObject({
-      label: "Waiting",
-      colorClass: "text-sidebar-muted-foreground",
-      dotClass: "bg-sidebar-muted-foreground",
-      pulse: false,
-    });
+    ).toMatchObject({ label: "Working", pulse: false });
   });
 
   it("keeps an active turn working when background tasks are also present", () => {
@@ -1397,38 +1404,6 @@ describe("resolveProjectStatusIndicator", () => {
         },
       ]),
     ).toMatchObject({ label: "Plan Ready", dotClass: "bg-violet-500" });
-  });
-
-  it("ranks waiting below active work and above plan-ready", () => {
-    const waiting = {
-      label: "Waiting" as const,
-      colorClass: "text-sidebar-muted-foreground",
-      dotClass: "bg-sidebar-muted-foreground",
-      pulse: false,
-    };
-
-    expect(
-      resolveProjectStatusIndicator([
-        waiting,
-        {
-          label: "Working",
-          colorClass: "text-sky-600",
-          dotClass: "bg-sky-500",
-          pulse: true,
-        },
-      ]),
-    ).toMatchObject({ label: "Working" });
-    expect(
-      resolveProjectStatusIndicator([
-        {
-          label: "Plan Ready",
-          colorClass: "text-violet-600",
-          dotClass: "bg-violet-500",
-          pulse: false,
-        },
-        waiting,
-      ]),
-    ).toMatchObject({ label: "Waiting" });
   });
 });
 

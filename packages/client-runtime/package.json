@@ -247,6 +247,10 @@
       "types": "./src/state/threadWorkflows.ts",
       "default": "./src/state/threadWorkflows.ts"
     },
+    "./state/thread-card-status": {
+      "types": "./src/state/threadCardStatus.ts",
+      "default": "./src/state/threadCardStatus.ts"
+    },
     "./state/thread-settled": {
       "types": "./src/state/threadSettled.ts",
       "default": "./src/state/threadSettled.ts"

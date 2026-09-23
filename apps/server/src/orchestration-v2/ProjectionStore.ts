@@ -3970,7 +3970,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             LEFT JOIN orchestration_v2_projection_runs r
               ON r.run_id = i.run_id
             WHERE i.type IN ('command_execution', 'dynamic_tool', 'subagent')
+              -- Keep the partial-index predicate verbatim so SQLite can use
+              -- it; idle subagents are finished-but-resumable, not pending.
               AND i.status NOT IN ('completed', 'interrupted', 'failed', 'cancelled')
+              AND i.status <> 'idle'
               -- A rolled-back run's items are abandoned, not pending. Without
               -- this the shell reports Waiting for work no one will finish,
               -- matching the item_count query's exclusion above.
@@ -3983,6 +3986,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ON r.run_id = i.run_id
             WHERE i.type IN ('command_execution', 'dynamic_tool', 'subagent')
               AND i.status NOT IN ('completed', 'interrupted', 'failed', 'cancelled')
+              AND i.status <> 'idle'
               AND (i.run_id IS NULL OR r.status <> 'rolled_back')
               AND i.thread_id IN ${sql.in(threadIds)}
           `;

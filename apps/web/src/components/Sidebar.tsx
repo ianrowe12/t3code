@@ -1175,7 +1175,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
   const isUnread = hasUnseenCompletion({ ...thread, lastVisitedAt });
   const status = resolveSidebarThreadStatus(thread);
   const isInFlight =
-    status === "working" || status === "waiting" || status === "approval" || status === "input";
+    status === "working" || status === "background" || status === "approval" || status === "input";
   // A woken thread reappears at its original position (the sort is
   // deliberately static), so the pill has to carry the weight. Snoozing is
   // an explicit act, so the pill clears only when the user re-engages:
@@ -1203,7 +1203,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
   // mobile Live Activity/widgets (amber approval, indigo input, sky working)
   // so a thread reads the same color everywhere it surfaces.
   const topStatus =
-    status === "working"
+    status === "working" || status === "background"
       ? {
           label: "Working",
           icon: "working" as const,
@@ -1214,45 +1214,37 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
           // the label at full strength.
           className: cn("text-sky-600 dark:text-sky-400", !props.isActive && "opacity-75"),
         }
-      : status === "waiting"
+      : status === "approval"
         ? {
-            // Waiting is calm background presence (post-settle background
-            // roster), not active progress, so the label keeps full strength.
-            label: "Waiting",
+            label: "Approval",
             icon: null,
-            className: "text-muted-foreground",
+            className: "text-amber-700 dark:text-amber-300",
           }
-        : status === "approval"
+        : status === "input"
           ? {
-              label: "Approval",
+              label: "Input",
               icon: null,
-              className: "text-amber-700 dark:text-amber-300",
+              className: "text-indigo-600 dark:text-indigo-300",
             }
-          : status === "input"
+          : status === "failed"
             ? {
-                label: "Input",
+                label: "Failed",
                 icon: null,
-                className: "text-indigo-600 dark:text-indigo-300",
+                className: "text-red-700 dark:text-red-300",
               }
-            : status === "failed"
+            : isWoke
               ? {
-                  label: "Failed",
-                  icon: null,
-                  className: "text-red-700 dark:text-red-300",
+                  label: "Woke",
+                  icon: "woke" as const,
+                  className: "text-amber-700 dark:text-amber-300",
                 }
-              : isWoke
+              : isUnread
                 ? {
-                    label: "Woke",
-                    icon: "woke" as const,
-                    className: "text-amber-700 dark:text-amber-300",
+                    label: "Done",
+                    icon: "done" as const,
+                    className: "text-emerald-700 dark:text-emerald-300",
                   }
-                : isUnread
-                  ? {
-                      label: "Done",
-                      icon: "done" as const,
-                      className: "text-emerald-700 dark:text-emerald-300",
-                    }
-                  : null;
+                : null;
   const isWokeStatus = topStatus?.icon === "woke";
 
   const branchMismatch = resolveLocalCheckoutBranchMismatch({
