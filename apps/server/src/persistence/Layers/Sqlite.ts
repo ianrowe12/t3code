@@ -41,6 +41,9 @@ const setup = Layer.effectDiscard(
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     // CLI and server write from separate processes; wait rather than fail with SQLITE_BUSY.
+    // The driver is synchronous, so this wait blocks the whole event loop. Keep
+    // it short; event writes retry lock contention asynchronously on top of it
+    // (see SqliteLockRetry.ts).
     yield* sql`PRAGMA busy_timeout = 5000;`;
     yield* sql`PRAGMA foreign_keys = ON;`;
     if (yield* SqliteMigrationsEnabled) {

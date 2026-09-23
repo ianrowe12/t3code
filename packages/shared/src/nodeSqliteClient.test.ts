@@ -1,4 +1,7 @@
+import * as NodeSqlite from "node:sqlite";
+
 import { assert, it } from "@effect/vitest";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -53,4 +56,25 @@ it.effect("returns a typed failure when the database cannot be opened", () =>
     assert.equal(error._tag, "SqlError");
     assert.equal(error.reason.operation, "open");
   }),
+);
+
+it.effect("classifies a write blocked by another connection's lock as lock contention", () =>
+  Effect.gen(function* () {
+    // A shared-cache memory database lets two connections contend without a file.
+    const filename = "file:node-sqlite-lock-contention?mode=memory&cache=shared";
+    const holder = new NodeSqlite.DatabaseSync(filename);
+    yield* Effect.addFinalizer(() => Effect.sync(() => holder.close()));
+    holder.exec("CREATE TABLE entries(id INTEGER PRIMARY KEY)");
+
+    const sql = yield* Layer.build(SqliteClient.layer({ filename })).pipe(
+      Effect.map(Context.get(SqlClient.SqlClient)),
+    );
+    holder.exec("BEGIN IMMEDIATE; INSERT INTO entries(id) VALUES (1)");
+    const error = yield* Effect.flip(sql`INSERT INTO entries(id) VALUES (2)`);
+    holder.exec("ROLLBACK");
+
+    assert.equal(error.reason._tag, "LockTimeoutError");
+    assert.isTrue(error.reason.isRetryable);
+    yield* sql`INSERT INTO entries(id) VALUES (2)`;
+  }).pipe(Effect.scoped),
 );

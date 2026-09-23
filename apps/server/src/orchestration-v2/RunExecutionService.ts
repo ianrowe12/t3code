@@ -500,6 +500,7 @@ export interface RunExecutionServiceV2StartRootRunInput {
   readonly attempt: OrchestrationV2RunAttempt;
   readonly attemptId: RunAttemptId;
   readonly providerTurnOrdinal: number;
+  readonly priorRunsSettled?: boolean;
   readonly loadInheritedBackgroundTurnItems?: () => Effect.Effect<
     ReadonlyArray<InheritedBackgroundTurnItemRoute>,
     unknown
@@ -1112,6 +1113,27 @@ export const layer: Layer.Layer<
             }
             return true;
           });
+          // Ingestion stopped before the provider reported this turn terminal,
+          // so the run is failed while the adapter may still hold the turn.
+          // Interrupt it; otherwise the next run on this provider thread is
+          // rejected because the adapter still sees a turn in flight.
+          const releaseProviderTurnAfterIngestFailure = Effect.gen(function* () {
+            if (yield* Ref.get(rootTerminalSeen)) return;
+            const providerTurnId = (yield* Ref.get(eventRouting)).rootProviderTurnId;
+            if (providerTurnId === null) return;
+            yield* input.session.interruptTurn({
+              providerThread: yield* Ref.get(latestProviderThread),
+              providerTurnId,
+            });
+          }).pipe(
+            Effect.timeout("30 seconds"),
+            Effect.catchCause((interruptCause) =>
+              Effect.logWarning("failed to interrupt provider turn after ingestion failure", {
+                runId: input.run.id,
+                cause: interruptCause,
+              }),
+            ),
+          );
           const providerEventFiber = yield* eventSubscription.events.pipe(
             Stream.filterEffect((event) =>
               Ref.modify(eventRouting, (state) => routeProviderEvent(event, routeIdentity, state)),
@@ -1262,6 +1284,9 @@ export const layer: Layer.Layer<
                           cause: { ingest: cause, write: writeCause },
                         }),
                     ),
+                    Effect.ensuring(
+                      finalized ? Effect.void : releaseProviderTurnAfterIngestFailure,
+                    ),
                   ),
                 ),
               ),
@@ -1299,6 +1324,7 @@ export const layer: Layer.Layer<
             message: input.message,
             modelSelection: input.modelSelection,
             runtimePolicy: input.runtimePolicy,
+            ...(input.priorRunsSettled === true ? { priorRunsSettled: true } : {}),
           };
           const compact =
             input.message.attachments.length === 0 &&

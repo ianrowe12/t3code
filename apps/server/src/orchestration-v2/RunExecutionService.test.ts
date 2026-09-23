@@ -46,7 +46,7 @@ import {
   type ProviderAdapterV2Event,
   type ProviderAdapterV2SessionRuntime,
 } from "./ProviderAdapter.ts";
-import { ProviderEventIngestorV2 } from "./ProviderEventIngestor.ts";
+import { ProviderEventIngestorV2, ProviderEventPublishError } from "./ProviderEventIngestor.ts";
 import {
   canRouteRelatedSubagent,
   cascadeTerminalizeRunOwnedSubagents,
@@ -2865,6 +2865,54 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
   }),
 );
 
+it.effect("interrupts the provider turn when ingestion fails before its terminal", () =>
+  Effect.gen(function* () {
+    const interrupted = yield* Ref.make<ReadonlyArray<ProviderTurnId>>([]);
+    const priorRunsSettled = yield* Ref.make<ReadonlyArray<boolean | undefined>>([]);
+    const { observed } = yield* captureRootRunTermination({
+      key: "ingest-failure:release-turn",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      priorRunsSettled: true,
+      startTurn: (turnInput) =>
+        Ref.update(priorRunsSettled, (current) => [...current, turnInput.priorRunsSettled]),
+      events: (ids) =>
+        Stream.make(
+          backgroundTurnItemEvent(ids, "command_execution", "running", 1),
+          rootTerminalEvent(ids, "completed"),
+        ),
+      failIngest: (event) => event.type === "turn_item.updated",
+      interruptTurn: (interruptInput) =>
+        Ref.update(interrupted, (current) => [...current, interruptInput.providerTurnId]),
+    });
+    assert.equal(observed[0], "run:failed");
+    assert.deepEqual(yield* Ref.get(interrupted), [
+      backgroundScenarioIds("ingest-failure:release-turn").rootProviderTurnId,
+    ]);
+    assert.deepEqual(yield* Ref.get(priorRunsSettled), [true]);
+  }),
+);
+
+it.effect("leaves the provider turn alone when ingestion fails after the run finalized", () =>
+  Effect.gen(function* () {
+    const interrupted = yield* Ref.make<ReadonlyArray<ProviderTurnId>>([]);
+    const { observed } = yield* captureRootRunTermination({
+      key: "ingest-failure:after-terminal",
+      shouldFinalizeRun: () => Effect.succeed(true),
+      events: (ids) =>
+        Stream.make(
+          backgroundTurnItemEvent(ids, "command_execution", "running", 1),
+          rootTerminalEvent(ids, "completed"),
+          backgroundTurnItemEvent(ids, "command_execution", "completed", 2),
+        ),
+      failIngest: (event) => event.type === "turn_item.updated" && event.turnItem.ordinal === 2,
+      interruptTurn: (interruptInput) =>
+        Ref.update(interrupted, (current) => [...current, interruptInput.providerTurnId]),
+    });
+    assert.deepEqual(observed, ["run:waiting", "pull-requests-refreshed"]);
+    assert.deepEqual(yield* Ref.get(interrupted), []);
+  }),
+);
+
 function captureRootRunTermination(input: {
   readonly key: string;
   readonly shouldFinalizeRun: () => Effect.Effect<boolean, never>;
@@ -2874,7 +2922,10 @@ function captureRootRunTermination(input: {
     ids: BackgroundScenarioIds,
   ) => Stream.Stream<ProviderAdapterV2Event, ProviderAdapterV2Error>;
   readonly startTurn?: ProviderAdapterV2SessionRuntime["startTurn"];
+  readonly interruptTurn?: ProviderAdapterV2SessionRuntime["interruptTurn"];
+  readonly failIngest?: (event: ProviderAdapterV2Event) => boolean;
   readonly refreshAfterTurn?: Effect.Effect<void>;
+  readonly priorRunsSettled?: boolean;
 }) {
   return Effect.gen(function* () {
     const ids = backgroundScenarioIds(input.key);
@@ -2932,7 +2983,16 @@ function captureRootRunTermination(input: {
           }),
           idAllocatorLayer,
           Layer.mock(ProviderEventIngestorV2)({
-            ingestNormalized: () => Effect.succeed([]),
+            ingestNormalized: (payload) =>
+              input.failIngest?.(payload.event) === true
+                ? Effect.fail(
+                    new ProviderEventPublishError({
+                      providerSessionId: ProviderSessionId.make(`session:${input.key}`),
+                      eventCount: 1,
+                      cause: "database is locked",
+                    }),
+                  )
+                : Effect.succeed([]),
           }),
           ServerSettingsService.layerTest(),
           Layer.succeed(RunFinalizationObserver, {
@@ -2984,6 +3044,7 @@ function captureRootRunTermination(input: {
             close: Deferred.succeed(ingestionDone, undefined),
           }),
           startTurn: input.startTurn ?? (() => Effect.void),
+          interruptTurn: input.interruptTurn ?? (() => Effect.void),
         } as unknown as ProviderAdapterV2SessionRuntime,
         run: {
           id: ids.runId,
@@ -3008,6 +3069,9 @@ function captureRootRunTermination(input: {
         } as OrchestrationV2RunAttempt,
         attemptId: ids.attemptId,
         providerTurnOrdinal: 1,
+        ...(input.priorRunsSettled === undefined
+          ? {}
+          : { priorRunsSettled: input.priorRunsSettled }),
         shouldFinalizeRun: input.shouldFinalizeRun,
         ...(input.hasUnpairedRunInterruptRequest === undefined
           ? {}
