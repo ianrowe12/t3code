@@ -152,6 +152,36 @@ describe("derivePendingBackgroundWork", () => {
     ]);
   });
 
+  it("treats idle subagents as settled, not pending", () => {
+    // Copilot parks a finished background agent at idle so it can take a
+    // follow-up; nothing runs until then, so it must not hold a Waiting chip.
+    const tasks = derivePendingBackgroundWork({
+      latestRun: { id: "run-1" as never, ordinal: 1, status: "completed" },
+      providerThreads: [{ id: "pt-1" as never }],
+      turnItems: [
+        {
+          id: "item-idle" as never,
+          type: "subagent",
+          status: "idle",
+          title: "finished agent",
+          nativeItemRef: { nativeId: "agent-idle" },
+          prompt: "review",
+        },
+        {
+          id: "item-running" as never,
+          type: "subagent",
+          status: "running",
+          title: "working agent",
+          nativeItemRef: { nativeId: "agent-running" },
+          prompt: "fix",
+        },
+      ],
+    });
+    expect(tasks).toEqual([
+      { taskId: "agent-running", description: "working agent", taskType: "subagent" },
+    ]);
+  });
+
   it("trims normalized background-work descriptions", () => {
     const base = {
       latestRun: { id: "run-1" as never, ordinal: 1, status: "completed" as const },
