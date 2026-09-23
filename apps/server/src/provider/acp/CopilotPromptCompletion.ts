@@ -132,11 +132,13 @@ export const makeCopilotPromptCompletionRuntime = Effect.fn("makeCopilotPromptCo
       runningAgents.clear();
       return releaseQuietWaiter;
     });
-    const awaitRunningAgents = Effect.gen(function* () {
-      if (runningAgents.size === 0) return true;
-      const waiter = yield* Deferred.make<boolean>();
+    // Check and register synchronously so a completion processed on the
+    // transport fiber cannot drain the set between the two.
+    const awaitRunningAgents = Effect.suspend(() => {
+      if (runningAgents.size === 0) return Effect.succeed(true);
+      const waiter = Deferred.makeUnsafe<boolean>();
       quietWaiter = waiter;
-      return yield* Deferred.await(waiter).pipe(
+      return Deferred.await(waiter).pipe(
         Effect.ensuring(
           Effect.sync(() => {
             if (quietWaiter === waiter) quietWaiter = undefined;
@@ -175,7 +177,9 @@ export const makeCopilotPromptCompletionRuntime = Effect.fn("makeCopilotPromptCo
       "github.com/copilot/sessionEvent",
       SessionEvent,
       Effect.fnUntraced(function* (event) {
-        const agent = event.agentId ?? event.data.toolCallId;
+        // Native subagent lifecycle events carry the child's agentId on both
+        // start and completion; keying on it alone keeps add/delete symmetric.
+        const agent = event.agentId;
         if (event.sessionId === agentSessionId && agent !== undefined) {
           if (event.type === "subagent.started") runningAgents.add(agent);
           if (event.type === "subagent.completed" || event.type === "subagent.failed") {
@@ -338,6 +342,8 @@ export const makeCopilotPromptCompletionRuntime = Effect.fn("makeCopilotPromptCo
         runtime.getEvents().pipe(
           Stream.tap((event) => {
             if (event._tag !== "ConnectionTerminated") return Effect.void;
+            // A held prompt is released on purpose: it proceeds into the dead
+            // transport and surfaces that failure rather than silently vanishing.
             if (pending === undefined) return resetRunningAgents;
             return Effect.all([
               resetRunningAgents,
@@ -426,16 +432,14 @@ export const makeCopilotPromptCompletionRuntime = Effect.fn("makeCopilotPromptCo
             return result;
           }),
         ),
+      // Copilot's cancel (and the close fallback below) abort the whole native
+      // session, background agents included, so every explicit cancel drops
+      // agent tracking. Otherwise a stale entry holds the next prompt forever.
       cancel: Effect.gen(function* () {
         const current = pending;
         if (current === undefined) {
-          // An explicit cancel also discards native-work tracking so a stale
-          // entry can never hold later prompts hostage.
-          if (quietWaiter !== undefined) {
-            yield* Deferred.succeed(quietWaiter, false);
-            yield* resetRunningAgents;
-          }
-          return yield* runtime.cancel;
+          if (quietWaiter !== undefined) yield* Deferred.succeed(quietWaiter, false);
+          return yield* runtime.cancel.pipe(Effect.ensuring(resetRunningAgents));
         }
         const barrier = yield* Deferred.make<void>();
         cancellation = barrier;
@@ -453,6 +457,7 @@ export const makeCopilotPromptCompletionRuntime = Effect.fn("makeCopilotPromptCo
         }).pipe(
           Effect.onExit((exit) =>
             Effect.gen(function* () {
+              yield* resetRunningAgents;
               if (Exit.isFailure(exit)) {
                 yield* invalidate(current);
                 yield* Deferred.done(current.started, exit);
