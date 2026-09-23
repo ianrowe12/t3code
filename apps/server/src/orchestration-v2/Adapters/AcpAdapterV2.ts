@@ -6921,9 +6921,69 @@ export function makeAcpAdapterV2(options: AcpAdapterV2Options): ProviderAdapterV
             ),
         );
 
+        // The orchestrator starts a run only when its app thread has no
+        // blocking run, so a live turn from an older run on the same thread
+        // belongs to a run it already settled (for example after provider
+        // event ingestion failed). Interrupt that orphan rather than rejecting
+        // every later message until restart. Turns of other threads sharing
+        // this session and duplicate starts for the same run stay rejected.
+        const releaseTurnSupersededBy = Effect.fnUntraced(function* (
+          turnInput: ProviderAdapterV2TurnInput,
+        ) {
+          if (turnInput.priorRunsSettled !== true) {
+            return;
+          }
+          const existing = yield* Ref.get(activeTurn);
+          if (
+            existing === null ||
+            existing.input.threadId !== turnInput.threadId ||
+            existing.input.runId === turnInput.runId ||
+            existing.input.runOrdinal >= turnInput.runOrdinal
+          ) {
+            return;
+          }
+          if (existing.finalized) {
+            // Already terminal; finalizeTurn clears the slot when it returns.
+            yield* Deferred.await(existing.completed);
+            return;
+          }
+          yield* Effect.logWarning(
+            "ACP start found a live turn from a settled run; interrupting it",
+            {
+              driver,
+              threadId: turnInput.threadId,
+              runId: turnInput.runId,
+              orphanedRunId: existing.input.runId,
+              orphanedProviderTurnId: existing.providerTurnId,
+            },
+          );
+          yield* sessionRuntime
+            .interruptTurn({
+              providerThread: existing.input.providerThread,
+              providerTurnId: existing.providerTurnId,
+            })
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("ACP orphaned turn interrupt failed", {
+                  driver,
+                  orphanedProviderTurnId: existing.providerTurnId,
+                  cause,
+                }),
+              ),
+            );
+          if ((yield* Ref.get(activeTurn)) === existing && !existing.finalized) {
+            // The interrupt failed before the turn settled (for example the
+            // cancel request itself failed). Nothing will ingest this turn, so
+            // settle it locally; late prompt callbacks see it finalized.
+            existing.interrupted = true;
+            yield* finalizeTurn(existing, "interrupted");
+          }
+        });
+
         const startTurn = Effect.fn("AcpAdapterV2.startTurn.transition")(function* (
           turnInput: ProviderAdapterV2TurnInput,
         ) {
+          yield* releaseTurnSupersededBy(turnInput);
           return yield* runtimeTransitionPermit.withPermit(startTurnUnlocked(turnInput));
         });
 
