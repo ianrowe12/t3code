@@ -608,6 +608,7 @@ const makeEventStore = Effect.gen(function* () {
         latestSequence: latestApplicationSequence,
         afterSequence: input.afterSequence ?? 0,
         project: input.project,
+        ...(input.coalesceKey === undefined ? {} : { coalesceKey: input.coalesceKey }),
         replay: (throughSequence) =>
           catchUpApplicationEvents({
             afterSequence: input?.afterSequence ?? 0,

@@ -210,7 +210,95 @@ type LiveStreamLimits = {
   readonly maxSerializedBytes?: number;
 };
 
+/**
+ * Values that share a key supersede each other while they wait for delivery.
+ * Use only when a newer value fully represents every older one with its key.
+ */
+type LiveStreamCoalesceKey<A> = (value: A) => string;
+
+const isLiveStreamBufferErrorValue = Schema.is(LiveStreamBufferError);
+
+/** True for a live buffer overflow, including one wrapped by a storage error. */
+export function isLiveStreamBufferError(error: unknown): boolean {
+  let current = error;
+  for (let depth = 0; depth < 4 && typeof current === "object" && current !== null; depth++) {
+    if (isLiveStreamBufferErrorValue(current)) return true;
+    current = (current as { readonly cause?: unknown }).cause;
+  }
+  return false;
+}
+
 const retainLiveStream = <A extends object, E, R>(
+  source: Stream.Stream<A, E, R>,
+  budget: LiveStreamBudget,
+  coalesceKey?: LiveStreamCoalesceKey<A>,
+) =>
+  coalesceKey === undefined
+    ? retainQueuedLiveStream(source, budget)
+    : retainCoalescedLiveStream(source, budget, coalesceKey);
+
+/**
+ * Retain at most one pending value per key, so a burst of updates to a few
+ * aggregates costs a few budget slots instead of one per event. A superseding
+ * value moves its key to the end, which keeps delivered sequences ascending.
+ */
+const retainCoalescedLiveStream = <A extends object, E, R>(
+  source: Stream.Stream<A, E, R>,
+  budget: LiveStreamBudget,
+  coalesceKey: LiveStreamCoalesceKey<A>,
+) =>
+  Effect.gen(function* () {
+    const pending = new Map<string, RetainedLiveItem<A>>();
+    const wakeup = yield* Queue.dropping<void, E | LiveStreamBufferError | Cause.Done>(1);
+    let closed = false;
+    const close = (error?: LiveStreamBufferError) =>
+      Effect.gen(function* () {
+        if (closed) return;
+        closed = true;
+        budget.release(pending.values());
+        pending.clear();
+        if (error) yield* Queue.fail(wakeup, error);
+        yield* Queue.shutdown(wakeup);
+      });
+    yield* Effect.addFinalizer(() => close());
+    yield* budget.failed.pipe(
+      Effect.catchTags({ LiveStreamBufferError: close }),
+      Effect.forkScoped,
+    );
+    const offer = (value: A) =>
+      Effect.suspend(() => {
+        const key = coalesceKey(value);
+        const previous = pending.get(key);
+        return budget.replace(previous === undefined ? [] : [previous], [value]).pipe(
+          Effect.flatMap((items) => {
+            pending.delete(key);
+            for (const item of items) pending.set(key, item);
+            return Queue.offer(wakeup, undefined);
+          }),
+        );
+      });
+    yield* source.pipe(
+      Stream.runForEach((value) => offer(value).pipe(Effect.uninterruptible)),
+      Effect.raceFirst(budget.failed),
+      Effect.exit,
+      Effect.flatMap((exit) =>
+        Exit.isFailure(exit) ? Queue.failCause(wakeup, exit.cause) : Queue.end(wakeup),
+      ),
+      Effect.forkScoped({ startImmediately: true }),
+    );
+    const pull = Effect.gen(function* () {
+      // Pending values drain before an end or failure surfaces.
+      while (pending.size === 0) {
+        yield* Queue.take(wakeup);
+      }
+      const items = Array.from(pending.values()) as Arr.NonEmptyArray<RetainedLiveItem<A>>;
+      pending.clear();
+      return items;
+    });
+    return Stream.fromPull(Effect.succeed(pull));
+  });
+
+const retainQueuedLiveStream = <A extends object, E, R>(
   source: Stream.Stream<A, E, R>,
   budget: LiveStreamBudget,
 ) =>
@@ -254,11 +342,12 @@ const retainLiveStream = <A extends object, E, R>(
 export const bufferLiveStream = <A extends object, E, R>(
   source: Stream.Stream<A, E, R>,
   limits?: LiveStreamLimits,
+  coalesceKey?: LiveStreamCoalesceKey<A>,
 ) =>
   Stream.unwrap(
     Effect.gen(function* () {
       const budget = yield* makeLiveStreamBudget(limits);
-      return budget.deliver(yield* retainLiveStream(source, budget));
+      return budget.deliver(yield* retainLiveStream(source, budget, coalesceKey));
     }),
   );
 
@@ -289,7 +378,11 @@ export const replayAndBufferProjectedLiveEvents = <
   E,
   R,
 >(
-  input: ReplayLiveInput<A, E, R> & { readonly project: (event: A) => B },
+  input: ReplayLiveInput<A, E, R> & {
+    readonly project: (event: A) => B;
+    /** Coalesces the live tail only; replay is paced by its reader. */
+    readonly coalesceKey?: LiveStreamCoalesceKey<B>;
+  },
   limits?: LiveStreamLimits,
 ) =>
   Stream.unwrap(
@@ -309,6 +402,7 @@ export const replayAndBufferProjectedLiveEvents = <
           Stream.ensuring(Scope.close(subscriptionScope, Exit.void)),
         ),
         budget,
+        input.coalesceKey,
       );
       const replay = Stream.unwrap(
         input.latestSequence.pipe(

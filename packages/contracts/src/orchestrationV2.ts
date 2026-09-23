@@ -2775,6 +2775,11 @@ export class OrchestrationV2GetShellSnapshotError extends Schema.TaggedError<Orc
   "OrchestrationV2GetShellSnapshotError",
   {
     message: Schema.String,
+    /**
+     * `liveBufferFull`: the subscriber fell behind the live tail. The server is
+     * healthy; resubscribe from the last received sequence.
+     */
+    reason: Schema.optional(Schema.Literal("liveBufferFull")),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}

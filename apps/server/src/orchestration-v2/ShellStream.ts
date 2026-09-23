@@ -47,17 +47,38 @@ export function toShellApplicationEvent(stored: ApplicationStoredEvent): ShellAp
     : { sequence: stored.sequence, event: { threadId: stored.event.threadId } };
 }
 
+/** Shell updates refetch one aggregate, so its newest event represents every older one. */
+export function shellApplicationEventKey(stored: ShellApplicationEvent): string {
+  return "aggregateKind" in stored
+    ? `project:${stored.aggregateId}`
+    : `thread:${stored.event.threadId}`;
+}
+
+/** Each live shell delta carries the aggregate's full current shell or its removal. */
+export function shellStreamItemKey(
+  item: Exclude<OrchestrationV2ShellStreamItem, { readonly kind: "snapshot" }>,
+): string {
+  switch (item.kind) {
+    case "synchronized":
+      return "synchronized";
+    case "project.updated":
+      return `project:${item.project.id}`;
+    case "project.removed":
+      return `project:${item.projectId}`;
+    case "thread.updated":
+      return `thread:${item.thread.id}`;
+    case "thread.removed":
+      return `thread:${item.threadId}`;
+  }
+}
+
 /** Keep only the newest shell-relevant event per project/thread aggregate. */
 export function coalesceShellApplicationEvents<A extends ShellApplicationEvent>(
   events: ReadonlyArray<A>,
 ): ReadonlyArray<A> {
   const latestByAggregate = new Map<string, A>();
   for (const stored of events) {
-    const key =
-      "aggregateKind" in stored
-        ? `project:${stored.aggregateId}`
-        : `thread:${stored.event.threadId}`;
-    latestByAggregate.set(key, stored);
+    latestByAggregate.set(shellApplicationEventKey(stored), stored);
   }
   return Array.from(latestByAggregate.values()).sort(
     (left, right) => left.sequence - right.sequence,

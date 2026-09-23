@@ -1,10 +1,12 @@
 import {
   EnvironmentId,
   ORCHESTRATION_V2_WS_METHODS,
+  OrchestrationV2GetShellSnapshotError,
   type OrchestrationV2ShellSnapshot,
   type OrchestrationV2ShellStreamItem,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import type * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -15,6 +17,7 @@ import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import * as TestClock from "effect/testing/TestClock";
 
 import {
   AVAILABLE_CONNECTION_STATE,
@@ -26,7 +29,12 @@ import * as ConnectionWakeups from "../connection/wakeups.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
-import { makeEnvironmentShellState, ShellSnapshotLoader } from "./shell.ts";
+import {
+  makeEnvironmentShellState,
+  shellOverflowResumeDelayMs,
+  ShellSnapshotLoader,
+  type EnvironmentShellState,
+} from "./shell.ts";
 import { v2Project, v2ShellSnapshot } from "./orchestrationV2TestFixtures.ts";
 
 const TARGET = new PrimaryConnectionTarget({
@@ -867,4 +875,122 @@ describe("environment shell synchronization", () => {
       expect(Option.getOrThrow(state.snapshot).projects[0]?.title).toBe("Server reset");
     }),
   );
+  it.effect("resumes quietly from its cursor when the server's live buffer overflows", () =>
+    Effect.gen(function* () {
+      type ShellStreamQueue = Queue.Queue<
+        OrchestrationV2ShellStreamItem,
+        OrchestrationV2GetShellSnapshotError | Cause.Done
+      >;
+      const streams = yield* Queue.unbounded<ShellStreamQueue>();
+      const loaderCalls = yield* Ref.make(0);
+      const capturedAfterSequences = yield* Ref.make<ReadonlyArray<number | undefined>>([]);
+      const client = {
+        [ORCHESTRATION_V2_WS_METHODS.subscribeShell]: (input: {
+          readonly afterSequence?: number;
+        }) =>
+          Stream.unwrap(
+            Effect.gen(function* () {
+              yield* Ref.update(capturedAfterSequences, (captured) => [
+                ...captured,
+                input.afterSequence,
+              ]);
+              const events: ShellStreamQueue = yield* Queue.unbounded<
+                OrchestrationV2ShellStreamItem,
+                OrchestrationV2GetShellSnapshotError | Cause.Done
+              >();
+              yield* Queue.offer(streams, events);
+              return Stream.fromQueue(events);
+            }),
+          ),
+      } as unknown as WsRpcProtocolClient;
+      const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+        target: TARGET,
+        state: yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE),
+        session: yield* SubscriptionRef.make<Option.Option<RpcSession.RpcSession>>(
+          Option.some(session(client)),
+        ),
+        prepared: yield* SubscriptionRef.make(Option.some(PREPARED)),
+        connect: Effect.void,
+        disconnect: Effect.void,
+        retryNow: Effect.void,
+      } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+      const cache = Persistence.EnvironmentCacheStore.of({
+        loadShell: () => Effect.succeed(Option.none()),
+        saveShell: () => Effect.void,
+        loadThread: () => Effect.succeed(Option.none()),
+        saveThread: () => Effect.void,
+        removeThread: () => Effect.void,
+        loadServerConfig: () => Effect.succeed(Option.none()),
+        saveServerConfig: () => Effect.void,
+        loadVcsRefs: () => Effect.succeed(Option.none()),
+        saveVcsRefs: () => Effect.void,
+        removeVcsRefs: () => Effect.void,
+        clearVcsRefs: () => Effect.void,
+        clear: () => Effect.void,
+      });
+      const snapshotLoader = ShellSnapshotLoader.of({
+        load: () =>
+          Ref.update(loaderCalls, (count) => count + 1).pipe(
+            Effect.as(Option.some(LIVE_SHELL_SNAPSHOT)),
+          ),
+      });
+      const shellState = yield* makeEnvironmentShellState().pipe(
+        Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        Effect.provideService(Persistence.EnvironmentCacheStore, cache),
+        Effect.provideService(ShellSnapshotLoader, snapshotLoader),
+      );
+      const awaitShell = (predicate: (state: EnvironmentShellState) => boolean) =>
+        SubscriptionRef.changes(shellState).pipe(Stream.filter(predicate), Stream.runHead);
+
+      const first = yield* Queue.take(streams);
+      yield* Queue.offerAll(first, [
+        { kind: "synchronized" },
+        { kind: "snapshot", snapshot: { ...LIVE_SHELL_SNAPSHOT, snapshotSequence: 5 } },
+      ]);
+      yield* awaitShell(
+        (state) =>
+          state.status === "live" &&
+          Option.isSome(state.snapshot) &&
+          state.snapshot.value.snapshotSequence === 5,
+      );
+
+      const observed = yield* Ref.make<ReadonlyArray<EnvironmentShellState>>([]);
+      yield* SubscriptionRef.changes(shellState).pipe(
+        Stream.runForEach((state) => Ref.update(observed, (states) => [...states, state])),
+        Effect.forkScoped,
+      );
+      yield* Queue.fail(
+        first,
+        new OrchestrationV2GetShellSnapshotError({
+          message: "Failed while streaming the application shell",
+          reason: "liveBufferFull",
+        }),
+      );
+      yield* TestClock.adjust("250 millis");
+      const resumed = yield* Queue.take(streams);
+      expect(yield* Ref.get(capturedAfterSequences)).toEqual([1, 5]);
+      expect(yield* Ref.get(loaderCalls)).toBe(1);
+      yield* Queue.offer(resumed, { kind: "synchronized" });
+      for (const state of yield* Ref.get(observed)) {
+        expect(state.status).toBe("live");
+        expect(Option.isNone(state.error)).toBe(true);
+      }
+
+      // Any other stream failure is still reported.
+      yield* Queue.fail(
+        resumed,
+        new OrchestrationV2GetShellSnapshotError({
+          message: "Failed while streaming the application shell",
+        }),
+      );
+      const failed = yield* awaitShell((state) => Option.isSome(state.error));
+      expect(Option.getOrThrow(failed).status).toBe("cached");
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it("backs off repeated overflow resumes up to a cap", () => {
+    expect([1, 2, 3, 4, 5, 6, 12].map(shellOverflowResumeDelayMs)).toEqual([
+      0, 250, 750, 1_750, 3_750, 7_750, 7_750,
+    ]);
+  });
 });
