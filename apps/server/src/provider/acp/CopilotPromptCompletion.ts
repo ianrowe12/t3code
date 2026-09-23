@@ -159,6 +159,9 @@ export const makeCopilotPromptCompletionRuntime = Effect.fn("makeCopilotPromptCo
         const config = yield* runtime.getConfigOptions;
         const mode = yield* runtime.getModeState;
         yield* runtime.closeSession(current.sessionId);
+        // Closing aborts every background agent, and the reload keeps the same
+        // session id, so nothing else would drop their tracking.
+        yield* resetRunningAgents;
         yield* runtime.loadSession(current.sessionId);
         for (const option of config) {
           yield* runtime.setConfigOption(option.id, option.currentValue);
@@ -435,14 +438,20 @@ export const makeCopilotPromptCompletionRuntime = Effect.fn("makeCopilotPromptCo
       // Copilot's cancel (and the close fallback below) abort the whole native
       // session, background agents included, so every explicit cancel drops
       // agent tracking. Otherwise a stale entry holds the next prompt forever.
+      // The barrier keeps the next prompt out until that reset lands, so it
+      // cannot wipe agents the next turn has already started.
       cancel: Effect.gen(function* () {
         const current = pending;
-        if (current === undefined) {
-          if (quietWaiter !== undefined) yield* Deferred.succeed(quietWaiter, false);
-          return yield* runtime.cancel.pipe(Effect.ensuring(resetRunningAgents));
-        }
         const barrier = yield* Deferred.make<void>();
         cancellation = barrier;
+        if (current === undefined) {
+          if (quietWaiter !== undefined) yield* Deferred.succeed(quietWaiter, false);
+          return yield* runtime.cancel.pipe(
+            Effect.ensuring(
+              resetRunningAgents.pipe(Effect.andThen(Deferred.succeed(barrier, undefined))),
+            ),
+          );
+        }
         current.cancelled = true;
         yield* Effect.gen(function* () {
           yield* runtime.cancel;

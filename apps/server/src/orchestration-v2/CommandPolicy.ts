@@ -128,8 +128,17 @@ export function resolveMessageDispatchIntent(
       run.status === "running" ||
       run.status === "waiting",
   );
+  // A client-computed steer/restart names its target; judge it by that run's provider.
+  const targetRunId =
+    deliveryIntent === undefined && "targetRunId" in requestedMode
+      ? requestedMode.targetRunId
+      : undefined;
+  const capabilityRun =
+    (targetRunId === undefined
+      ? undefined
+      : projection.runs.find((run) => run.id === targetRunId)) ?? activeRun;
   const providerThread = projection.providerThreads.find(
-    (candidate) => candidate.id === activeRun?.providerThreadId,
+    (candidate) => candidate.id === capabilityRun?.providerThreadId,
   );
   const providerSession =
     providerThread?.providerSessionId == null

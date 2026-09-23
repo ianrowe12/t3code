@@ -305,6 +305,50 @@ describe("Copilot prompt completion", () => {
     }),
   );
 
+  it.effect("drops background-agent tracking when a missed start closes and reloads", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeFixture();
+      const first = yield* fixture.start();
+      yield* fixture.agentEvent("subagent.started", "bg-1");
+      yield* Deferred.succeed(fixture.rpc, { stopReason: "end_turn" });
+      yield* TestClock.adjust("15 seconds");
+      const error = yield* Fiber.join(first).pipe(Effect.flip);
+      assert.include(error.message, "before acknowledging the new turn");
+      assert.deepEqual(fixture.calls, ["close:root", "load:root"]);
+
+      yield* fixture.promptNext;
+      yield* Effect.yieldNow;
+      assert.equal(yield* Queue.size(fixture.dispatched), 1);
+    }),
+  );
+
+  it.effect("keeps the next prompt out until a stop has dropped agent tracking", () =>
+    Effect.gen(function* () {
+      const release = yield* Deferred.make<void>();
+      const fixture = yield* makeFixture({ cancel: Deferred.await(release) });
+      yield* fixture.settleWithAgents("bg-1");
+      const cancel = yield* fixture.runtime.cancel.pipe(Effect.forkChild);
+      yield* Deferred.await(fixture.cancelling);
+      yield* fixture.agentEvent("subagent.completed", "bg-1");
+
+      const second = yield* fixture.promptNext;
+      yield* Effect.yieldNow;
+      assert.equal(yield* Queue.size(fixture.dispatched), 0);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(cancel);
+      yield* Queue.take(fixture.dispatched);
+      yield* fixture.accept;
+      yield* fixture.agentEvent("subagent.started", "bg-2");
+      yield* fixture.event("assistant.idle");
+      yield* Deferred.succeed(fixture.rpc, { stopReason: "end_turn" });
+      yield* Fiber.join(second);
+
+      yield* fixture.promptNext;
+      yield* Effect.yieldNow;
+      assert.equal(yield* Queue.size(fixture.dispatched), 0, "held behind running bg-2");
+    }),
+  );
+
   it.effect("releases a prompt whose last background agent finishes as it begins waiting", () =>
     Effect.gen(function* () {
       // Preempt the prompt fiber after every operation and land the completion
