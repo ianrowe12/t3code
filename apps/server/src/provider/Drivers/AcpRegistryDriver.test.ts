@@ -363,6 +363,59 @@ describe("acpRegistrySnapshotReadiness", () => {
     });
   });
 
+  it("keeps the discovered catalog when a live update reports no model selector", () => {
+    const configOptions = [
+      {
+        id: "reasoning_effort",
+        label: "Reasoning Effort",
+        type: "select" as const,
+        currentValue: "xhigh",
+        options: [{ id: "xhigh", label: "Extra High" }],
+      },
+    ];
+    const provider = buildCheckedAcpRegistrySnapshot({
+      ...identity,
+      settings: decodeSettings({ agentId: "github-copilot-cli" }),
+      checkedAt: "2026-09-24T18:12:36.340Z",
+      inspection: {
+        status: "ready",
+        agentId: "github-copilot-cli",
+        version: "1.0.83",
+        distribution: "npx",
+      },
+      probe: {
+        probe: {
+          instanceId: identity.instanceId,
+          ready: true,
+          icon: null,
+          authMethods: [],
+          models: [
+            { id: "auto", name: "Auto", description: null },
+            { id: "claude-opus-5.5", name: "Claude Opus 5.5", description: null },
+          ],
+          currentModelId: "auto",
+          configOptions,
+          sessionManagement: noSessionManagement,
+        },
+        slashCommands: [],
+        skills: [],
+      },
+    });
+
+    const refreshed = applyAcpRegistryLiveConfiguration(
+      provider,
+      { models: [], currentModelId: null, configOptions: [] },
+      [],
+      "github-copilot-cli",
+    );
+
+    expect(refreshed.models.map((model) => model.slug)).toEqual(["auto", "claude-opus-5.5"]);
+    expect(refreshed.models[0]?.isDefault).toBe(true);
+    expect(
+      refreshed.models[1]?.capabilities?.optionDescriptors?.map((option) => option.id),
+    ).toEqual(["reasoning_effort"]);
+  });
+
   it("maps registry inspection status to provider readiness", () => {
     expect(
       acpRegistrySnapshotReadiness({
