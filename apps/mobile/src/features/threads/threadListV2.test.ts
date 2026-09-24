@@ -144,7 +144,7 @@ describe("resolveThreadListV2Status", () => {
     expect(resolveThreadListV2Status(thread)).toBe("approval");
   });
 
-  it("reports waiting when presentation parks runtime idle for background tasks", () => {
+  it("reports background while background agents are still running", () => {
     expect(
       resolveThreadListV2Status(
         makeThread({
@@ -161,7 +161,7 @@ describe("resolveThreadListV2Status", () => {
           },
         }),
       ),
-    ).toBe("waiting");
+    ).toBe("background");
   });
 
   it("resolves ready for quiescent threads", () => {

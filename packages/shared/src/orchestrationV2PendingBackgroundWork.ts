@@ -11,11 +11,15 @@ const BACKGROUND_TURN_ITEM_TYPES = new Set<OrchestrationV2TurnItem["type"]>([
   "subagent",
 ]);
 
-const TERMINAL_TURN_ITEM_STATUSES = new Set<OrchestrationV2TurnItem["status"]>([
-  "completed",
-  "interrupted",
-  "failed",
-  "cancelled",
+/**
+ * Turn item statuses that still represent open work. `idle` is settled: ACP
+ * providers (Copilot, Antigravity) park a finished subagent at idle so it can
+ * be resumed with a follow-up, but nothing is running until that happens.
+ */
+const OPEN_TURN_ITEM_STATUSES = new Set<OrchestrationV2TurnItem["status"]>([
+  "pending",
+  "running",
+  "waiting",
 ]);
 
 /**
@@ -74,8 +78,8 @@ type PendingBackgroundWorkTurnItem = {
   readonly prompt?: string | undefined;
 };
 
-function isTerminalTurnItemStatus(status: OrchestrationV2TurnItem["status"]): boolean {
-  return TERMINAL_TURN_ITEM_STATUSES.has(status);
+function isOpenTurnItemStatus(status: OrchestrationV2TurnItem["status"]): boolean {
+  return OPEN_TURN_ITEM_STATUSES.has(status);
 }
 
 function isLatestRunSettledForBackgroundWait(
@@ -128,7 +132,8 @@ function nativeTaskIdFromTurnItem(item: PendingBackgroundWorkTurnItem): string {
  *
  * Sources:
  * - Provider-thread roster (Claude SDK background tasks)
- * - Nonterminal command_execution / dynamic_tool / subagent turn items
+ * - Open (pending/running/waiting) command_execution / dynamic_tool /
+ *   subagent turn items; idle subagents are resumable but not working
  *
  * Gated on latest root run settlement. Dedupes by native task ID. Excludes
  * the roster while any interruptible foreground run remains active. Excludes
@@ -191,7 +196,7 @@ export function derivePendingBackgroundWork(input: {
     if (!BACKGROUND_TURN_ITEM_TYPES.has(item.type)) {
       continue;
     }
-    if (isTerminalTurnItemStatus(item.status)) {
+    if (!isOpenTurnItemStatus(item.status)) {
       continue;
     }
     if (item.type === "dynamic_tool" && isPersistentDynamicToolInput(item.input)) {

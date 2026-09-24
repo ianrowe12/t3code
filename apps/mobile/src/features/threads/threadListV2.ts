@@ -11,6 +11,10 @@ import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell
 import { resolveThreadProviderStack } from "@t3tools/client-runtime/state/models";
 import { threadSearchMatchKey } from "@t3tools/client-runtime/state/thread-search";
 import {
+  resolveThreadCardStatus,
+  type ThreadCardStatus,
+} from "@t3tools/client-runtime/state/thread-card-status";
+import {
   sortActiveThreadsByOrderKey,
   resolveSettledThreadTimestamp,
   sortPinnedThreadsByOrderKey,
@@ -52,13 +56,12 @@ export function resolveThreadListV2ProviderDrivers(
  * Thread List v2 model, ported from the web sidebar v2
  * (apps/web/src/components/Sidebar.logic.ts + SidebarV2.tsx).
  *
- * Six visual states. Color distinguishes approval, input, active work, and
- * failures. Ready is the unlabeled resting state; waiting (runtime status "idle") is the agent
- * parked on open background tasks, grey like working rather than a false Done.
- * The orchestrator v2 presentation bridge parks runtime at idle when the
- * post-settlement background roster is nonempty.
+ * Status comes from the shared resolveThreadCardStatus so a row reads the
+ * same as the web sidebar. Color distinguishes approval, input, active work
+ * (including background agents the run will report back on), and failures.
+ * Ready is the unlabeled resting state.
  */
-export type ThreadListV2Status = "approval" | "input" | "working" | "waiting" | "failed" | "ready";
+export type ThreadListV2Status = ThreadCardStatus;
 export type ThreadListV2SwipeAction = "archive" | "settle" | "unsettle" | "snooze" | "unsnooze";
 
 export function resolveThreadListV2SnoozeMenuSelection(input: {
@@ -157,48 +160,20 @@ export function resolveThreadListV2Enabled(input: {
 }
 
 /**
- * Completed-but-not-yet-seen, mirroring the web sidebar's
- * hasUnseenCompletion. The visited watermark is server state
- * (thread.lastVisitedAt), so the marker agrees across web and mobile.
- * Never-visited threads count as read — a fresh environment must not light
- * up its whole history — and pre-tracking servers (field absent) never
- * report unread.
+ * Completed-but-not-yet-seen, shared with the web sidebar. The visited
+ * watermark is server state (thread.lastVisitedAt), so the marker agrees
+ * across web and mobile. Pre-tracking servers (field absent) never report
+ * unread.
  */
-export function threadHasUnseenCompletion(
-  thread: Pick<EnvironmentThreadShell, "latestRun" | "lastVisitedAt">,
-): boolean {
-  const completedAt = thread.latestRun?.completedAt;
-  if (!completedAt) return false;
-  const completedAtMs = Date.parse(completedAt);
-  if (Number.isNaN(completedAtMs)) return false;
-  if (!thread.lastVisitedAt) return false;
-  const lastVisitedAtMs = Date.parse(thread.lastVisitedAt);
-  if (Number.isNaN(lastVisitedAtMs)) return true;
-  return completedAtMs > lastVisitedAtMs;
-}
+export { threadHasUnseenCompletion } from "@t3tools/client-runtime/state/thread-card-status";
 
 export function resolveThreadListV2Status(
-  thread: Pick<EnvironmentThreadShell, "hasPendingApprovals" | "hasPendingUserInput" | "runtime">,
+  thread: Pick<
+    EnvironmentThreadShell,
+    "hasPendingApprovals" | "hasPendingUserInput" | "runtime" | "pendingBackgroundTasks"
+  >,
 ): ThreadListV2Status {
-  if (thread.hasPendingApprovals) {
-    return "approval";
-  }
-  if (thread.hasPendingUserInput) {
-    return "input";
-  }
-  if (
-    thread.runtime !== null &&
-    ["preparing", "queued", "starting", "running", "waiting"].includes(thread.runtime.status)
-  ) {
-    return "working";
-  }
-  if (thread.runtime?.status === "idle") {
-    return "waiting";
-  }
-  if (thread.runtime?.status === "failed") {
-    return "failed";
-  }
-  return "ready";
+  return resolveThreadCardStatus(thread);
 }
 
 /** NaN-safe Date.parse for sort comparators: a malformed timestamp must not

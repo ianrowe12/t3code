@@ -2499,6 +2499,122 @@ it.layer(TestLayer)("ProjectionStoreV2", (it) => {
     }),
   );
 
+  it.effect("does not report idle subagents as pending background work", () =>
+    Effect.gen(function* () {
+      const projectionStore = yield* ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("thread:projection-idle-subagent");
+      const runId = RunId.make("run:projection-idle-subagent");
+      const rootNodeId = NodeId.make("node:projection-idle-subagent:root");
+      const providerThreadId = ProviderThreadId.make("provider-thread:projection-idle-subagent");
+
+      yield* projectionStore.apply({
+        id: EventId.make("event:projection-idle-subagent:thread-created"),
+        type: "thread.created",
+        threadId,
+        occurredAt: now,
+        payload: {
+          createdBy: "user",
+          creationSource: "web",
+          id: threadId,
+          projectId: ProjectId.make("project:projection-idle-subagent"),
+          title: "Idle subagent",
+          providerInstanceId,
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          activeProviderThreadId: providerThreadId,
+          lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: null,
+          settledOverride: null,
+          settledAt: null,
+          lastVisitedAt: null,
+          deletedAt: null,
+        },
+      });
+      yield* projectionStore.apply({
+        id: EventId.make("event:projection-idle-subagent:run-created"),
+        type: "run.created",
+        threadId,
+        runId,
+        nodeId: rootNodeId,
+        driver,
+        occurredAt: now,
+        payload: {
+          id: runId,
+          threadId,
+          ordinal: 1,
+          providerInstanceId,
+          modelSelection,
+          providerThreadId,
+          userMessageId: MessageId.make("message:projection-idle-subagent:user"),
+          rootNodeId,
+          activeAttemptId: RunAttemptId.make("attempt:projection-idle-subagent"),
+          status: "completed",
+          requestedAt: now,
+          startedAt: now,
+          completedAt: now,
+          checkpointId: null,
+          contextHandoffId: null,
+        },
+      });
+      for (const [name, status] of [
+        ["idle", "idle"],
+        ["running", "running"],
+      ] as const) {
+        yield* projectionStore.apply({
+          id: EventId.make(`event:projection-idle-subagent:${name}-item`),
+          type: "turn-item.updated",
+          threadId,
+          runId,
+          nodeId: rootNodeId,
+          driver,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make(`turn-item:projection-idle-subagent:${name}`),
+            threadId,
+            runId,
+            nodeId: rootNodeId,
+            providerThreadId,
+            providerTurnId: null,
+            nativeItemRef: { driver, nativeId: `agent-${name}`, strength: "weak" },
+            parentItemId: null,
+            ordinal: name === "idle" ? 200 : 201,
+            status,
+            title: `${name} agent`,
+            startedAt: now,
+            completedAt: null,
+            updatedAt: now,
+            type: "subagent",
+            subagentId: NodeId.make(`node:projection-idle-subagent:${name}`),
+            origin: "provider_native",
+            driver,
+            providerInstanceId,
+            childThreadId: null,
+            prompt: `${name} agent`,
+            result: null,
+          },
+        });
+      }
+
+      // A finished Copilot agent parks at idle so it can take follow-ups;
+      // only the still-running agent is background work.
+      const expected = [
+        { taskId: "agent-running", description: "running agent", taskType: "subagent" },
+      ];
+      const shell = yield* projectionStore.getShellSnapshot();
+      const shellThread = shell.threads.find((entry) => entry.id === threadId);
+      assert.deepEqual(shellThread?.pendingBackgroundTasks, expected);
+      const threadShell = yield* projectionStore.getThreadShell(threadId);
+      assert.deepEqual(threadShell?.pendingBackgroundTasks, expected);
+    }),
+  );
+
   it.effect("keeps fork visible items stable after a source run is rolled back", () =>
     Effect.gen(function* () {
       const projectionStore = yield* ProjectionStoreV2;

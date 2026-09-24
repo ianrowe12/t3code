@@ -10,6 +10,13 @@ import type { SidebarProjectSortOrder, SidebarThreadSortOrder } from "@t3tools/c
 import type { AsyncResult } from "effect/unstable/reactivity";
 import { planPinnedReorder } from "@t3tools/client-runtime/state/thread-sort";
 import {
+  resolveThreadCardStatus,
+  threadCardStatusIsInFlight,
+  threadHasUnseenCompletion,
+  type ThreadCardStatus,
+  type ThreadCardStatusInput,
+} from "@t3tools/client-runtime/state/thread-card-status";
+import {
   getThreadSortTimestamp,
   resolveSettledThreadTimestamp,
   sortThreads,
@@ -535,7 +542,6 @@ export interface ThreadStatusPill {
     | "Completed"
     | "Pending Approval"
     | "Awaiting Input"
-    | "Waiting"
     | "Plan Ready";
   colorClass: string;
   dotClass: string;
@@ -547,7 +553,6 @@ const THREAD_STATUS_PRIORITY: Record<ThreadStatusPill["label"], number> = {
   "Awaiting Input": 4,
   Working: 3,
   Connecting: 3,
-  Waiting: 2.5,
   "Plan Ready": 2,
   Completed: 1,
 };
@@ -676,14 +681,7 @@ export function resolveThreadLastVisitedAt(
 }
 
 export function hasUnseenCompletion(thread: ThreadStatusInput): boolean {
-  if (!thread.latestRun?.completedAt) return false;
-  const completedAt = Date.parse(thread.latestRun.completedAt);
-  if (Number.isNaN(completedAt)) return false;
-  if (!thread.lastVisitedAt) return false;
-
-  const lastVisitedAt = Date.parse(thread.lastVisitedAt);
-  if (Number.isNaN(lastVisitedAt)) return true;
-  return completedAt > lastVisitedAt;
+  return threadHasUnseenCompletion(thread);
 }
 
 export function shouldClearThreadSelectionOnMouseDown(target: HTMLElement | null): boolean {
@@ -846,16 +844,15 @@ export function resolveThreadRowClassName(input: {
 }
 
 // ── Sidebar v2 status model ─────────────────────────────────────────
-// Six visual states, three colors: color is reserved for "act now"
-// (approval), "in motion" (working), and "broken" (failed). Ready is the
-// unlabeled resting state — the agent stopped and is waiting on the user,
-// whether it finished, asked a question, or proposed a plan. Waiting
-// (runtime status "idle") is the agent stopped with background tasks still
-// open: not the user's turn yet, so it renders grey like working, not as a
-// false Done.
+// Shared with mobile through resolveThreadCardStatus. Color is reserved for
+// "act now" (approval), "in motion" (working and background), and "broken"
+// (failed). Ready is the unlabeled resting state — the agent stopped and is
+// waiting on the user, whether it finished, asked a question, or proposed a
+// plan. Background is a settled run whose background agents are still
+// running; it reads as Working because the agent will report back.
 // Unread completion is tracked separately: it describes whether a ready
 // thread needs attention, not what the thread is currently doing.
-export type SidebarThreadStatus = "approval" | "input" | "working" | "waiting" | "failed" | "ready";
+export type SidebarThreadStatus = ThreadCardStatus;
 
 export function shouldRecedeSidebarThread(input: {
   status: SidebarThreadStatus;
@@ -865,59 +862,26 @@ export function shouldRecedeSidebarThread(input: {
   isSelected: boolean;
 }): boolean {
   if (input.isActive || input.isSelected) return false;
-  if (input.status === "working" || input.status === "waiting") return true;
+  if (threadCardStatusIsInFlight(input.status)) return true;
   if (input.status === "ready" || input.status === "approval" || input.status === "input") {
     return !input.isUnread && !input.isWoke;
   }
   return false;
 }
 
-type SidebarThreadStatusInput = Pick<
-  SidebarThreadSummary,
-  "hasPendingApprovals" | "hasPendingUserInput" | "runtime"
->;
-
-export function resolveSidebarThreadStatus(thread: SidebarThreadStatusInput): SidebarThreadStatus {
-  if (thread.hasPendingApprovals) {
-    return "approval";
-  }
-  if (thread.hasPendingUserInput) {
-    return "input";
-  }
-  if (
-    thread.runtime !== null &&
-    ["preparing", "queued", "starting", "running", "waiting"].includes(thread.runtime.status)
-  ) {
-    return "working";
-  }
-  if (thread.runtime?.status === "idle") {
-    return "waiting";
-  }
-  if (thread.runtime?.status === "failed") {
-    return "failed";
-  }
-  return "ready";
+export function resolveSidebarThreadStatus(thread: ThreadCardStatusInput): SidebarThreadStatus {
+  return resolveThreadCardStatus(thread);
 }
 
-export type SidebarV2TopStatusKind =
-  | "approval"
-  | "done"
-  | "failed"
-  | "input"
-  | "waiting"
-  | "woke"
-  | "working";
+export type SidebarV2TopStatusKind = "approval" | "done" | "failed" | "input" | "woke" | "working";
 
 export function resolveSidebarV2TopStatus(input: {
   readonly status: SidebarThreadStatus;
   readonly isUnread: boolean;
   readonly isWoke: boolean;
 }): SidebarV2TopStatusKind | null {
-  if (input.status === "working") {
+  if (threadCardStatusIsInFlight(input.status)) {
     return "working";
-  }
-  if (input.status === "waiting") {
-    return "waiting";
   }
   if (input.status === "approval") {
     return "approval";
@@ -1107,11 +1071,13 @@ export function resolveThreadStatusPill(input: {
     };
   }
 
+  // Background agents still running after the turn settled: the agent is
+  // working and will report back. Steady (no pulse) since no turn is open.
   if ((thread.pendingBackgroundTasks?.length ?? 0) > 0) {
     return {
-      label: "Waiting",
-      colorClass: "text-sidebar-muted-foreground",
-      dotClass: "bg-sidebar-muted-foreground",
+      label: "Working",
+      colorClass: "text-sky-600 dark:text-sky-300/80",
+      dotClass: "bg-sky-500 dark:bg-sky-300/80",
       pulse: false,
     };
   }
