@@ -259,7 +259,36 @@ export function applyAcpRegistryLiveConfiguration(
     ...snapshot,
     status: provider.enabled ? "ready" : provider.status,
     auth: { ...provider.auth, status: "authenticated" },
-    models: modelsFromDiscovery(configuration, customModels, agentId),
+    models: modelsFromDiscovery(
+      withKnownModelsWhenLiveListIsEmpty(provider, configuration),
+      customModels,
+      agentId,
+    ),
+  };
+}
+
+/**
+ * Some session updates (for example a `session/load` response without
+ * `configOptions`) carry no model selector. That means "not reported", not
+ * "no models", so keep the catalog already discovered for this instance
+ * instead of collapsing every picker to the "Default" placeholder.
+ */
+function withKnownModelsWhenLiveListIsEmpty(
+  provider: ServerProvider,
+  configuration: AcpRegistryLiveConfiguration,
+): AcpRegistryLiveConfiguration {
+  if (configuration.models.length > 0) return configuration;
+  const known = provider.models.filter((model) => !model.isCustom);
+  const onlyPlaceholder = known.length === 1 && known[0]?.slug === "default";
+  if (known.length === 0 || onlyPlaceholder) return configuration;
+  const previousOptions = known[0]?.capabilities?.optionDescriptors ?? [];
+  return {
+    models: known.map((model) => ({ id: model.slug, name: model.name, description: null })),
+    currentModelId: known.find((model) => model.isDefault)?.slug ?? null,
+    configOptions:
+      configuration.configOptions.length > 0
+        ? configuration.configOptions
+        : (previousOptions as AcpRegistryLiveConfiguration["configOptions"]),
   };
 }
 
