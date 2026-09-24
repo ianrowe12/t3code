@@ -21,7 +21,7 @@ import * as Stream from "effect/Stream";
 import * as Reactivity from "effect/unstable/reactivity/Reactivity";
 import * as Client from "effect/unstable/sql/SqlClient";
 import type { Connection } from "effect/unstable/sql/SqlConnection";
-import { SqlError, classifySqliteError } from "effect/unstable/sql/SqlError";
+import { LockTimeoutError, SqlError, classifySqliteError } from "effect/unstable/sql/SqlError";
 import * as Statement from "effect/unstable/sql/Statement";
 
 const ATTR_DB_SYSTEM_NAME = "db.system.name";
@@ -91,6 +91,25 @@ const checkNodeSqliteCompat = () => {
   return Effect.void;
 };
 
+// node:sqlite reports the SQLite result code as `errcode` (its `code` is always
+// ERR_SQLITE_ERROR), which `classifySqliteError` does not read. Without this,
+// SQLITE_BUSY/SQLITE_LOCKED surface as UnknownError and look non-retryable.
+const classifyNodeSqliteError = (
+  cause: unknown,
+  options: { readonly message: string; readonly operation: string },
+) => {
+  const errcode =
+    typeof cause === "object" && cause !== null && "errcode" in cause ? cause.errcode : undefined;
+  if (typeof errcode === "number") {
+    const primaryCode = errcode & 0xff;
+    // SQLITE_BUSY (5) and SQLITE_LOCKED (6), including extended codes.
+    if (primaryCode === 5 || primaryCode === 6) {
+      return new LockTimeoutError({ cause, ...options });
+    }
+  }
+  return classifySqliteError(cause, options);
+};
+
 const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
   options: SqliteClientConfig,
   openDatabase: () => NodeSqlite.DatabaseSync,
@@ -108,7 +127,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
       try: openDatabase,
       catch: (cause) =>
         new SqlError({
-          reason: classifySqliteError(cause, {
+          reason: classifyNodeSqliteError(cause, {
             message: "Failed to open database",
             operation: "open",
           }),
@@ -120,7 +139,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         try: () => db.close(),
         catch: (cause) =>
           new SqlError({
-            reason: classifySqliteError(cause, {
+            reason: classifyNodeSqliteError(cause, {
               message: "Failed to close database",
               operation: "close",
             }),
@@ -144,7 +163,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         try: () => db.prepare(sql),
         catch: (cause) =>
           new SqlError({
-            reason: classifySqliteError(cause, {
+            reason: classifyNodeSqliteError(cause, {
               message: "Failed to prepare statement",
               operation: "prepare",
             }),
@@ -173,7 +192,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
         } catch (cause) {
           return Effect.fail(
             new SqlError({
-              reason: classifySqliteError(cause, {
+              reason: classifyNodeSqliteError(cause, {
                 message: "Failed to execute statement",
                 operation: "execute",
               }),
@@ -206,7 +225,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             },
             catch: (cause) =>
               new SqlError({
-                reason: classifySqliteError(cause, {
+                reason: classifyNodeSqliteError(cause, {
                   message: "Failed to execute statement",
                   operation: "execute",
                 }),
@@ -221,7 +240,7 @@ const makeWithDatabase = Effect.fn("makeWithDatabase")(function* (
             },
             catch: (cause) =>
               new SqlError({
-                reason: classifySqliteError(cause, {
+                reason: classifyNodeSqliteError(cause, {
                   message: "Failed to reset statement result mode",
                   operation: "resetResultMode",
                 }),

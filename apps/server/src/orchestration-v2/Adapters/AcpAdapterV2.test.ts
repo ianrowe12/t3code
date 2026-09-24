@@ -4930,6 +4930,134 @@ describe("AcpAdapterV2", () => {
     }).pipe(Effect.provide(testLayer), Effect.scoped),
   );
 
+  // Each prompt blocks on a permission request, like an agent that was waiting
+  // for approval when its run was failed underneath it.
+  const openPermissionBlockedSession = (key: string) =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const idAllocator = yield* IdAllocatorV2;
+      const path = yield* Path.Path;
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      const protocolEvents = yield* Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>();
+      const instanceId = ProviderInstanceId.make("acp-test");
+      const adapter = makeAcpAdapterV2({
+        crypto: yield* Crypto.Crypto,
+        instanceId,
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          makeRuntime: makeMockRuntime({
+            childProcessSpawner,
+            mockAgentPath,
+            environment: { T3_ACP_EMIT_TOOL_CALLS: "1" },
+            protocolEvents,
+          }),
+        },
+        fileSystem: yield* FileSystem.FileSystem,
+        idAllocator,
+        serverConfig: yield* ServerConfig,
+      });
+      const threadId = ThreadId.make(`thread-acp-${key}`);
+      const runtimePolicy = ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const modelSelection = { instanceId, model: "default" } as const;
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make(`provider-session-acp-${key}`),
+        modelSelection,
+        runtimePolicy,
+      });
+      const events = yield* Queue.unbounded<ProviderAdapterV2Event>();
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) => Queue.offer(events, event)),
+        Effect.forkScoped,
+      );
+      const providerThread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const now = yield* DateTime.now;
+      const turnInput = (ordinal: number, priorRunsSettled = false) => ({
+        ...makeTurnInput({ threadId, providerThread, instanceId, runtimePolicy, now, ordinal }),
+        ...(priorRunsSettled ? { priorRunsSettled } : {}),
+      });
+      const takeUntil = (predicate: (event: ProviderAdapterV2Event) => boolean) =>
+        Effect.gen(function* () {
+          const seen: Array<ProviderAdapterV2Event> = [];
+          while (true) {
+            const event = yield* Queue.take(events);
+            seen.push(event);
+            if (predicate(event)) return seen;
+          }
+        });
+      const awaitPendingRequest = takeUntil(
+        (event) =>
+          event.type === "runtime_request.updated" && event.runtimeRequest.status === "pending",
+      ).pipe(
+        Effect.map((seen) => {
+          const request = seen.at(-1);
+          if (request?.type !== "runtime_request.updated") {
+            throw new Error("Expected a pending permission request");
+          }
+          return request.runtimeRequest;
+        }),
+      );
+      return { runtime, turnInput, takeUntil, awaitPendingRequest, protocolEvents };
+    });
+
+  it.effect("interrupts a live turn left behind by an already settled run", () =>
+    Effect.gen(function* () {
+      const session = yield* openPermissionBlockedSession("orphaned-turn");
+      yield* session.runtime.startTurn(session.turnInput(1));
+      const orphanedTurnId = (yield* session.awaitPendingRequest).providerTurnId;
+
+      // The orchestrator only starts run 2 once it has settled run 1.
+      yield* session.runtime.startTurn(session.turnInput(2, true));
+
+      const seen = yield* session.takeUntil(
+        (event) =>
+          event.type === "provider_turn.updated" &&
+          event.providerTurn.status === "running" &&
+          event.providerTurn.id !== orphanedTurnId,
+      );
+      const orphanedTerminal = seen.find(
+        (event) => event.type === "turn.terminal" && event.providerTurnId === orphanedTurnId,
+      );
+      assert.equal(
+        orphanedTerminal?.type === "turn.terminal" && orphanedTerminal.status,
+        "interrupted",
+      );
+      const nextRequest = yield* session.awaitPendingRequest;
+      assert.notEqual(nextRequest.providerTurnId, orphanedTurnId);
+    }).pipe(Effect.provide(testLayer), Effect.scoped),
+  );
+
+  it.effect("still rejects overlapping starts unless the prior run is settled", () =>
+    Effect.gen(function* () {
+      const session = yield* openPermissionBlockedSession("duplicate-start");
+      yield* session.runtime.startTurn(session.turnInput(1));
+      yield* session.awaitPendingRequest;
+
+      for (const overlapping of [session.turnInput(1, true), session.turnInput(2)]) {
+        const overlapExit = yield* Effect.exit(session.runtime.startTurn(overlapping));
+        assert.isTrue(Exit.isFailure(overlapExit));
+        if (Exit.isFailure(overlapExit)) {
+          const rendered = Cause.pretty(overlapExit.cause);
+          assert.include(rendered, "ProviderAdapterTurnStartError");
+          assert.include(rendered, "is still active");
+        }
+      }
+      const methods = yield* pollProtocolMethods(session.protocolEvents);
+      assert.notInclude(methods, "session/cancel");
+    }).pipe(Effect.provide(testLayer), Effect.scoped),
+  );
+
   it.effect("finalizes a settled turn held open for background work when interrupted", () =>
     Effect.gen(function* () {
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;

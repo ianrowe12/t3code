@@ -43,6 +43,7 @@ import {
   TurnItemPositionStoreV2,
   layer as turnItemPositionStoreLayer,
 } from "./TurnItemPositionStore.ts";
+import { retryTransactionOnSqliteLock } from "../persistence/SqliteLockRetry.ts";
 
 /**
  * ERRORS
@@ -197,6 +198,13 @@ const baseLayer: Layer.Layer<
     const turnItemPositions = yield* TurnItemPositionStoreV2;
     const liveEvents = yield* PubSub.unbounded<OrchestrationV2StoredEvent>();
 
+    // Transaction bodies below only touch SQL (no in-memory state), and every
+    // publish happens after commit, so a rolled-back attempt can be rerun.
+    const withRetriedTransaction = <A, E, R>(operation: string, effect: Effect.Effect<A, E, R>) =>
+      sql
+        .withTransaction(effect)
+        .pipe(retryTransactionOnSqliteLock(sql, `orchestrationV2.EventSink.${operation}`));
+
     // A user can answer after terminal normalization reads the pending request.
     // Recheck inside the write transaction so stale cleanup cannot erase answers.
     const guardUserInputCancellations = (events: ReadonlyArray<OrchestrationV2DomainEvent>) =>
@@ -304,7 +312,8 @@ const baseLayer: Layer.Layer<
         "orchestration_v2.thread_id": input.events[0]?.threadId ?? null,
       });
 
-      const storedEvents = yield* sql.withTransaction(
+      const storedEvents = yield* withRetriedTransaction(
+        "write",
         Effect.gen(function* () {
           const normalized = yield* normalizeEvents(
             input.guardPendingUserInputCancellations === true
@@ -337,7 +346,8 @@ const baseLayer: Layer.Layer<
           "orchestration_v2.thread_id": input.threadId,
         });
 
-        const result = yield* sql.withTransaction(
+        const result = yield* withRetriedTransaction(
+          "writeIfRunCurrent",
           Effect.gen(function* () {
             const rows = yield* sql<{
               readonly status: string;
@@ -396,7 +406,8 @@ const baseLayer: Layer.Layer<
         "orchestration_v2.expected_last_run_ordinal": input.expectedLastRunOrdinal,
       });
 
-      const result = yield* sql.withTransaction(
+      const result = yield* withRetriedTransaction(
+        "writeIfProviderThreadOwner",
         Effect.gen(function* () {
           const rows = yield* sql<{
             readonly active_attempt_id: string | null;
@@ -462,7 +473,8 @@ const baseLayer: Layer.Layer<
     const commitCommandEffect = Effect.fn("orchestrationV2.EventSink.commitCommand")(function* (
       input: Parameters<EventSinkV2Shape["commitCommand"]>[0],
     ) {
-      const result = yield* sql.withTransaction(
+      const result = yield* withRetriedTransaction(
+        "commitCommand",
         Effect.gen(function* () {
           const reserved = yield* commandReceipts.insertIfAbsent({
             commandId: input.commandId,
@@ -530,7 +542,8 @@ const baseLayer: Layer.Layer<
     const commitRejectedCommandEffect = Effect.fn(
       "orchestrationV2.EventSink.commitRejectedCommand",
     )(function* (input: Parameters<EventSinkV2Shape["commitRejectedCommand"]>[0]) {
-      return yield* sql.withTransaction(
+      return yield* withRetriedTransaction(
+        "commitRejectedCommand",
         Effect.gen(function* () {
           const sequence = yield* eventStore.latestSequence({ threadId: input.threadId });
           const receipt: CommandReceiptV2 = {

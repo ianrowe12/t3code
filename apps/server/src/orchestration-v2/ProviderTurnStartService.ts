@@ -36,6 +36,7 @@ import {
   selectInheritedBackgroundTurnItems,
 } from "./RunExecutionService.ts";
 import { RuntimePolicyV2 } from "./RuntimePolicy.ts";
+import { isActiveRun } from "./ThreadManagementService.ts";
 
 export class ProviderTurnStartError extends Schema.TaggedError<ProviderTurnStartError>()(
   "ProviderTurnStartError",
@@ -664,6 +665,9 @@ export const layer: Layer.Layer<
               .filter((turn) => turn.providerThreadId === providerThread.id)
               .map((turn) => turn.ordinal),
           ) + 1,
+        priorRunsSettled: projection.runs.every(
+          (candidate) => candidate.id === run.id || !isActiveRun(candidate),
+        ),
         shouldStartProviderTurn: () => isCurrentAttemptInStatus("running"),
         shouldFinalizeRun: () =>
           projectionStore.getThreadProjection(projection.thread.id).pipe(

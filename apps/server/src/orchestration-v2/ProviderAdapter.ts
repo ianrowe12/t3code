@@ -403,6 +403,12 @@ export interface ProviderAdapterV2TurnInput {
   readonly message: ProviderAdapterV2TurnMessage;
   readonly modelSelection: ModelSelection;
   readonly runtimePolicy: ProviderAdapterV2RuntimePolicy;
+  /**
+   * Set by the orchestrator when every other run on this app thread is
+   * settled. A provider turn the adapter still holds for an older run on the
+   * same thread is then orphaned and may be interrupted to make room.
+   */
+  readonly priorRunsSettled?: boolean;
 }
 
 export interface ProviderAdapterV2SteerInput {
