@@ -29,6 +29,7 @@ import { layer as legacyV1ThreadImporterLayer } from "./LegacyV1ThreadImporter.t
 import { layer as orchestratorLayer } from "./Orchestrator.ts";
 import { layer as projectionStoreLayer } from "./ProjectionStore.ts";
 import { layer as projectionMaintenanceLayer } from "./ProjectionMaintenance.ts";
+import { workerLive as projectionCompactionWorkerLive } from "./ProjectionCompactionWorker.ts";
 import { layerFromProviderInstanceRegistry as providerAdapterRegistryLayerFromProviderInstances } from "./ProviderAdapterRegistry.ts";
 import { layer as providerContinuationRequestsLayer } from "./ProviderContinuationRequests.ts";
 import { workerLive as providerContinuationWorkerLive } from "./ProviderContinuationService.ts";
@@ -73,6 +74,9 @@ const storesLayer = Layer.mergeAll(
 export const OrchestrationV2EventSinkLayerLive = eventSinkLayer.pipe(Layer.provide(storesLayer));
 const eventSinkProvided = OrchestrationV2EventSinkLayerLive;
 const projectionMaintenanceProvided = projectionMaintenanceLayer.pipe(Layer.provide(storesLayer));
+const projectionCompactionWorkerProvided = projectionCompactionWorkerLive.pipe(
+  Layer.provide(projectionMaintenanceProvided),
+);
 const legacyV1ThreadImporterProvided = legacyV1ThreadImporterLayer.pipe(
   Layer.provide(Layer.mergeAll(eventSinkProvided, eventStoreProvided)),
 );
@@ -296,5 +300,6 @@ export const OrchestrationV2ProductionLayerLive = Layer.mergeAll(
   threadLifecycleProvided,
   scheduledTaskProvided,
   providerContinuationWorkerProvided,
+  projectionCompactionWorkerProvided,
   agentSessionImporterProvided,
 ).pipe(Layer.provideMerge(OrchestrationLayerLive));

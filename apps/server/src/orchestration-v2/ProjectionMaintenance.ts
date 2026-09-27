@@ -238,7 +238,9 @@ export const layer: Layer.Layer<
      * Scan newest first to retain the newest state for each entity.
      * Page every event, including non-candidates: filtering before LIMIT could
      * still scan the entire history when superseded events are sparse.
-     * turn-item.updated stays intact because replay assigns positions on first write.
+     * turn-item.updated keeps its first update as well as its newest: replay
+     * upserts by id, so the first write fixes where the item sits, and the
+     * newest carries its final payload. Only updates in between are dropped.
      */
     const compactEventStore = Effect.gen(function* () {
       const bounds = yield* sql<{
@@ -253,6 +255,7 @@ export const layer: Layer.Layer<
       let throughReceiptRowId = bounds[0]?.receipt_row_id ?? 0;
       const retainedThreadIds = new Set<string>();
       const retainedEntityKeys = new Set<string>();
+      const oldestTurnItemSequences = new Map<string, number>();
       let deletedEventCount = 0;
       let deletedReceiptCount = 0;
 
@@ -274,7 +277,7 @@ export const layer: Layer.Layer<
             event.event_type,
             CASE
               WHEN event.application_event_version = 2
-                AND event.event_type IN ('message.updated', 'node.updated')
+                AND event.event_type IN ('message.updated', 'node.updated', 'turn-item.updated')
               THEN json_extract(event.payload_json, '$.id')
               ELSE NULL
             END AS entity_id,
@@ -307,6 +310,16 @@ export const layer: Layer.Layer<
               const key = encodeEntityKey([row.event_type, row.stream_id, row.entity_id]);
               if (retainedEntityKeys.has(key)) obsolete.push(row.sequence);
               else retainedEntityKeys.add(key);
+            } else if (row.event_type === "turn-item.updated") {
+              const key = encodeEntityKey([row.event_type, row.stream_id, row.entity_id]);
+              if (!retainedEntityKeys.has(key)) retainedEntityKeys.add(key);
+              else {
+                // Newest first: each older update demotes the previous oldest
+                // candidate to obsolete, so only the newest and the first survive.
+                const newerCandidate = oldestTurnItemSequences.get(key);
+                if (newerCandidate !== undefined) obsolete.push(newerCandidate);
+                oldestTurnItemSequences.set(key, row.sequence);
+              }
             }
           }
         }
