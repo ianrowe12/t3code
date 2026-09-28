@@ -582,11 +582,14 @@ describe("thread inbox delivery", () => {
       Effect.gen(function* () {
         const text = "Stop the CI wait and look at the new failure.";
         const waiting = yield* harness
-          .invoke("t3_inbox_wait", { timeoutMs: 10_000 })
+          .invoke("t3_inbox_wait", { timeoutMs: 20_000 })
           .pipe(Effect.forkChild);
         yield* Effect.sleep("100 millis");
+        const queuedAt = Date.now();
         const queuedRun = yield* harness.queueMessage("wait", text);
         const result = yield* Fiber.join(waiting);
+        // Woken by the queue event, not by the timeout or the periodic re-read.
+        expect(Date.now() - queuedAt).toBeLessThan(5_000);
 
         expect(result.isError).toBe(false);
         expect(result.structuredContent).toMatchObject({
