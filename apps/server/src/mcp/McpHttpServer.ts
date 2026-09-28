@@ -11,7 +11,7 @@ import * as Schema from "effect/Schema";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import type * as Types from "effect/Types";
-import { McpProtocol, McpSchema, McpServer, Tool } from "effect/unstable/ai";
+import { McpProtocol, McpSchema, McpServer, Tool, type Toolkit } from "effect/unstable/ai";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 
 import packageJson from "../../package.json" with { type: "json" };
@@ -29,6 +29,7 @@ import { AttachmentToolkit } from "./toolkits/attachment/tools.ts";
 import { AttachmentHandlersLive } from "./toolkits/attachment/handlers.ts";
 import { ThreadToolkit } from "./toolkits/thread/tools.ts";
 import { ThreadToolkitHandlersLive } from "./toolkits/thread/handlers.ts";
+import * as ThreadInbox from "./ThreadInbox.ts";
 import * as ThreadMetadataMcpService from "./ThreadMetadataMcpService.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
@@ -601,7 +602,64 @@ const registerDeviceScreenshot = Effect.fn("McpHttpServer.registerDeviceScreensh
   );
 });
 
-const PreviewStandardToolkitRegistrationLive = McpServer.toolkit(PreviewStandardToolkit).pipe(
+/**
+ * Registers a toolkit against whichever McpServer the caller provides, so the
+ * production layer can hand every toolkit the inbox-delivering server below.
+ */
+const registerToolkitLayer = <Tools extends Record<string, Tool.Any>>(
+  toolkit: Toolkit.Toolkit<Tools>,
+) => Layer.effectDiscard(McpServer.registerToolkit(toolkit));
+
+/** Tools that already read or change the queue themselves. */
+const isInboxExemptTool = (name: string) =>
+  name === "t3_inbox_wait" || name.startsWith("t3_queue_");
+
+/**
+ * Wraps McpServer.addTool so any T3 tool result from a live caller whose
+ * provider cannot steer also carries that thread's queued messages. A tool
+ * call is the one point where such a provider reads new input mid-turn.
+ */
+export const InboxDeliveryMcpServerLive = Layer.effect(
+  McpServer.McpServer,
+  Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const inbox = yield* ThreadInbox.ThreadInbox;
+    const appendInbox = (result: McpSchema.CallToolResult) =>
+      Effect.serviceOption(McpInvocationContext.McpInvocationContext).pipe(
+        Effect.flatMap((scope) =>
+          Option.isNone(scope) ? Effect.succeed(null) : inbox.piggyback(scope.value),
+        ),
+        Effect.map((delivery) =>
+          delivery === null
+            ? result
+            : new McpSchema.CallToolResult({
+                ...result,
+                content: [
+                  ...result.content,
+                  { type: "text", text: ThreadInbox.formatPiggybackBlock(delivery) },
+                ],
+              }),
+        ),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("mcp.thread-inbox.piggyback-failed", { cause }).pipe(Effect.as(result)),
+        ),
+      );
+    return McpServer.McpServer.of({
+      ...server,
+      addTool: (options) =>
+        server.addTool(
+          isInboxExemptTool(options.tool.name)
+            ? options
+            : {
+                ...options,
+                handle: (payload) => options.handle(payload).pipe(Effect.flatMap(appendInbox)),
+              },
+        ),
+    });
+  }),
+).pipe(Layer.provide(ThreadInbox.layer));
+
+const PreviewStandardToolkitRegistrationLive = registerToolkitLayer(PreviewStandardToolkit).pipe(
   Layer.provide(PreviewStandardToolkitHandlersLive),
 );
 
@@ -614,42 +672,43 @@ export const PreviewToolkitRegistrationLive = Layer.mergeAll(
   PreviewSnapshotRegistrationLive,
 );
 
-export const OrchestratorToolkitRegistrationLive = McpServer.toolkit(OrchestratorToolkit).pipe(
+export const OrchestratorToolkitRegistrationLive = registerToolkitLayer(OrchestratorToolkit).pipe(
   Layer.provide(OrchestratorToolkitHandlersLive),
   Layer.provide(OrchestratorMcpService.layer),
   Layer.provide(ThreadMetadataMcpService.layer),
 );
 
-export const ThreadToolkitRegistrationLive = McpServer.toolkit(ThreadToolkit).pipe(
+export const ThreadToolkitRegistrationLive = registerToolkitLayer(ThreadToolkit).pipe(
   Layer.provide(ThreadToolkitHandlersLive),
+  Layer.provide(ThreadInbox.layer),
 );
 
-const WorktreeToolkitRegistrationLive = McpServer.toolkit(WorktreeToolkit).pipe(
+const WorktreeToolkitRegistrationLive = registerToolkitLayer(WorktreeToolkit).pipe(
   Layer.provide(WorktreeToolkitHandlersLive),
   Layer.provide(WorktreeMcpService.layer),
 );
 
-const PreviewControlsRegistrationLive = McpServer.toolkit(PreviewControlsToolkit).pipe(
+const PreviewControlsRegistrationLive = registerToolkitLayer(PreviewControlsToolkit).pipe(
   Layer.provide(PreviewControlsHandlersLive),
 );
 
-const EnvironmentRegistrationLive = McpServer.toolkit(EnvironmentToolkit).pipe(
+const EnvironmentRegistrationLive = registerToolkitLayer(EnvironmentToolkit).pipe(
   Layer.provide(EnvironmentHandlersLive),
 );
 
-const ProjectRegistrationLive = McpServer.toolkit(ProjectToolkit).pipe(
+const ProjectRegistrationLive = registerToolkitLayer(ProjectToolkit).pipe(
   Layer.provide(ProjectHandlersLive),
 );
 
-const AttachmentRegistrationLive = McpServer.toolkit(AttachmentToolkit).pipe(
+const AttachmentRegistrationLive = registerToolkitLayer(AttachmentToolkit).pipe(
   Layer.provide(AttachmentHandlersLive),
 );
 
-export const PullRequestsToolkitRegistrationLive = McpServer.toolkit(PullRequestsToolkit).pipe(
+export const PullRequestsToolkitRegistrationLive = registerToolkitLayer(PullRequestsToolkit).pipe(
   Layer.provide(PullRequestsToolkitHandlersLive),
 );
 
-const DeviceStandardToolkitRegistrationLive = McpServer.toolkit(DeviceStandardToolkit).pipe(
+const DeviceStandardToolkitRegistrationLive = registerToolkitLayer(DeviceStandardToolkit).pipe(
   Layer.provide(DeviceStandardToolkitHandlersLive),
 );
 
@@ -680,4 +739,4 @@ export const layer = Layer.mergeAll(
   WorktreeToolkitRegistrationLive,
   PullRequestsToolkitRegistrationLive,
   DeviceToolkitRegistrationLive,
-).pipe(Layer.provideMerge(McpTransportLive));
+).pipe(Layer.provide(InboxDeliveryMcpServerLive), Layer.provideMerge(McpTransportLive));

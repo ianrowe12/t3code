@@ -2426,6 +2426,15 @@ export const OrchestrationV2Command = Schema.Union([
     queuedRunId: RunId,
     targetRunId: RunId,
   }),
+  // Records a queued message as read by the active run through a tool result
+  // (the MCP inbox), without a provider steer. The queued run is cancelled.
+  Schema.Struct({
+    type: Schema.Literal("queued-message.deliver-in-turn"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    queuedRunId: RunId,
+    targetRunId: RunId,
+  }),
   Schema.Struct({
     type: Schema.Literal("queued-run.reorder"),
     commandId: CommandId,

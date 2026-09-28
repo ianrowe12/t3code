@@ -21,6 +21,7 @@ import {
 import * as ProjectionSnapshotQuery from "../../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ScheduledTasks from "../../../scheduledTasks/ScheduledTaskService.ts";
 import { queuedRunsInDeliveryOrder } from "../../../orchestration-v2/QueuedRunOrder.ts";
+import { ThreadInbox } from "../../ThreadInbox.ts";
 import { ThreadToolkit } from "./tools.ts";
 
 function queueEntry(projection: OrchestrationV2ThreadProjection, runId: RunId, limit: number) {
@@ -266,6 +267,20 @@ export const ThreadToolkitHandlersLive = ThreadToolkit.toLayer({
       queuedRunId: input.queuedRunId,
       targetRunId: input.targetRunId,
     })),
+  t3_inbox_wait: (input) =>
+    Effect.gen(function* () {
+      const { scope, caller } = yield* readMutationCaller();
+      const inbox = yield* ThreadInbox;
+      if (caller.activeRunId === null) {
+        return { messages: [], notices: [], timedOut: true };
+      }
+      return yield* inbox.wait({
+        scope,
+        expectedRunId: caller.activeRunId,
+        timeoutMs: input.timeoutMs ?? 60_000,
+        includeNotices: input.includeNotices ?? true,
+      });
+    }),
   t3_thread_organize: (input) =>
     Effect.gen(function* () {
       const { threads, projection } = yield* readWritableThread(input.threadId);
