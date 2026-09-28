@@ -263,6 +263,46 @@ export function isNativeMaintenanceCommand(message: {
   );
 }
 
+/**
+ * Why a queued user or agent message cannot be carried into `targetRun` as text in a
+ * tool result, or null when it can. The MCP inbox and `queued-message.deliver-in-turn`
+ * share it so neither consumes input the running turn cannot honour.
+ */
+export function queuedMessageInTurnBlocker(input: {
+  readonly queuedRun: OrchestrationV2Run;
+  readonly message: {
+    readonly text: string;
+    readonly attachments: ReadonlyArray<ChatAttachment>;
+    readonly delegatedCompletion?: unknown;
+    readonly notification?: unknown;
+  };
+  readonly targetRun: OrchestrationV2Run;
+  readonly targetMessage:
+    | { readonly text: string; readonly attachments: ReadonlyArray<ChatAttachment> }
+    | undefined;
+}): string | null {
+  const { queuedRun, message, targetRun, targetMessage } = input;
+  if (message.delegatedCompletion !== undefined || message.notification !== undefined) {
+    return "Automatic completion deliveries keep their own delivery path.";
+  }
+  if (isNativeMaintenanceCommand(message)) {
+    return "Native maintenance commands must run as their own turn.";
+  }
+  if (message.attachments.length > 0) {
+    return "Messages with attachments must run as their own turn.";
+  }
+  if (queuedRun.sourcePlanRef !== undefined || queuedRun.restartContinuationOfRunId !== undefined) {
+    return "Plan and restart continuations must run as their own turn.";
+  }
+  if (!modelSelectionsEqual(queuedRun.modelSelection, targetRun.modelSelection)) {
+    return "The queued message asked for a different model selection.";
+  }
+  if (targetMessage !== undefined && isNativeMaintenanceCommand(targetMessage)) {
+    return "The target run is a maintenance command.";
+  }
+  return null;
+}
+
 const threadPullRequestLinksEqual = Schema.toEquivalence(Schema.NullOr(ThreadLinkedPullRequest));
 
 function commandThreadId(command: OrchestrationV2Command): ThreadId {
@@ -5975,21 +6015,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (queuedMessage === undefined) {
         return yield* reject(`Queued run ${queuedRun.id} has no message.`);
       }
-      if (
-        queuedMessage.delegatedCompletion !== undefined ||
-        queuedMessage.notification !== undefined
-      ) {
-        return yield* reject("Automatic completion deliveries keep their own delivery path.");
-      }
-      if (isNativeMaintenanceCommand(queuedMessage)) {
-        return yield* reject("Native maintenance commands must run as their own turn.");
-      }
       const targetRun = projection.runs.find((candidate) => candidate.id === command.targetRunId);
       if (targetRun === undefined || targetRun.status !== "running") {
         return yield* reject(`Target run ${command.targetRunId} is not running.`);
       }
       if (targetRun.rootNodeId === null) {
         return yield* reject(`Target run ${targetRun.id} has no root node.`);
+      }
+      const blocker = queuedMessageInTurnBlocker({
+        queuedRun,
+        message: queuedMessage,
+        targetRun,
+        targetMessage: projection.messages.find(
+          (candidate) => candidate.id === targetRun.userMessageId,
+        ),
+      });
+      if (blocker !== null) {
+        return yield* reject(blocker);
       }
       const providerTurn = projection.providerTurns.find(
         (candidate) =>

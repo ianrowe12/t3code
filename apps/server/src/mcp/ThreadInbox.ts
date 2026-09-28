@@ -21,12 +21,12 @@ import * as PubSub from "effect/PubSub";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
-import { isNativeMaintenanceCommand } from "../orchestration-v2/Orchestrator.ts";
+import { queuedMessageInTurnBlocker } from "../orchestration-v2/Orchestrator.ts";
 import { queuedRunsInDeliveryOrder } from "../orchestration-v2/QueuedRunOrder.ts";
 import { ThreadManagementService } from "../orchestration-v2/ThreadManagementService.ts";
 import type { McpInvocationScope } from "./McpInvocationContext.ts";
 
-/** Full text is returned up to this many characters per message. */
+/** Longer messages stay queued and run as their own turn, so nothing is consumed unseen. */
 export const INBOX_MESSAGE_TEXT_LIMIT = 16_000;
 const MAX_MESSAGES_PER_DELIVERY = 20;
 /** Hints seeded before the event subscription has settled are re-read once. */
@@ -38,7 +38,6 @@ export interface ThreadInboxMessage {
   readonly queuedRunId: RunId;
   readonly messageId: MessageId;
   readonly text: string;
-  readonly truncated: boolean;
   readonly createdBy: OrchestrationV2Actor;
   readonly creationSource: OrchestrationV2CreationSource;
 }
@@ -65,6 +64,8 @@ export interface ThreadInboxShape {
     readonly scope: McpInvocationScope;
     readonly timeoutMs: number;
     readonly includeNotices: boolean;
+    /** The caller's run; messages are consumed only into it. */
+    readonly expectedRunId: RunId;
   }) => Effect.Effect<ThreadInboxDelivery & { readonly timedOut: boolean }>;
   /**
    * Collect queued input for a tool result from a live caller whose provider
@@ -109,11 +110,9 @@ export function isEmptyDelivery(delivery: ThreadInboxDelivery): boolean {
   return delivery.messages.length === 0 && delivery.notices.length === 0;
 }
 
-function truncate(text: string): { readonly text: string; readonly truncated: boolean } {
-  const characters = Array.from(text);
-  return characters.length > INBOX_MESSAGE_TEXT_LIMIT
-    ? { text: characters.slice(0, INBOX_MESSAGE_TEXT_LIMIT).join(""), truncated: true }
-    : { text, truncated: false };
+function exceedsTextLimit(text: string): boolean {
+  if (text.length <= INBOX_MESSAGE_TEXT_LIMIT) return false;
+  return Array.from(text).length > INBOX_MESSAGE_TEXT_LIMIT;
 }
 
 function activeRunSteers(
@@ -160,9 +159,6 @@ export function formatPiggybackBlock(delivery: ThreadInboxDelivery): string {
         `--- message ${index + 1} of ${count} (from ${message.createdBy}, queued run ${message.queuedRunId}) ---`,
         message.text,
       );
-      if (message.truncated) {
-        lines.push(`[truncated at ${INBOX_MESSAGE_TEXT_LIMIT} characters]`);
-      }
     });
   }
   if (delivery.notices.length > 0) {
@@ -185,7 +181,15 @@ export const make = Effect.gen(function* () {
   const config = yield* ThreadInboxConfig;
   const layerScope = yield* Effect.scope;
   const signals = yield* PubSub.unbounded<ThreadId>();
-  const collectLock = yield* Semaphore.make(1);
+  // Per-thread: the invariant is one delivery at a time for a thread, not for the server.
+  const collectLocks = new Map<ThreadId, Semaphore.Semaphore>();
+  const lockFor = (threadId: ThreadId): Semaphore.Semaphore => {
+    const existing = collectLocks.get(threadId);
+    if (existing !== undefined) return existing;
+    const created = Semaphore.makeUnsafe(1);
+    collectLocks.set(threadId, created);
+    return created;
+  };
   const hints = new Map<ThreadId, ThreadHint>();
   let started = false;
   let settled = false;
@@ -290,9 +294,13 @@ export const make = Effect.gen(function* () {
 
   const collect = (
     scope: McpInvocationScope,
-    options: { readonly mode: "wait" | "piggyback"; readonly includeNotices: boolean },
+    options: {
+      readonly mode: "wait" | "piggyback";
+      readonly includeNotices: boolean;
+      readonly expectedRunId?: RunId;
+    },
   ): Effect.Effect<ThreadInboxDelivery> =>
-    collectLock
+    lockFor(scope.threadId)
       .withPermit(
         Effect.gen(function* () {
           const versionAtRead = hintFor(scope.threadId).version;
@@ -324,12 +332,27 @@ export const make = Effect.gen(function* () {
           const notices: Array<ThreadInboxNotice> = [];
           const messages: Array<ThreadInboxMessage> = [];
           const inert: Array<RunId> = [];
-          let blocked = targetRun === undefined || targetRun.rootNodeId === null;
+          // The target's state is transient, so it blocks delivery without marking runs inert.
+          const target =
+            targetRun === undefined ||
+            targetRun.rootNodeId === null ||
+            (options.expectedRunId !== undefined && targetRun.id !== options.expectedRunId)
+              ? undefined
+              : targetRun;
+          const targetMessage =
+            target === undefined
+              ? undefined
+              : current.messages.find((candidate) => candidate.id === target.userMessageId);
+          let blocked = false;
           for (const run of queuedRunsInDeliveryOrder(current)) {
             const message = current.messages.find(
               (candidate) => candidate.id === run.userMessageId,
             );
-            if (message === undefined) continue;
+            if (message === undefined) {
+              blocked = true;
+              inert.push(run.id);
+              continue;
+            }
             if (message.delegatedCompletion !== undefined || message.notification !== undefined) {
               if (hint.surfaced.has(run.id)) {
                 inert.push(run.id);
@@ -358,13 +381,18 @@ export const make = Effect.gen(function* () {
               );
               continue;
             }
+            if (target === undefined) continue;
             // Deliver in queue order; stop at the first message that must stay a turn of its own.
             if (
               blocked ||
-              targetRun === undefined ||
-              message.attachments.length > 0 ||
-              isNativeMaintenanceCommand(message) ||
-              messages.length >= MAX_MESSAGES_PER_DELIVERY
+              messages.length >= MAX_MESSAGES_PER_DELIVERY ||
+              exceedsTextLimit(message.text) ||
+              queuedMessageInTurnBlocker({
+                queuedRun: run,
+                message,
+                targetRun: target,
+                targetMessage,
+              }) !== null
             ) {
               blocked = true;
               inert.push(run.id);
@@ -376,7 +404,7 @@ export const make = Effect.gen(function* () {
                 commandId: yield* newCommandId,
                 threadId: scope.threadId,
                 queuedRunId: run.id,
-                targetRunId: targetRun.id,
+                targetRunId: target.id,
               })
               .pipe(
                 Effect.as(true),
@@ -390,13 +418,14 @@ export const make = Effect.gen(function* () {
               );
             if (!delivered) {
               blocked = true;
+              inert.push(run.id);
               continue;
             }
             hint.queued.delete(run.id);
             messages.push({
               queuedRunId: run.id,
               messageId: message.id,
-              ...truncate(message.text),
+              text: message.text,
               createdBy: message.createdBy,
               creationSource: message.creationSource,
             });
@@ -424,7 +453,7 @@ export const make = Effect.gen(function* () {
       return isEmptyDelivery(delivery) ? null : delivery;
     });
 
-  const wait: ThreadInboxShape["wait"] = ({ scope, timeoutMs, includeNotices }) =>
+  const wait: ThreadInboxShape["wait"] = ({ scope, timeoutMs, includeNotices, expectedRunId }) =>
     Effect.scoped(
       Effect.gen(function* () {
         yield* ensureStarted;
@@ -436,7 +465,7 @@ export const make = Effect.gen(function* () {
         });
         const startedAt = yield* Clock.currentTimeMillis;
         while (true) {
-          const delivery = yield* collect(scope, { mode: "wait", includeNotices });
+          const delivery = yield* collect(scope, { mode: "wait", includeNotices, expectedRunId });
           if (!isEmptyDelivery(delivery)) return { ...delivery, timedOut: false };
           const now = yield* Clock.currentTimeMillis;
           const remaining = timeoutMs - (now - startedAt);

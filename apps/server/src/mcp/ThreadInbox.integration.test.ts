@@ -49,6 +49,7 @@ import { makeProviderRegistryLayer } from "../provider/testUtils/providerRegistr
 import { ScheduledTaskService } from "../scheduledTasks/ScheduledTaskService.ts";
 import * as McpHttpServer from "./McpHttpServer.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
+import * as ThreadInbox from "./ThreadInbox.ts";
 
 const parentThreadId = ThreadId.make("thread:mcp-inbox-parent");
 const projectId = ProjectId.make("project:mcp-inbox");
@@ -311,7 +312,11 @@ interface Harness {
     name: string,
     args: Record<string, unknown>,
   ) => Effect.Effect<McpSchema.CallToolResult>;
-  readonly queueMessage: (suffix: string, text: string) => Effect.Effect<OrchestrationV2Run>;
+  readonly queueMessage: (
+    suffix: string,
+    text: string,
+    modelSelection?: ModelSelection,
+  ) => Effect.Effect<OrchestrationV2Run>;
   readonly queueDelegatedCompletion: (
     suffix: string,
   ) => Effect.Effect<{ readonly queuedRun: OrchestrationV2Run; readonly taskId: string }>;
@@ -447,7 +452,11 @@ function withInboxHarness<A, E>(
             Effect.map((projection) => projection.runs.find((candidate) => candidate.id === runId)),
             Effect.orDie,
           );
-        const queueMessage = (suffix: string, text: string) =>
+        const queueMessage = (
+          suffix: string,
+          text: string,
+          modelSelection: ModelSelection = parentSelection,
+        ) =>
           Effect.gen(function* () {
             const messageId = MessageId.make(`message:inbox:${suffix}`);
             yield* orchestrator.dispatch({
@@ -459,7 +468,7 @@ function withInboxHarness<A, E>(
               messageId,
               text,
               attachments: [],
-              modelSelection: parentSelection,
+              modelSelection,
               dispatchMode: { type: "queue_after_active" },
             });
             const queued = yield* waitForProjection(orchestrator, (projection) =>
@@ -595,7 +604,7 @@ describe("thread inbox delivery", () => {
 
         expect(result.isError).toBe(false);
         expect(result.structuredContent).toMatchObject({
-          messages: [{ queuedRunId: queuedRun.id, text, truncated: false, createdBy: "user" }],
+          messages: [{ queuedRunId: queuedRun.id, text, createdBy: "user" }],
           notices: [],
           timedOut: false,
         });
@@ -726,6 +735,44 @@ describe("thread inbox delivery", () => {
           (turn) => turn.threadId === parentThreadId && turn.text.startsWith("Delegated task"),
         );
         expect(deliveries).toHaveLength(1);
+      }),
+    ),
+  );
+
+  it.live("leaves a message sent for another model queued, with everything behind it", () =>
+    withInboxHarness("mcp-inbox-model", nonSteeringCapabilities, (harness) =>
+      Effect.gen(function* () {
+        const switched = yield* harness.queueMessage("model", "Answer this on the bigger model.", {
+          instanceId: parentInstanceId,
+          model: "gpt-5.5",
+        });
+        const behind = yield* harness.queueMessage("model-behind", "Then tidy up.");
+
+        const result = yield* harness.invoke("t3_thread_configuration", {});
+        expect(inboxBlocks(result)).toEqual([]);
+        const waited = yield* harness.invoke("t3_inbox_wait", { timeoutMs: 200 });
+        expect(waited.structuredContent).toEqual({ messages: [], notices: [], timedOut: true });
+        expect((yield* harness.run(switched.id))?.status).toBe("queued");
+        expect((yield* harness.run(behind.id))?.status).toBe("queued");
+      }),
+    ),
+  );
+
+  it.live("leaves a message over the text limit queued instead of consuming it cut short", () =>
+    withInboxHarness("mcp-inbox-limit", nonSteeringCapabilities, (harness) =>
+      Effect.gen(function* () {
+        const long = yield* harness.queueMessage(
+          "limit",
+          "x".repeat(ThreadInbox.INBOX_MESSAGE_TEXT_LIMIT + 1),
+        );
+        const behind = yield* harness.queueMessage("limit-behind", "Short follow-up.");
+
+        const result = yield* harness.invoke("t3_thread_configuration", {});
+        expect(inboxBlocks(result)).toEqual([]);
+        const waited = yield* harness.invoke("t3_inbox_wait", { timeoutMs: 200 });
+        expect(waited.structuredContent).toEqual({ messages: [], notices: [], timedOut: true });
+        expect((yield* harness.run(long.id))?.status).toBe("queued");
+        expect((yield* harness.run(behind.id))?.status).toBe("queued");
       }),
     ),
   );

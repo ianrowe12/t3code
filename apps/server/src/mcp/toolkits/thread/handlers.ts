@@ -269,10 +269,14 @@ export const ThreadToolkitHandlersLive = ThreadToolkit.toLayer({
     })),
   t3_inbox_wait: (input) =>
     Effect.gen(function* () {
-      const { scope } = yield* readMutationCaller();
+      const { scope, caller } = yield* readMutationCaller();
       const inbox = yield* ThreadInbox;
+      if (caller.activeRunId === null) {
+        return { messages: [], notices: [], timedOut: true };
+      }
       return yield* inbox.wait({
         scope,
+        expectedRunId: caller.activeRunId,
         timeoutMs: input.timeoutMs ?? 60_000,
         includeNotices: input.includeNotices ?? true,
       });

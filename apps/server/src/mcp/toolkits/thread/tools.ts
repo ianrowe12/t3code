@@ -122,7 +122,7 @@ const QueuePromoteTool = Tool.make("t3_queue_promote_to_steer", {
 const InboxWaitTool = Tool.make("t3_inbox_wait", {
   ...commandTool,
   description:
-    "Wait for new input sent to THIS thread while it is busy. Use this instead of a long sleep, a CI/deploy wait loop, or a polling script: it returns as soon as a user or agent message is queued for this thread (or a delegated-task/background completion notice arrives), otherwise after timeoutMs (default 60000, max 600000) with timedOut=true, so call it again to keep waiting. Returned messages are delivered into the current turn and removed from the queue, so they will not start a later turn; act on them now. Notices are listed once for awareness and still arrive as their own turn when this turn ends. Messages with attachments or provider commands such as /compact stay queued.",
+    "Wait for new input sent to THIS thread while it is busy. Use this instead of a long sleep, a CI/deploy wait loop, or a polling script: it returns as soon as a user or agent message is queued for this thread (or a delegated-task/background completion notice arrives), otherwise after timeoutMs (default 60000, max 600000) with timedOut=true, so call it again to keep waiting. Returned messages are delivered into the current turn and removed from the queue, so they will not start a later turn; act on them now. Notices are listed once for awareness and still arrive as their own turn when this turn ends. Messages with attachments, over 16000 characters, sent for a different model, or provider commands such as /compact stay queued and run as their own turn.",
   parameters: Schema.Struct({
     timeoutMs: Schema.optional(
       Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 600_000 })),
@@ -135,7 +135,6 @@ const InboxWaitTool = Tool.make("t3_inbox_wait", {
         queuedRunId: RunId,
         messageId: MessageId,
         text: Schema.String,
-        truncated: Schema.Boolean,
         createdBy: OrchestrationV2Actor,
         creationSource: OrchestrationV2CreationSource,
       }),
