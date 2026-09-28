@@ -20,6 +20,7 @@ import {
   ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -309,7 +310,7 @@ interface Harness {
   readonly invoke: (
     name: string,
     args: Record<string, unknown>,
-  ) => Effect.Effect<McpSchema.CallToolResult, unknown>;
+  ) => Effect.Effect<McpSchema.CallToolResult>;
   readonly queueMessage: (suffix: string, text: string) => Effect.Effect<OrchestrationV2Run>;
   readonly queueDelegatedCompletion: (
     suffix: string,
@@ -321,10 +322,10 @@ interface Harness {
  * Runs `body` against the production MCP registration with the inbox-delivering
  * server, while a parent turn on `parentCapabilities` stays open.
  */
-function withInboxHarness<A>(
+function withInboxHarness<A, E>(
   name: string,
   parentCapabilities: OrchestrationV2ProviderCapabilities,
-  body: (harness: Harness) => Effect.Effect<A, unknown>,
+  body: (harness: Harness) => Effect.Effect<A, E>,
 ) {
   return Effect.scoped(
     Effect.gen(function* () {
@@ -439,6 +440,7 @@ function withInboxHarness<A>(
             .pipe(
               Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
               Effect.provideService(McpSchema.McpServerClient, client),
+              Effect.orDie,
             );
         const run = (runId: RunId) =>
           orchestrator.getThreadProjection(parentThreadId).pipe(
@@ -568,7 +570,7 @@ const inboxBlocks = (result: McpSchema.CallToolResult) =>
   );
 
 /** Samples an absence repeatedly instead of trusting one sleep to outlast a late event. */
-const expectToStay = (check: Effect.Effect<void, unknown>) =>
+const expectToStay = (check: Effect.Effect<void>) =>
   Effect.gen(function* () {
     for (let sample = 0; sample < 4; sample += 1) {
       yield* Effect.sleep("50 millis");
@@ -585,11 +587,11 @@ describe("thread inbox delivery", () => {
           .invoke("t3_inbox_wait", { timeoutMs: 20_000 })
           .pipe(Effect.forkChild);
         yield* Effect.sleep("100 millis");
-        const queuedAt = Date.now();
+        const queuedAt = yield* Clock.currentTimeMillis;
         const queuedRun = yield* harness.queueMessage("wait", text);
         const result = yield* Fiber.join(waiting);
         // Woken by the queue event, not by the timeout or the periodic re-read.
-        expect(Date.now() - queuedAt).toBeLessThan(5_000);
+        expect((yield* Clock.currentTimeMillis) - queuedAt).toBeLessThan(5_000);
 
         expect(result.isError).toBe(false);
         expect(result.structuredContent).toMatchObject({
@@ -631,9 +633,9 @@ describe("thread inbox delivery", () => {
   it.live("t3_inbox_wait returns empty after the timeout when nothing is queued", () =>
     withInboxHarness("mcp-inbox-timeout", nonSteeringCapabilities, (harness) =>
       Effect.gen(function* () {
-        const startedAt = Date.now();
+        const startedAt = yield* Clock.currentTimeMillis;
         const result = yield* harness.invoke("t3_inbox_wait", { timeoutMs: 300 });
-        expect(Date.now() - startedAt).toBeGreaterThanOrEqual(290);
+        expect((yield* Clock.currentTimeMillis) - startedAt).toBeGreaterThanOrEqual(290);
         expect(result.structuredContent).toEqual({ messages: [], notices: [], timedOut: true });
       }),
     ),
