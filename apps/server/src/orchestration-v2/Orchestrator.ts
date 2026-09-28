@@ -252,7 +252,8 @@ function nextRunOrdinal(projection: OrchestrationV2ThreadProjection): number {
   return projection.runs.length + 1;
 }
 
-function isNativeMaintenanceCommand(message: {
+/** Provider-native slash commands that must run as their own turn. */
+export function isNativeMaintenanceCommand(message: {
   readonly text: string;
   readonly attachments: ReadonlyArray<ChatAttachment>;
 }): boolean {
@@ -298,6 +299,7 @@ function commandThreadId(command: OrchestrationV2Command): ThreadId {
     case "prepared-run.fail":
     case "run.interrupt":
     case "queued-message.promote-to-steer":
+    case "queued-message.deliver-in-turn":
     case "queued-run.reorder":
     case "queued-run.cancel":
     case "queued-run.edit":
@@ -5938,6 +5940,156 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       });
     });
 
+  /**
+   * The MCP inbox handed a queued message to the active run through a tool
+   * result. Record it where the agent read it, as a promoted steer, and retire
+   * the queued run so it never starts a later turn. No provider effect runs:
+   * the provider already has the text.
+   */
+  const dispatchQueuedMessageDeliverInTurn = (
+    command: Extract<OrchestrationV2Command, { readonly type: "queued-message.deliver-in-turn" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) =>
+    Effect.gen(function* () {
+      const reject = (cause: string) =>
+        new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause,
+        });
+      const projection = yield* projectionStore
+        .getThreadProjection(command.threadId)
+        .pipe(
+          Effect.mapError(() => new OrchestratorProjectionError({ threadId: command.threadId })),
+        );
+      if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null) {
+        return yield* reject(`Thread ${command.threadId} is not active.`);
+      }
+      const queuedRun = projection.runs.find((candidate) => candidate.id === command.queuedRunId);
+      if (queuedRun === undefined || queuedRun.status !== "queued") {
+        return yield* reject(`Queued run ${command.queuedRunId} is not queued.`);
+      }
+      const queuedMessage = projection.messages.find(
+        (candidate) => candidate.id === queuedRun.userMessageId,
+      );
+      if (queuedMessage === undefined) {
+        return yield* reject(`Queued run ${queuedRun.id} has no message.`);
+      }
+      if (
+        queuedMessage.delegatedCompletion !== undefined ||
+        queuedMessage.notification !== undefined
+      ) {
+        return yield* reject("Automatic completion deliveries keep their own delivery path.");
+      }
+      if (isNativeMaintenanceCommand(queuedMessage)) {
+        return yield* reject("Native maintenance commands must run as their own turn.");
+      }
+      const targetRun = projection.runs.find((candidate) => candidate.id === command.targetRunId);
+      if (targetRun === undefined || targetRun.status !== "running") {
+        return yield* reject(`Target run ${command.targetRunId} is not running.`);
+      }
+      if (targetRun.rootNodeId === null) {
+        return yield* reject(`Target run ${targetRun.id} has no root node.`);
+      }
+      const providerTurn = projection.providerTurns.find(
+        (candidate) =>
+          candidate.runAttemptId === targetRun.activeAttemptId && candidate.status === "running",
+      );
+      const queuedRootNode =
+        queuedRun.rootNodeId === null
+          ? undefined
+          : projection.nodes.find((candidate) => candidate.id === queuedRun.rootNodeId);
+      const queuedAttempt =
+        queuedRun.activeAttemptId === null
+          ? undefined
+          : projection.attempts.find((candidate) => candidate.id === queuedRun.activeAttemptId);
+
+      const now = yield* DateTime.now;
+      const emitEvent = emit(events, command);
+      yield* emitEvent({
+        type: "run.updated",
+        threadId: command.threadId,
+        runId: queuedRun.id,
+        ...(queuedRun.rootNodeId === null ? {} : { nodeId: queuedRun.rootNodeId }),
+        providerInstanceId: queuedRun.providerInstanceId,
+        occurredAt: now,
+        payload: { ...queuedRun, status: "cancelled", queuePosition: null, completedAt: now },
+      });
+      if (queuedAttempt !== undefined && queuedRootNode !== undefined) {
+        yield* emitEvent({
+          type: "run-attempt.updated",
+          threadId: command.threadId,
+          runId: queuedRun.id,
+          nodeId: queuedRootNode.id,
+          providerInstanceId: queuedRun.providerInstanceId,
+          occurredAt: now,
+          payload: { ...queuedAttempt, status: "cancelled", completedAt: now },
+        });
+      }
+      if (queuedRootNode !== undefined) {
+        yield* emitEvent({
+          type: "node.updated",
+          threadId: command.threadId,
+          runId: queuedRun.id,
+          nodeId: queuedRootNode.id,
+          providerInstanceId: queuedRun.providerInstanceId,
+          occurredAt: now,
+          payload: { ...queuedRootNode, status: "cancelled", completedAt: now },
+        });
+      }
+
+      const message: OrchestrationV2ConversationMessage = {
+        ...queuedMessage,
+        runId: targetRun.id,
+        nodeId: targetRun.rootNodeId,
+        updatedAt: now,
+      };
+      const turnItem: OrchestrationV2TurnItem = {
+        createdBy: queuedMessage.createdBy,
+        creationSource: queuedMessage.creationSource,
+        ...(queuedMessage.scheduledTaskId === undefined
+          ? {}
+          : { scheduledTaskId: queuedMessage.scheduledTaskId }),
+        id: idAllocator.derive.userTurnItem({ messageId: queuedMessage.id }),
+        threadId: command.threadId,
+        runId: targetRun.id,
+        nodeId: targetRun.rootNodeId,
+        providerThreadId: targetRun.providerThreadId,
+        providerTurnId: providerTurn?.id ?? null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: nextTurnItemOrdinal(projection),
+        status: "completed",
+        title: null,
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        type: "user_message",
+        messageId: queuedMessage.id,
+        inputIntent: "promoted_queued_to_steer",
+        text: queuedMessage.text,
+        attachments: queuedMessage.attachments,
+      };
+      yield* emitEvent({
+        type: "message.updated",
+        threadId: command.threadId,
+        runId: targetRun.id,
+        nodeId: targetRun.rootNodeId,
+        providerInstanceId: targetRun.providerInstanceId,
+        occurredAt: now,
+        payload: message,
+      });
+      yield* emitEvent({
+        type: "turn-item.updated",
+        threadId: command.threadId,
+        runId: targetRun.id,
+        nodeId: targetRun.rootNodeId,
+        providerInstanceId: targetRun.providerInstanceId,
+        occurredAt: now,
+        payload: turnItem,
+      });
+    });
+
   const dispatchQueuedRunReorder = (
     command: Extract<OrchestrationV2Command, { readonly type: "queued-run.reorder" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
@@ -7717,6 +7869,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "queued-message.promote-to-steer":
         yield* dispatchQueuedMessagePromoteToSteer(command, events, effects);
+        break;
+      case "queued-message.deliver-in-turn":
+        yield* dispatchQueuedMessageDeliverInTurn(command, events);
         break;
       case "queued-run.reorder":
         yield* dispatchQueuedRunReorder(command, events);
