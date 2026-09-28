@@ -703,7 +703,7 @@ describe("thread inbox delivery", () => {
             queuedRunId: queuedRun.id,
             targetRunId: harness.parentRun.id,
           })
-          .pipe(Effect.flip);
+          .pipe(Effect.match({ onFailure: (error) => error, onSuccess: () => "accepted" }));
         expect(rejected).toMatchObject({
           cause: expect.stringContaining("keep their own delivery path"),
         });
