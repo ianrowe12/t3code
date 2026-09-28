@@ -12,11 +12,14 @@ import {
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -175,6 +178,113 @@ export class EventSinkV2 extends Context.Service<EventSinkV2, EventSinkV2Shape>(
   "t3/orchestration-v2/EventSink/EventSinkV2",
 ) {}
 
+export const TURN_ITEM_PERSIST_THROTTLE_MS = 2_000;
+export const TURN_ITEM_PERSIST_THROTTLE_ENV = "T3CODE_TURN_ITEM_PERSIST_THROTTLE_MS";
+
+type TurnItemUpdatedDomainEvent = Extract<
+  OrchestrationV2DomainEvent,
+  { readonly type: "turn-item.updated" }
+>;
+type PendingStreamingTextUpdate = {
+  readonly key: string;
+  readonly event: TurnItemUpdatedDomainEvent;
+  readonly commandId?: CommandId;
+};
+
+function currentTurnItemPersistThrottleMs(): number {
+  const raw = process.env[TURN_ITEM_PERSIST_THROTTLE_ENV];
+  if (raw === undefined || raw.trim().length === 0) {
+    return TURN_ITEM_PERSIST_THROTTLE_MS;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : TURN_ITEM_PERSIST_THROTTLE_MS;
+}
+
+function isStreamingTextTurnItemUpdate(
+  event: OrchestrationV2DomainEvent,
+): event is TurnItemUpdatedDomainEvent {
+  if (event.type !== "turn-item.updated" || event.payload.status !== "running") return false;
+  switch (event.payload.type) {
+    case "assistant_message":
+    case "reasoning":
+      return event.payload.streaming;
+    default:
+      return false;
+  }
+}
+
+function isTerminalTextTurnItemUpdate(
+  event: OrchestrationV2DomainEvent,
+): event is TurnItemUpdatedDomainEvent {
+  if (event.type !== "turn-item.updated") return false;
+  switch (event.payload.type) {
+    case "assistant_message":
+    case "reasoning":
+      return event.payload.status !== "running" || !event.payload.streaming;
+    default:
+      return false;
+  }
+}
+
+function streamingTextTurnItemKey(event: TurnItemUpdatedDomainEvent): string {
+  return [
+    event.threadId,
+    event.payload.runId ?? event.runId ?? "",
+    event.payload.providerTurnId ?? "",
+    event.payload.id,
+  ].join("\u0000");
+}
+
+function terminalRunBoundary(input: OrchestrationV2DomainEvent): {
+  readonly threadId: ThreadId;
+  readonly runId?: RunId;
+  readonly providerTurnId?: string;
+} | null {
+  switch (input.type) {
+    case "provider-turn.updated":
+      return ["completed", "interrupted", "failed", "cancelled"].includes(input.payload.status)
+        ? {
+            threadId: input.threadId,
+            ...(input.runId === undefined || input.runId === null ? {} : { runId: input.runId }),
+            providerTurnId: input.payload.id,
+          }
+        : null;
+    case "run.updated":
+      return ["waiting", "completed", "interrupted", "failed", "cancelled", "rolled_back"].includes(
+        input.payload.status,
+      )
+        ? {
+            threadId: input.threadId,
+            runId: input.payload.id,
+          }
+        : null;
+    case "node.updated":
+      return ["completed", "interrupted", "failed", "cancelled"].includes(input.payload.status) &&
+        input.payload.runId !== null
+        ? {
+            threadId: input.threadId,
+            runId: input.payload.runId,
+          }
+        : null;
+    default:
+      return null;
+  }
+}
+
+function pendingUpdateMatchesBoundary(
+  pending: PendingStreamingTextUpdate,
+  boundary: NonNullable<ReturnType<typeof terminalRunBoundary>>,
+): boolean {
+  if (pending.event.threadId !== boundary.threadId) return false;
+  if (boundary.runId !== undefined && pending.event.payload.runId === boundary.runId) return true;
+  if (
+    boundary.providerTurnId !== undefined &&
+    pending.event.payload.providerTurnId === boundary.providerTurnId
+  )
+    return true;
+  return boundary.runId === undefined && boundary.providerTurnId === undefined;
+}
+
 /**
  * IMPLEMENTATIONS
  */
@@ -197,6 +307,11 @@ const baseLayer: Layer.Layer<
     const projectionStore = yield* ProjectionStoreV2;
     const turnItemPositions = yield* TurnItemPositionStoreV2;
     const liveEvents = yield* PubSub.unbounded<OrchestrationV2StoredEvent>();
+    const throttleScope = yield* Effect.scope;
+    const throttleMutex = yield* Semaphore.make(1);
+    const pendingStreamingTextUpdates = new Map<string, PendingStreamingTextUpdate>();
+    const lastStreamingTextPersistedAt = new Map<string, number>();
+    const scheduledStreamingTextFlushes = new Map<string, Fiber.Fiber<unknown, unknown>>();
 
     // Transaction bodies below only touch SQL (no in-memory state), and every
     // publish happens after commit, so a rolled-back attempt can be rerun.
@@ -336,6 +451,184 @@ const baseLayer: Layer.Layer<
       yield* PubSub.publishAll(liveEvents, storedEvents);
       return storedEvents;
     });
+
+    const cancelScheduledStreamingTextFlush = Effect.fn(
+      "orchestrationV2.EventSink.cancelScheduledStreamingTextFlush",
+    )(function* (key: string) {
+      const scheduled = scheduledStreamingTextFlushes.get(key);
+      if (scheduled === undefined) return;
+      scheduledStreamingTextFlushes.delete(key);
+      yield* Fiber.interrupt(scheduled).pipe(Effect.ignore);
+    });
+
+    const persistPendingStreamingTextUpdates = Effect.fn(
+      "orchestrationV2.EventSink.persistPendingStreamingTextUpdates",
+    )(function* (keys: ReadonlyArray<string>) {
+      const uniqueKeys = Array.from(new Set(keys));
+      const pending = uniqueKeys.flatMap((key) => {
+        const update = pendingStreamingTextUpdates.get(key);
+        return update === undefined ? [] : [update];
+      });
+      if (pending.length === 0) {
+        return [] as ReadonlyArray<OrchestrationV2StoredEvent>;
+      }
+
+      const storedEvents: Array<OrchestrationV2StoredEvent> = [];
+      const groups = new Map<
+        string,
+        {
+          readonly commandId?: CommandId;
+          readonly updates: Array<PendingStreamingTextUpdate>;
+        }
+      >();
+      for (const update of pending) {
+        const groupKey = update.commandId ?? "";
+        const existing = groups.get(groupKey);
+        if (existing === undefined) {
+          groups.set(groupKey, {
+            ...(update.commandId === undefined ? {} : { commandId: update.commandId }),
+            updates: [update],
+          });
+        } else {
+          existing.updates.push(update);
+        }
+      }
+
+      for (const group of groups.values()) {
+        const committed = yield* writeEffect({
+          ...(group.commandId === undefined ? {} : { commandId: group.commandId }),
+          events: group.updates.map((update) => update.event),
+          effects: [],
+        });
+        storedEvents.push(...committed);
+        const persistedAt = DateTime.toEpochMillis(yield* DateTime.now);
+        for (const update of group.updates) {
+          pendingStreamingTextUpdates.delete(update.key);
+          lastStreamingTextPersistedAt.set(update.key, persistedAt);
+          scheduledStreamingTextFlushes.delete(update.key);
+        }
+      }
+      return storedEvents;
+    });
+
+    const flushPendingStreamingTextUpdates = (keys: ReadonlyArray<string>) =>
+      throttleMutex.withPermits(1)(persistPendingStreamingTextUpdates(keys));
+
+    const scheduleStreamingTextFlush = Effect.fn(
+      "orchestrationV2.EventSink.scheduleStreamingTextFlush",
+    )(function* (key: string, delayMs: number) {
+      if (scheduledStreamingTextFlushes.has(key)) return;
+      const fiber = yield* Effect.sleep(Duration.millis(Math.max(1, delayMs))).pipe(
+        Effect.andThen(flushPendingStreamingTextUpdates([key])),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("failed to flush throttled streaming turn-item update", {
+            key,
+            cause,
+          }).pipe(Effect.andThen(Effect.sync(() => scheduledStreamingTextFlushes.delete(key)))),
+        ),
+        Effect.forkIn(throttleScope),
+      );
+      scheduledStreamingTextFlushes.set(key, fiber);
+    });
+
+    const dropPendingStreamingTextUpdate = Effect.fn(
+      "orchestrationV2.EventSink.dropPendingStreamingTextUpdate",
+    )(function* (key: string) {
+      pendingStreamingTextUpdates.delete(key);
+      yield* cancelScheduledStreamingTextFlush(key);
+    });
+
+    const flushPendingForTerminalBoundaries = Effect.fn(
+      "orchestrationV2.EventSink.flushPendingForTerminalBoundaries",
+    )(function* (events: ReadonlyArray<OrchestrationV2DomainEvent>) {
+      for (const event of events) {
+        if (isTerminalTextTurnItemUpdate(event)) {
+          yield* dropPendingStreamingTextUpdate(streamingTextTurnItemKey(event));
+        }
+      }
+
+      const boundaries = events.flatMap((event) => {
+        const boundary = terminalRunBoundary(event);
+        return boundary === null ? [] : [boundary];
+      });
+      if (boundaries.length === 0) {
+        return [] as ReadonlyArray<OrchestrationV2StoredEvent>;
+      }
+
+      const keys = Array.from(pendingStreamingTextUpdates.entries()).flatMap(([key, update]) =>
+        boundaries.some((boundary) => pendingUpdateMatchesBoundary(update, boundary)) ? [key] : [],
+      );
+      return yield* persistPendingStreamingTextUpdates(keys);
+    });
+
+    const writeWithStreamingTextThrottle = Effect.fn(
+      "orchestrationV2.EventSink.writeWithStreamingTextThrottle",
+    )(function* (input: Parameters<EventSinkV2Shape["writeWithEffects"]>[0]) {
+      const throttleMs = currentTurnItemPersistThrottleMs();
+      if (throttleMs === 0) {
+        return yield* writeEffect(input);
+      }
+
+      return yield* throttleMutex.withPermits(1)(
+        Effect.gen(function* () {
+          const flushed = yield* flushPendingForTerminalBoundaries(input.events);
+
+          if (input.effects.length > 0) {
+            const committed = yield* writeEffect(input);
+            return [...flushed, ...committed];
+          }
+
+          const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
+          const eventsToPersist: Array<OrchestrationV2DomainEvent> = [];
+          const persistedKeys: Array<string> = [];
+
+          for (const event of input.events) {
+            if (!isStreamingTextTurnItemUpdate(event)) {
+              eventsToPersist.push(event);
+              continue;
+            }
+
+            const key = streamingTextTurnItemKey(event);
+            const lastPersistedAt = lastStreamingTextPersistedAt.get(key);
+            if (lastPersistedAt === undefined || nowMs - lastPersistedAt >= throttleMs) {
+              yield* dropPendingStreamingTextUpdate(key);
+              eventsToPersist.push(event);
+              persistedKeys.push(key);
+              continue;
+            }
+
+            pendingStreamingTextUpdates.set(key, {
+              key,
+              event,
+              ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
+            });
+            yield* scheduleStreamingTextFlush(key, lastPersistedAt + throttleMs - nowMs);
+          }
+
+          if (eventsToPersist.length === 0) {
+            return flushed;
+          }
+
+          const committed = yield* writeEffect({ ...input, events: eventsToPersist });
+          const persistedAt = DateTime.toEpochMillis(yield* DateTime.now);
+          for (const key of persistedKeys) {
+            lastStreamingTextPersistedAt.set(key, persistedAt);
+          }
+          return [...flushed, ...committed];
+        }),
+      );
+    });
+
+    yield* Effect.addFinalizer(() =>
+      throttleMutex
+        .withPermits(1)(
+          Effect.gen(function* () {
+            const keys = Array.from(pendingStreamingTextUpdates.keys());
+            yield* persistPendingStreamingTextUpdates(keys);
+          }),
+        )
+        .pipe(Effect.ignoreCause({ log: true })),
+    );
 
     const writeIfRunCurrentEffect = Effect.fn("orchestrationV2.EventSink.writeIfRunCurrent")(
       function* (input: Parameters<EventSinkV2Shape["writeIfRunCurrent"]>[0]) {
@@ -633,7 +926,7 @@ const baseLayer: Layer.Layer<
 
     return EventSinkV2.of({
       write: (input) =>
-        writeEffect({ ...input, effects: [] }).pipe(
+        writeWithStreamingTextThrottle({ ...input, effects: [] }).pipe(
           Effect.mapError(
             (cause) =>
               new EventSinkWriteError({
@@ -644,7 +937,7 @@ const baseLayer: Layer.Layer<
           ),
         ),
       writeWithEffects: (input) =>
-        writeEffect(input).pipe(
+        writeWithStreamingTextThrottle(input).pipe(
           Effect.mapError(
             (cause) =>
               new EventSinkWriteError({
