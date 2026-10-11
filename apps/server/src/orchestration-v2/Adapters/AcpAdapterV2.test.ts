@@ -942,6 +942,15 @@ describe("AcpAdapterV2", () => {
 
       const switchToB = yield* Effect.exit(runtime.startTurn(turnInput(1, selectionB)));
       assert.isTrue(Exit.isFailure(switchToB), "the agent rejected B's mode step");
+      for (let retry = 0; retry < 2; retry += 1) {
+        const resume = yield* Effect.exit(
+          runtime.resumeThread({ providerThread, modelSelection: selectionB, runtimePolicy }),
+        );
+        assert.isTrue(
+          Exit.isFailure(resume),
+          "resume must retry rejected configuration, not report the partly configured session ready",
+        );
+      }
       yield* Queue.clear(protocolEvents);
 
       yield* runtime.startTurn(turnInput(2, selectionA));
