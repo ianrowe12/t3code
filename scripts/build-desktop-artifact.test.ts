@@ -336,6 +336,40 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     }),
   );
 
+  it.effect.each(["copilot", "ianrowe12"])(
+    "packages the %s fork identity without an upstream update feed",
+    (profile) =>
+      Effect.gen(function* () {
+        const config = yield* createBuildConfig(
+          "mac",
+          "dmg",
+          "0.0.46-ianrowe12.20261011.1",
+          false,
+          false,
+          undefined,
+          undefined,
+        );
+        assert.equal(
+          config.appId,
+          profile === "copilot" ? "com.ianrowe12.t3code.copilot" : "com.t3tools.t3code",
+        );
+        assert.equal(
+          config.productName,
+          profile === "copilot" ? "T3 Code Copilot" : "T3 Code (ianrowe12)",
+        );
+        assert.notProperty(config, "publish");
+      }).pipe(
+        Effect.provide(
+          ConfigProvider.layer(
+            ConfigProvider.fromEnv({
+              env: { T3CODE_DESKTOP_PROFILE: profile, GITHUB_REPOSITORY: "pingdotgg/t3code" },
+            }),
+          ),
+        ),
+        Effect.provide(NodeServices.layer),
+      ),
+  );
+
   it.effect("omits update feeds for pull request preview builds", () =>
     Effect.gen(function* () {
       const preview = yield* createBuildConfig(

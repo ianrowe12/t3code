@@ -39,6 +39,45 @@ const makeEnvironment = (
 ) => DesktopEnvironment.DesktopEnvironment.pipe(Effect.provide(layerEnvironment(overrides, env)));
 
 describe("DesktopEnvironment", () => {
+  it.effect.each(["copilot", "ianrowe12"] as const)(
+    "preserves the packaged %s fork profile independently of the upstream default",
+    (profile) =>
+      Effect.gen(function* () {
+        const environment = yield* makeEnvironment({
+          isPackaged: true,
+          t3codeDesktopProfile: profile,
+        });
+        const home = profile === "copilot" ? ".t3-copilot-desktop" : ".t3-ianrowe12";
+        const userData = profile === "copilot" ? "t3code-copilot" : "t3code";
+        assert.equal(environment.baseDir, `/Users/alice/${home}`);
+        assert.equal(environment.stateDir, `/Users/alice/${home}/userdata`);
+        assert.deepEqual(
+          environment.userDataDirectory,
+          Option.some(`/Users/alice/Library/Application Support/${userData}`),
+        );
+        const override = yield* makeEnvironment(
+          { isPackaged: true, t3codeDesktopProfile: profile },
+          { T3CODE_HOME: "/other/home", T3CODE_DESKTOP_USER_DATA_DIR: "/other/profile" },
+        );
+        assert.equal(override.baseDir, "/other/home");
+        assert.deepEqual(override.userDataDirectory, Option.some("/other/profile"));
+        const development = yield* makeEnvironment({ t3codeDesktopProfile: profile });
+        assert.equal(development.baseDir, "/Users/alice/.t3");
+        assert.deepEqual(development.userDataDirectory, Option.none());
+      }),
+  );
+
+  it.effect.each(["relative/profile", "~/profile", "/profile\0invalid"])(
+    "rejects the unsafe desktop profile override %s",
+    (value) =>
+      Effect.gen(function* () {
+        const error = yield* makeEnvironment({}, { T3CODE_DESKTOP_USER_DATA_DIR: value }).pipe(
+          Effect.flip,
+        );
+        assert.include(String(error), "T3CODE_DESKTOP_USER_DATA_DIR");
+      }),
+  );
+
   it.effect("derives state paths and development identity inside Effect", () =>
     Effect.gen(function* () {
       const environment = yield* makeEnvironment(

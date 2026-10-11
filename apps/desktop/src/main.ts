@@ -14,6 +14,9 @@ import * as NodeOS from "node:os";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 
 import * as Electron from "electron";
 
@@ -86,6 +89,13 @@ if (process.argv.includes("--version")) {
   Electron.app.exit(0);
 }
 
+const DesktopPackageMetadata = Schema.Struct({
+  t3codeDesktopProfile: Schema.optional(Schema.Literals(["copilot", "ianrowe12"])),
+});
+const decodeDesktopPackageMetadata = Schema.decodeEffect(
+  Schema.fromJsonString(DesktopPackageMetadata),
+);
+
 const layerDesktopEnvironment = Layer.unwrap(
   Effect.gen(function* () {
     const metadata = yield* Effect.service(ElectronApp.ElectronApp).pipe(
@@ -93,12 +103,28 @@ const layerDesktopEnvironment = Layer.unwrap(
     );
     const platform = yield* HostProcess.Platform;
     const processArch = yield* HostProcess.Architecture;
+    const t3codeDesktopProfile = metadata.isPackaged
+      ? yield* Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const packaged = yield* decodeDesktopPackageMetadata(
+            yield* fs.readFileString(path.join(metadata.appPath, "package.json")),
+          );
+          return packaged.t3codeDesktopProfile;
+        }).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ElectronApp.ElectronAppMetadataReadError({ property: "desktop-profile", cause }),
+          ),
+        )
+      : undefined;
     return DesktopEnvironment.layer({
       dirname: __dirname,
       homeDirectory: NodeOS.homedir(),
       platform,
       processArch,
       ...metadata,
+      ...(t3codeDesktopProfile === undefined ? {} : { t3codeDesktopProfile }),
     });
   }),
 );

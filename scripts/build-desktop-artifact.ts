@@ -946,6 +946,7 @@ interface StagePackageJson {
   readonly version: string;
   readonly buildVersion: string;
   readonly t3codeCommitHash: string;
+  readonly t3codeDesktopProfile?: "copilot" | "ianrowe12";
   readonly t3codeWebAuthn?: MacWebAuthnEntitlements;
   readonly private: true;
   readonly packageManager: string;
@@ -1683,6 +1684,11 @@ const BuildEnvConfig = Config.all({
   // WSL runtime.
   wslRuntime: Config.String("T3CODE_DESKTOP_WSL_RUNTIME").pipe(Config.option),
 });
+
+const DesktopProfileConfig = Config.schema(
+  Schema.Literals(["copilot", "ianrowe12"]),
+  "T3CODE_DESKTOP_PROFILE",
+).pipe(Config.option);
 
 const MockUpdateServerPortSchema = Schema.NumberFromString.check(
   Schema.isInt(),
@@ -2766,9 +2772,15 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   wslRuntimeBundled = false,
   arch?: typeof BuildArch.Type,
 ) {
+  const desktopProfile = yield* DesktopProfileConfig;
   const buildConfig: Record<string, unknown> = {
-    appId: DESKTOP_APP_ID,
-    productName: resolveDesktopProductName(version),
+    appId: Option.contains(desktopProfile, "copilot")
+      ? "com.ianrowe12.t3code.copilot"
+      : DESKTOP_APP_ID,
+    productName: Option.match(desktopProfile, {
+      onNone: () => resolveDesktopProductName(version),
+      onSome: (profile) => (profile === "copilot" ? "T3 Code Copilot" : "T3 Code (ianrowe12)"),
+    }),
     artifactName: "T3-Code-${version}-${arch}.${ext}",
     electronLanguages: [...DESKTOP_ELECTRON_LANGUAGES],
     files: [
@@ -2797,7 +2809,7 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
     ],
   };
   const updateChannel = resolveDesktopUpdateChannel(version);
-  if (!isDesktopPreviewVersion(version)) {
+  if (!isDesktopPreviewVersion(version) && Option.isNone(desktopProfile)) {
     const publishConfig = yield* resolveGitHubPublishConfig(updateChannel);
     if (publishConfig) {
       buildConfig.publish = [publishConfig];
@@ -3860,6 +3872,10 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     version: appVersion,
     buildVersion: appVersion,
     t3codeCommitHash: commitHash,
+    ...Option.match(yield* DesktopProfileConfig, {
+      onNone: () => ({}),
+      onSome: (t3codeDesktopProfile) => ({ t3codeDesktopProfile }),
+    }),
     // Read by apps/desktop/src/preview/Passkeys.ts; must match the signed entitlements.
     ...(macWebAuthn ? { t3codeWebAuthn: macWebAuthn } : {}),
     private: true,

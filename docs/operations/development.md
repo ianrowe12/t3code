@@ -21,6 +21,21 @@ Use `vp run dev` for server and web, or `vp run dev:desktop` for the Electron cl
 `dev:server` and `dev:web` start those processes separately.
 See the [mobile README](../../apps/mobile/README.md) for native builds and Metro.
 
+### Fork desktop packages
+
+Set `T3CODE_DESKTOP_PROFILE=copilot` or `ianrowe12` when building a fork desktop
+artifact. The package embeds its profile selection so normal Finder launches preserve
+the existing app identity, backend home, and Chromium profile without shell configuration.
+The Copilot profile uses `~/.t3-copilot-desktop` and `t3code-copilot`; the personal
+profile uses `~/.t3-ianrowe12` and `t3code`. Explicit `T3CODE_HOME` and absolute
+`T3CODE_DESKTOP_USER_DATA_DIR` overrides take precedence. Unpackaged builds retain
+upstream development defaults.
+
+Fork desktop packages omit automatic update feeds. The CLI release origin points to
+`ianrowe12/t3code`, not the official repository, so an upstream update cannot silently
+replace the fork's behavior. Deploy matching server, web, desktop, and native components
+together.
+
 Flags go directly after the task name, for example `vp run dev --home-dir /tmp/t3code-dev`.
 Add `--browser` to open a browser automatically.
 

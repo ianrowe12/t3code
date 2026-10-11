@@ -1,10 +1,10 @@
 {
   "name": "t3",
-  "version": "0.0.45",
+  "version": "0.0.46-ianrowe12.20261011.1",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pingdotgg/t3code",
+    "url": "https://github.com/ianrowe12/t3code",
     "directory": "apps/server"
   },
   "bin": {

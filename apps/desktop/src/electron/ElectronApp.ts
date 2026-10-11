@@ -12,12 +12,13 @@ export interface ElectronAppMetadata {
   readonly isPackaged: boolean;
   readonly resourcesPath: string;
   readonly runningUnderArm64Translation: boolean;
+  readonly t3codeDesktopProfile?: "copilot" | "ianrowe12";
 }
 
 export class ElectronAppMetadataReadError extends Schema.TaggedError<ElectronAppMetadataReadError>()(
   "ElectronAppMetadataReadError",
   {
-    property: Schema.Literals(["app-version", "app-path"]),
+    property: Schema.Literals(["app-version", "app-path", "desktop-profile"]),
     cause: Schema.Defect(),
   },
 ) {
@@ -116,7 +117,6 @@ export const make = ElectronApp.of({
           cause,
         }),
     });
-
     return {
       appVersion,
       appPath,

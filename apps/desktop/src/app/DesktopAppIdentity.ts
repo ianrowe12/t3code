@@ -85,9 +85,11 @@ export const make = Effect.gen(function* () {
     return commitHash;
   });
 
-  const userDataPath = DesktopUserData.resolveUserDataPath(environment).pipe(
-    Effect.provide(userDataContext),
-  );
+  const userDataPath = Option.match(environment.userDataDirectory, {
+    onSome: Effect.succeed,
+    onNone: () =>
+      DesktopUserData.resolveUserDataPath(environment).pipe(Effect.provide(userDataContext)),
+  });
 
   const configure = Effect.gen(function* () {
     const commitHash = yield* resolveAboutCommitHash;

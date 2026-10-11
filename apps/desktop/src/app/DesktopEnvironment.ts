@@ -10,6 +10,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import * as DesktopConfig from "./DesktopConfig.ts";
@@ -28,6 +29,7 @@ export interface MakeDesktopEnvironmentInput {
   readonly isPackaged: boolean;
   readonly resourcesPath: string;
   readonly runningUnderArm64Translation: boolean;
+  readonly t3codeDesktopProfile?: "copilot" | "ianrowe12";
 }
 
 export class DesktopEnvironment extends Context.Service<
@@ -44,6 +46,7 @@ export class DesktopEnvironment extends Context.Service<
     readonly resourcesPath: string;
     readonly homeDirectory: string;
     readonly appDataDirectory: string;
+    readonly userDataDirectory: Option.Option<string>;
     readonly baseDir: string;
     readonly stateDir: string;
     readonly desktopSettingsPath: string;
@@ -156,6 +159,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
   const homeDirectory = input.homeDirectory;
   const devServerUrl = config.devServerUrl;
   const isDevelopment = Option.isSome(devServerUrl);
+  const profile = input.isPackaged ? input.t3codeDesktopProfile : undefined;
   const appDataDirectory =
     input.platform === "win32"
       ? Option.getOrElse(config.appDataDirectory, () =>
@@ -164,10 +168,35 @@ const make = Effect.fn("desktop.environment.make")(function* (
       : input.platform === "darwin"
         ? path.join(homeDirectory, "Library", "Application Support")
         : Option.getOrElse(config.xdgConfigHome, () => path.join(homeDirectory, ".config"));
+  const t3Home = Option.orElse(config.t3Home, () =>
+    profile === undefined
+      ? Option.none()
+      : Option.some(
+          path.join(homeDirectory, profile === "copilot" ? ".t3-copilot-desktop" : ".t3-ianrowe12"),
+        ),
+  );
+  // oxlint-disable-next-line t3code/no-inline-schema-compile -- Absolute-path semantics depend on the injected Path service.
+  const userDataDirectory = yield* Schema.decodeEffect(
+    Schema.Option(
+      Schema.String.check(
+        Schema.makeFilter((value) => path.isAbsolute(value) && !value.includes("\0"), {
+          message: "T3CODE_DESKTOP_USER_DATA_DIR must be an absolute directory without null bytes",
+        }),
+      ),
+    ),
+  )(
+    Option.orElse(config.userDataDirectory, () =>
+      profile === undefined
+        ? Option.none()
+        : Option.some(
+            path.join(appDataDirectory, profile === "copilot" ? "t3code-copilot" : "t3code"),
+          ),
+    ),
+  ).pipe(Effect.mapError((cause) => new Config.ConfigError(cause)));
   const baseDir = resolveDesktopBaseDir({
     homeDirectory,
     joinPath: path.join,
-    t3Home: config.t3Home,
+    t3Home,
   });
   const rootDir = path.resolve(input.dirname, "../../..");
   const appRoot = input.isPackaged ? input.appPath : rootDir;
@@ -179,12 +208,17 @@ const make = Effect.fn("desktop.environment.make")(function* (
     isDevelopment,
     appVersion: input.appVersion,
   });
-  const displayName = branding.displayName;
+  const displayName =
+    profile === "copilot"
+      ? "T3 Code Copilot"
+      : profile === "ianrowe12"
+        ? "T3 Code (ianrowe12)"
+        : branding.displayName;
   const stateDir = resolveDesktopStateDir({
     baseDir,
     isDevelopment,
     joinPath: path.join,
-    t3Home: config.t3Home,
+    t3Home,
   });
   const linuxApplicationsDir = path.join(
     Option.getOrElse(config.xdgDataHome, () => path.join(homeDirectory, ".local", "share")),
@@ -204,6 +238,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
     resourcesPath,
     homeDirectory,
     appDataDirectory,
+    userDataDirectory,
     baseDir,
     stateDir,
     desktopSettingsPath: path.join(stateDir, "desktop-settings.json"),
@@ -236,7 +271,11 @@ const make = Effect.fn("desktop.environment.make")(function* (
     branding,
     displayName,
     appUserModelId: Option.getOrElse(config.appUserModelIdOverride, () =>
-      isDevelopment ? "com.t3tools.t3code.dev" : "com.t3tools.t3code",
+      profile === "copilot"
+        ? "com.ianrowe12.t3code.copilot"
+        : isDevelopment
+          ? "com.t3tools.t3code.dev"
+          : "com.t3tools.t3code",
     ),
     linuxDesktopEntryName: resolveLinuxDesktopEntryName(isDevelopment),
     linuxWmClass: isDevelopment ? "t3code-dev" : "t3code",

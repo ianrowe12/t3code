@@ -147,6 +147,24 @@ const withIdentity = <A, E, R>(
 };
 
 describe("DesktopAppIdentity", () => {
+  it.effect("uses a fork profile override without probing an unrelated legacy profile", () =>
+    withIdentity(
+      Effect.gen(function* () {
+        const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
+        assert.equal(yield* identity.resolveUserDataPath, "/Users/alice/personal-profile");
+      }),
+      {
+        environment: { env: { T3CODE_DESKTOP_USER_DATA_DIR: "/Users/alice/personal-profile" } },
+        legacyPathProbeError: PlatformError.systemError({
+          _tag: "PermissionDenied",
+          module: "FileSystem",
+          method: "exists",
+          description: "unrelated legacy profile is inaccessible",
+        }),
+      },
+    ),
+  );
+
   it.effect("isolates the V2 profile even when the legacy V1 profile exists", () =>
     withIdentity(
       Effect.gen(function* () {
