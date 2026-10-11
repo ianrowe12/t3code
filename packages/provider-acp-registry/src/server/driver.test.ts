@@ -176,6 +176,15 @@ describe("acpRegistrySnapshotReadiness", () => {
       nativeSessions: { canList: true, canLoad: true, canResume: true },
       models: [{ slug: "live-model", isDefault: true }],
     });
+    const omitted = applyAcpRegistryLiveConfiguration(
+      provider,
+      { models: [], currentModelId: null, configOptions: [] },
+      ["custom-model"],
+    );
+    expect(omitted.models.map((model) => model.slug)).toEqual(["probe-model", "custom-model"]);
+    expect(omitted.models[0]?.isDefault).toBe(true);
+    expect(omitted.models[1]?.isCustom).toBe(true);
+    expect(omitted.auth).toEqual(provider.auth);
   });
 
   it("maps registry inspection status to provider readiness", () => {

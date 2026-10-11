@@ -112,6 +112,12 @@ rename a thread, regenerate its title, or link and unlink a pull request. These 
 appear on web, desktop, and mobile without requiring the originating browser to remain
 open.
 
+Recurring scheduled tasks wait for their previous scheduled turn to finish before dispatching
+another occurrence, including after a server restart. A manual run reports an error while that
+turn is queued, starting, working, or waiting. Scheduled prompts bound to an existing thread
+queue behind its current work instead of interrupting it. Webhook deliveries keep their
+separate per-delivery queue behavior.
+
 ### Fold working threads (beta)
 
 Turn on **Settings → General → Working section (beta)** on web and desktop, or **Settings →

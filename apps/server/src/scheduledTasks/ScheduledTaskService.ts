@@ -773,6 +773,34 @@ export const layer = Layer.effect(
           if (reason !== null) return yield* new WebhookDeliverySkipped({ reason });
         }
 
+        if (trigger !== "webhook") {
+          const unfinished = yield* sql<{ readonly run_id: string }>`
+            SELECT run.run_id
+            FROM orchestration_v2_projection_runs AS run
+            JOIN orchestration_v2_projection_messages AS message ON message.run_id = run.run_id
+            JOIN orchestration_v2_projection_threads AS thread ON thread.thread_id = run.thread_id
+            WHERE thread.project_id = ${active.projectId} AND thread.deleted_at IS NULL
+              AND run.status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+              AND json_extract(message.payload_json, '$.scheduledTaskId') = ${active.id}
+            LIMIT 1
+          `.pipe(
+            Effect.mapError((cause) =>
+              taskError("Could not check the previous scheduled turn.", {
+                taskId: active.id,
+                cause,
+              }),
+            ),
+          );
+          if (unfinished.length > 0) {
+            if (trigger === "manual") {
+              return yield* taskError("The previous scheduled turn has not finished.", {
+                taskId: active.id,
+              });
+            }
+            return active;
+          }
+        }
+
         yield* markRunning(active.id, startedAtIso);
         yield* notifyChanged;
 

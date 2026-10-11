@@ -266,10 +266,27 @@ export function applyAcpRegistryLiveConfiguration(
   customModels: ReadonlyArray<string>,
 ): ServerProvider {
   const { message: _staleProbeMessage, ...snapshot } = provider;
+  const knownModels = provider.models.filter((model) => !model.isCustom);
+  const hasKnownCatalog =
+    knownModels.length > 0 && !(knownModels.length === 1 && knownModels[0]?.slug === "default");
+  const capabilities = createModelCapabilities({
+    optionDescriptors:
+      configuration.configOptions.length > 0
+        ? configuration.configOptions
+        : (knownModels[0]?.capabilities?.optionDescriptors ?? []),
+  });
+  const models =
+    configuration.models.length === 0 && hasKnownCatalog
+      ? providerModelsFromSettings(
+          knownModels.map((model) => ({ ...model, capabilities })),
+          customModels,
+          capabilities,
+        )
+      : modelsFromDiscovery(configuration, customModels);
   return {
     ...snapshot,
     status: provider.enabled ? "ready" : provider.status,
-    models: modelsFromDiscovery(configuration, customModels),
+    models,
   };
 }
 

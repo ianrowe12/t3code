@@ -80,6 +80,9 @@ Other settings the agent offers, such as reasoning effort or approval mode, appe
 composer's model options menu like they do for built-in providers. Agents with their own plan and
 build modes follow T3 Code's Plan and Build toggle. Models and options that change while an agent
 is running update the picker without waiting for another provider probe.
+If a live session omits its model list, T3 Code keeps the last discovered models and refreshes
+custom models instead of replacing the picker with a default placeholder. This does not change
+the agent's sign-in status.
 
 ## Commands and skills
 

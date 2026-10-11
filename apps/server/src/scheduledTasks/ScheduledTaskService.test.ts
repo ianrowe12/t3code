@@ -3,7 +3,7 @@ import * as NodeUtil from "node:util";
 
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { assert, it } from "@effect/vitest";
-import { ScheduledTaskError } from "@t3tools/contracts";
+import { ScheduledTaskError, ScheduledTaskId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -57,6 +57,87 @@ const insertRow = (
     last_run_error: null,
     run_count: 0,
   })}`;
+
+it.effect("does not dispatch another timer or manual run before its durable turn finishes", () =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const now = "2026-09-09T12:00:00.000Z";
+    yield* insertRow(sql, { id: "previous-turn", next: now, enabled: 1, status: "succeeded" }, now);
+    yield* sql`INSERT INTO orchestration_v2_projection_threads ${sql.insert({
+      thread_id: "thread:previous",
+      project_id: "project:test",
+      title: "Previous",
+      default_provider: "codex",
+      runtime_mode: "full-access",
+      interaction_mode: "default",
+      created_at: now,
+      updated_at: now,
+      payload_json: "{}",
+    })}`;
+    yield* sql`INSERT INTO orchestration_v2_projection_runs ${sql.insert({
+      run_id: "run:previous",
+      thread_id: "thread:previous",
+      ordinal: 1,
+      provider: "codex",
+      status: "running",
+      requested_at: now,
+      payload_json: "{}",
+    })}`;
+    yield* sql`INSERT INTO orchestration_v2_projection_messages ${sql.insert({
+      message_id: "message:previous",
+      thread_id: "thread:previous",
+      run_id: "run:previous",
+      role: "user",
+      streaming: 0,
+      created_at: now,
+      updated_at: now,
+      payload_json: '{"scheduledTaskId":"previous-turn"}',
+    })}`;
+    yield* TestClock.setTime(Date.parse(now) + 1_000);
+    let dispatched = 0;
+    const layer = ScheduledTaskService.layer.pipe(
+      Layer.provideMerge(
+        Layer.mergeAll(
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({
+            launch: () =>
+              Effect.sync(() => {
+                dispatched += 1;
+              }).pipe(Effect.andThen(Effect.die("test dispatch reached"))),
+          }),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({}),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          NodeCrypto.layer,
+          Scheduler.layer,
+        ),
+      ),
+    );
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const context = yield* Layer.build(layer);
+        const service = yield* ScheduledTaskService.ScheduledTaskService.pipe(
+          Effect.provide(context),
+        );
+        for (const status of ["queued", "preparing", "starting", "running", "waiting"]) {
+          yield* sql`UPDATE orchestration_v2_projection_runs SET status = ${status}`;
+          const error = yield* service
+            .runNow({ id: ScheduledTaskId.make("previous-turn") })
+            .pipe(Effect.flip);
+          assert.isTrue(isScheduledTaskError(error));
+          assert.equal(dispatched, 0);
+        }
+        yield* TestClock.adjust("6 seconds");
+        assert.equal(dispatched, 0);
+        const rows = yield* sql<{ readonly run_count: number }>`
+        SELECT run_count FROM scheduled_tasks WHERE task_id = 'previous-turn'
+      `;
+        assert.equal(rows[0]?.run_count, 0);
+        yield* sql`UPDATE orchestration_v2_projection_runs SET status = 'completed'`;
+        yield* service.runNow({ id: ScheduledTaskId.make("previous-turn") });
+        assert.equal(dispatched, 1);
+      }),
+    );
+  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
 
 it.effect("loads only due tasks and skips corrupt due rows without decoding settled tasks", () =>
   Effect.gen(function* () {
