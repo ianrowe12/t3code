@@ -25,6 +25,7 @@ import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 
 import * as ServerConfig from "../config.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import { acquireServerStateLock } from "../serverStateLock.ts";
 import * as RuntimeLayer from "../orchestration-v2/runtimeLayer.ts";
 import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
 import * as ProjectFaviconResolver from "../project/ProjectFaviconResolver.ts";
@@ -34,6 +35,7 @@ import { projectMutationOperation } from "../project/ProjectMutation.ts";
 import * as T3ProjectFileLoader from "../project/T3ProjectFileLoader.ts";
 import {
   clearPersistedServerRuntimeState,
+  isProcessAlive,
   readPersistedServerRuntimeState,
 } from "../serverRuntimeState.ts";
 import * as WorkspacePaths from "../workspace/WorkspacePaths.ts";
@@ -370,7 +372,10 @@ const tryResolveLiveProjectExecutionMode = Effect.fn("tryResolveLiveProjectExecu
       origin: runtimeState.value.origin,
       cause: attempted.failure,
     });
-    yield* clearPersistedServerRuntimeState(config.serverRuntimeStatePath);
+    if (isProcessAlive(runtimeState.value.pid)) {
+      return yield* Effect.fail(attempted.failure);
+    }
+    yield* clearPersistedServerRuntimeState(config.serverRuntimeStatePath, runtimeState.value);
     return Option.none<{ readonly origin: string }>();
   },
 );
@@ -416,6 +421,7 @@ const runProjectMutation = Effect.fn("runProjectMutation")(function* (
       );
     }
 
+    yield* acquireServerStateLock(config.stateDir);
     const layerOfflineRuntime = layerProjectCliRuntime.pipe(
       Layer.provide(ServerConfig.layer(config)),
       Layer.provide(Layer.succeed(References.MinimumLogLevel, minimumLogLevel)),
@@ -439,6 +445,7 @@ const runProjectMutation = Effect.fn("runProjectMutation")(function* (
         Layer.provide(Layer.succeed(References.MinimumLogLevel, minimumLogLevel)),
       ),
     ),
+    Effect.scoped,
   );
 });
 

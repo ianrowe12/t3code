@@ -9,6 +9,7 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodePath from "node:path";
+import { acquireDatabaseAccess, acquireStateLaunchGate } from "./serverStateOwnership.ts";
 
 import type {
   PendingServiceUpdate,
@@ -118,6 +119,9 @@ async function backupDatabaseOnce(baseDir: string, pending: PendingServiceUpdate
   const stagingDir = `${backupDir}.staging`;
   await NodeFSP.rm(stagingDir, { recursive: true, force: true });
   await NodeFSP.mkdir(stagingDir, { recursive: true, mode: 0o700 });
+  const releaseAccess = await acquireDatabaseAccess(NodePath.dirname(pending.dbPath), {
+    exclusive: true,
+  });
   try {
     for (const suffix of DB_FILE_SUFFIXES) {
       const source = `${pending.dbPath}${suffix}`;
@@ -131,6 +135,8 @@ async function backupDatabaseOnce(baseDir: string, pending: PendingServiceUpdate
   } catch (cause) {
     await NodeFSP.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
     throw cause;
+  } finally {
+    releaseAccess();
   }
 }
 
@@ -162,16 +168,23 @@ async function restoreDatabaseBackup(
   const backupDir = databaseBackupDir(baseDir, pending.id);
   if (!(await pathExists(backupDir))) return;
 
-  await markDatabaseRestorePending(backupDir);
-  for (const suffix of DB_FILE_SUFFIXES) {
-    const target = `${pending.dbPath}${suffix}`;
-    const source = databaseBackupFile(backupDir, suffix);
-    if (await pathExists(source)) {
-      await NodeFSP.copyFile(source, target);
-      await syncFile(target);
-    } else {
-      await NodeFSP.rm(target, { force: true });
+  const releaseAccess = await acquireDatabaseAccess(NodePath.dirname(pending.dbPath), {
+    exclusive: true,
+  });
+  try {
+    await markDatabaseRestorePending(backupDir);
+    for (const suffix of DB_FILE_SUFFIXES) {
+      const target = `${pending.dbPath}${suffix}`;
+      const source = databaseBackupFile(backupDir, suffix);
+      if (await pathExists(source)) {
+        await NodeFSP.copyFile(source, target);
+        await syncFile(target);
+      } else {
+        await NodeFSP.rm(target, { force: true });
+      }
     }
+  } finally {
+    releaseAccess();
   }
   await syncDirectory(NodePath.dirname(pending.dbPath));
 }
@@ -296,6 +309,7 @@ export class Launcher {
   }
 
   async run(): Promise<void> {
+    const releaseGate = await acquireStateLaunchGate(NodePath.join(this.#baseDir, "userdata"));
     const onSigterm = () => void this.stop("SIGTERM");
     const onSigint = () => void this.stop("SIGINT");
     process.once("SIGTERM", onSigterm);
@@ -306,6 +320,7 @@ export class Launcher {
     } finally {
       process.off("SIGTERM", onSigterm);
       process.off("SIGINT", onSigint);
+      releaseGate();
     }
   }
 
@@ -423,6 +438,7 @@ export class Launcher {
     const context: ServiceLauncherContext = {
       protocol: SERVICE_LAUNCHER_PROTOCOL,
       childVersion: version,
+      stateDir: NodePath.join(this.#baseDir, "userdata"),
       ...(update === undefined ? {} : { update }),
     };
     const spawnArguments = runtimeSpawnArguments(paths);

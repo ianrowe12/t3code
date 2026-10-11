@@ -1,8 +1,9 @@
 import type { ServerSelfUpdateOutcome } from "@t3tools/contracts";
 
-// Protocol 3 requires the standalone executable layout. Bump when runtimePaths
+// Protocol 4 combines the standalone layout with state ownership leases.
+// Bump when runtimePaths
 // or the installed runtime tree changes incompatibly; launchers survive self-updates.
-export const SERVICE_LAUNCHER_PROTOCOL = 3 as const;
+export const SERVICE_LAUNCHER_PROTOCOL = 4 as const;
 export const SERVICE_LAUNCHER_CONTEXT_ENV = "T3_SERVICE_LAUNCHER_CONTEXT";
 export const SERVICE_STATE_FILE = "service-state.json";
 /** Written by the launcher just before an explicit stop kills its child, so
@@ -35,6 +36,7 @@ export interface ServiceState {
 export interface ServiceLauncherContext {
   readonly protocol: typeof SERVICE_LAUNCHER_PROTOCOL;
   readonly childVersion: string;
+  readonly stateDir?: string;
   readonly update?: ServiceUpdateRecord;
 }
 
@@ -214,7 +216,9 @@ export function decodeServiceLauncherContext(value: string): ServiceLauncherCont
     !isRecord(parsed) ||
     parsed.protocol !== SERVICE_LAUNCHER_PROTOCOL ||
     typeof parsed.childVersion !== "string" ||
-    !isExactServiceVersion(parsed.childVersion)
+    !isExactServiceVersion(parsed.childVersion) ||
+    (parsed.stateDir !== undefined &&
+      (typeof parsed.stateDir !== "string" || parsed.stateDir.trim() === ""))
   ) {
     return undefined;
   }
@@ -232,6 +236,7 @@ export function decodeServiceLauncherContext(value: string): ServiceLauncherCont
   return {
     protocol: SERVICE_LAUNCHER_PROTOCOL,
     childVersion: parsed.childVersion,
+    ...(typeof parsed.stateDir === "string" ? { stateDir: parsed.stateDir } : {}),
     ...(update === undefined ? {} : { update }),
   };
 }

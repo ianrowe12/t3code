@@ -20,6 +20,8 @@ import {
   SERVICE_LAUNCHER_PROTOCOL,
 } from "../cloud/serviceProtocol.ts";
 import * as ServiceLauncherClient from "../cloud/serviceLauncherClient.ts";
+import { acquireRuntimeStateOwnership, acquireStateLaunchGate } from "../serverStateOwnership.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import {
   makePersistedServerRuntimeState,
   persistServerRuntimeState,
@@ -112,6 +114,22 @@ const captureStdout = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
     }),
   );
 
+const prepareGuardedServer = (stateDir: string) =>
+  Effect.gen(function* () {
+    yield* Effect.void.pipe(
+      Effect.provide(SqlitePersistence.layerFromPath(NodePath.join(stateDir, "statev2.sqlite"))),
+      Effect.scoped,
+    );
+    yield* Effect.acquireRelease(
+      Effect.tryPromise(() => acquireStateLaunchGate(stateDir)),
+      (release) => Effect.sync(release),
+    );
+    yield* Effect.acquireRelease(
+      Effect.tryPromise(() => acquireRuntimeStateOwnership(stateDir)),
+      (release) => Effect.sync(release),
+    );
+  });
+
 const testDescriptor = {
   environmentId: "pair-test-environment",
   label: "pair-test",
@@ -151,11 +169,13 @@ describe("t3 pair", () => {
         const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pair-test-"));
         const port = Number(new URL(origin).port);
         const statePath = NodePath.join(baseDir, "userdata", "server-runtime.json");
+        yield* prepareGuardedServer(NodePath.dirname(statePath));
         yield* persistServerRuntimeState({
           path: statePath,
           state: yield* makePersistedServerRuntimeState({
             config: { host: "127.0.0.1", devUrl: undefined },
             port,
+            stateLockVersion: 1,
           }),
         });
 
@@ -183,6 +203,7 @@ describe("t3 pair", () => {
         assert.deepEqual(credentials[0]?.scopes, AuthStandardClientScopes);
       }),
     ).pipe(
+      Effect.scoped,
       Effect.provide(NodeServices.layer),
       Effect.provideService(HostProcess.Environment, {
         ...process.env,
@@ -204,11 +225,13 @@ describe("t3 pair", () => {
     withDescriptorServer((origin) =>
       Effect.gen(function* () {
         const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pair-scopes-test-"));
+        yield* prepareGuardedServer(NodePath.join(baseDir, "userdata"));
         yield* persistServerRuntimeState({
           path: NodePath.join(baseDir, "userdata", "server-runtime.json"),
           state: yield* makePersistedServerRuntimeState({
             config: { host: "127.0.0.1", devUrl: undefined },
             port: Number(new URL(origin).port),
+            stateLockVersion: 1,
           }),
         });
 
@@ -234,7 +257,7 @@ describe("t3 pair", () => {
         assert.lengthOf(credentials, 1);
         assert.deepEqual(credentials[0]?.scopes, ["orchestration:read", "relay:read"]);
       }),
-    ).pipe(Effect.provide(NodeServices.layer)),
+    ).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.effect("pairs through the recorded dev web URL for dev servers", () =>
@@ -248,14 +271,16 @@ describe("t3 pair", () => {
           state: yield* makePersistedServerRuntimeState({
             config: { host: undefined, devUrl: new URL("http://localhost:5733") },
             port,
+            stateLockVersion: 1,
           }),
         });
+        yield* prepareGuardedServer(NodePath.dirname(statePath));
 
         const output = yield* captureStdout(runCli(["pair", "--base-dir", baseDir]));
 
         assert.include(output, "Pairing URL: http://localhost:5733/pair#token=");
       }),
-    ).pipe(Effect.provide(NodeServices.layer)),
+    ).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
 
   it.effect("directs to t3 serve or t3 connect when no server is running", () =>

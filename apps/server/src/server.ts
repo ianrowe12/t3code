@@ -180,6 +180,7 @@ import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
 import { disableTailscaleServe, ensureTailscaleServe } from "@t3tools/tailscale";
 import * as ServerActivation from "./serverActivation.ts";
+import { acquireServerStateLock } from "./serverStateLock.ts";
 
 // MCP handoff thread IDs include escaped provenance and can exceed find-my-way's
 // 100-character default for one path segment.
@@ -767,7 +768,7 @@ const layerMakeServer = Layer.unwrap(
           const server = yield* HttpServer.HttpServer;
           const address = server.address;
           if (typeof address === "string" || !("port" in address)) {
-            return;
+            return undefined;
           }
 
           const launcher = yield* ServiceLauncherClient.ServiceLauncherClient;
@@ -775,6 +776,7 @@ const layerMakeServer = Layer.unwrap(
             config,
             port: address.port,
             serviceManaged: launcher.managed,
+            stateLockVersion: 1,
           });
           yield* persistServerRuntimeState({
             path: config.serverRuntimeStatePath,
@@ -784,9 +786,13 @@ const layerMakeServer = Layer.unwrap(
               Effect.logWarning("Failed to persist server runtime state", { cause }),
             ),
           );
+          return state;
         }),
-        () =>
-          clearPersistedServerRuntimeState(config.serverRuntimeStatePath).pipe(
+        (state) =>
+          (state === undefined
+            ? Effect.void
+            : clearPersistedServerRuntimeState(config.serverRuntimeStatePath, state)
+          ).pipe(
             Effect.catchCause((cause) =>
               Effect.logWarning("Failed to clear server runtime state", { cause }),
             ),
@@ -1117,4 +1123,17 @@ const layerMakeServer = Layer.unwrap(
 );
 
 // The CLI supplies configuration.
-export const runServer = Layer.launch(layerMakeServer);
+export const runServer = Effect.gen(function* () {
+  const config = yield* ServerConfig.ServerConfig;
+  const launcher = yield* ServiceLauncherClient.resolveServiceLauncherMode();
+  if (launcher.managed && launcher.stateDir === undefined) {
+    return yield* new ServiceLauncherClient.ServiceLauncherClientError({
+      operation: "decode-context",
+    });
+  }
+  yield* acquireServerStateLock(config.stateDir, launcher.stateDir);
+  if (launcher.managed) {
+    yield* ServiceLauncherClient.resolveServiceLauncherMode();
+  }
+  return yield* Layer.launch(layerMakeServer);
+}).pipe(Effect.provide(NodeServices.layer), Effect.scoped);

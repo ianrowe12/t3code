@@ -45,6 +45,8 @@ import * as SessionStore from "./SessionStore.ts";
 import { REUSABLE_DEV_SESSION_EXPIRES_AT, resolveReusableDevAuth } from "./ReusableDevAuth.ts";
 import { verifyRequestDpopProof } from "./dpop.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import { acquireAuthDatabaseAccess } from "../serverStateOwnership.ts";
+import { ServerStateLockError } from "../serverStateLock.ts";
 
 const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
 export const INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT = "administrative-bootstrap";
@@ -1319,7 +1321,22 @@ export const layer = Layer.effect(EnvironmentAuth, make).pipe(
   Layer.provideMerge(EnvironmentAuthPolicy.layer),
 );
 
-const layerStorage = Layer.mergeAll(ServerSecretStore.layer, SqlitePersistence.layerConfig);
+const layerStorage = Layer.unwrap(
+  Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    const access = yield* Effect.acquireRelease(
+      Effect.tryPromise({
+        try: () => acquireAuthDatabaseAccess(config.stateDir),
+        catch: (cause) => new ServerStateLockError({ stateDir: config.stateDir, cause }),
+      }),
+      (access) => Effect.sync(access.release),
+    );
+    return Layer.mergeAll(ServerSecretStore.layer, SqlitePersistence.layerConfig).pipe(
+      Layer.provide(Layer.succeed(SqlitePersistence.MigrationsEnabled, access.allowMigrations)),
+      Layer.tap(() => Effect.sync(access.completeInitialization)),
+    );
+  }),
+);
 
 export const layerRuntime = layer.pipe(
   Layer.provideMerge(layerStorage),

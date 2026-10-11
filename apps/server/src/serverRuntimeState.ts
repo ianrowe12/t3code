@@ -24,6 +24,7 @@ export const PersistedServerRuntimeState = Schema.Struct({
    * the difference between "restart the service" and "stop your terminal".
    */
   serviceManaged: Schema.optional(Schema.Boolean),
+  stateLockVersion: Schema.optional(Schema.Literal(1)),
 });
 export type PersistedServerRuntimeState = typeof PersistedServerRuntimeState.Type;
 
@@ -57,6 +58,7 @@ export const makePersistedServerRuntimeState = (input: {
   readonly config: Pick<ServerConfig.ServerConfig["Service"], "host" | "devUrl">;
   readonly port: number;
   readonly serviceManaged?: boolean;
+  readonly stateLockVersion?: 1;
 }): Effect.Effect<PersistedServerRuntimeState> =>
   Effect.map(DateTime.now, (now) => ({
     version: 1,
@@ -67,6 +69,7 @@ export const makePersistedServerRuntimeState = (input: {
     ...(input.config.devUrl ? { devUrl: input.config.devUrl.toString() } : {}),
     startedAt: DateTime.formatIso(now),
     ...(input.serviceManaged ? { serviceManaged: true } : {}),
+    ...(input.stateLockVersion === undefined ? {} : { stateLockVersion: input.stateLockVersion }),
   }));
 
 export const persistServerRuntimeState = (input: {
@@ -87,9 +90,21 @@ export const persistServerRuntimeState = (input: {
     ),
   );
 
-export const clearPersistedServerRuntimeState = (path: string) =>
+export const clearPersistedServerRuntimeState = (
+  path: string,
+  expected: PersistedServerRuntimeState,
+) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
+    const current = yield* readPersistedServerRuntimeState(path);
+    if (
+      Option.isNone(current) ||
+      current.value.pid !== expected.pid ||
+      current.value.startedAt !== expected.startedAt ||
+      current.value.origin !== expected.origin
+    ) {
+      return;
+    }
     yield* fs.remove(path, { force: true }).pipe(
       Effect.mapError(
         (cause) =>

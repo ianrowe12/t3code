@@ -13,6 +13,21 @@ immutable runtime. Preflight checks the launcher protocol because a target that
 needs new rollback guarantees cannot safely run under an older launcher. Upgrading
 that launcher requires a local service update.
 
+## State ownership
+
+Launcher protocol 4 passes the canonical state directory to its child. The
+launcher holds `server-launcher-lock.sqlite` across handoffs and rollback; each
+runtime separately holds `server-lock.sqlite` until shutdown. Standalone servers
+hold both leases. An orphan child therefore still excludes another runtime.
+Symlink aliases share the same locks, and live legacy descriptors without the
+guarded protocol are refused rather than assumed safe.
+
+SQLite connections hold shared `server-database-access.sqlite` leases. Backup
+and restore require an exclusive lease, including against CLI auth writes. Auth
+commands may share a guarded live runtime without running migrations; offline
+project mutations require exclusive runtime ownership. Runtime descriptor cleanup
+matches the publishing owner's pid, start time, and origin.
+
 ## Commit boundary
 
 The launcher durably records the pending update before acknowledging it, then

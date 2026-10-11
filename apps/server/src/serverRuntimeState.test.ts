@@ -19,6 +19,30 @@ interface CapturedLog {
 }
 
 describe("serverRuntimeState", () => {
+  it.effect("clears only the descriptor written by the expected owner", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-runtime-owner-" });
+      const statePath = path.join(root, "server-runtime.json");
+      const old = yield* ServerRuntimeState.makePersistedServerRuntimeState({
+        config: { host: undefined, devUrl: undefined },
+        port: 3773,
+      });
+      const replacement = { ...old, startedAt: "2026-10-11T19:00:00.000Z", port: 3774 };
+      yield* ServerRuntimeState.persistServerRuntimeState({
+        path: statePath,
+        state: replacement,
+      });
+      yield* ServerRuntimeState.clearPersistedServerRuntimeState(statePath, old);
+      assert.deepEqual(
+        Option.getOrThrow(yield* ServerRuntimeState.readPersistedServerRuntimeState(statePath)),
+        replacement,
+      );
+      yield* ServerRuntimeState.clearPersistedServerRuntimeState(statePath, replacement);
+      assert.isFalse(yield* fs.exists(statePath));
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
   it.effect("persists and reads the runtime state", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
