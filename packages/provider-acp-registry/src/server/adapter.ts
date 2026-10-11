@@ -271,6 +271,7 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
       ? {}
       : {
           fixedConfigOptions: [{ id: "agent", value: "" }],
+          preserveNativeSessionOnResumeFailure: true,
           extractPromptFinalAnswer: copilotPromptFinalAnswer,
           textUpdateIntervalMs,
           clientCapabilitiesMeta: {

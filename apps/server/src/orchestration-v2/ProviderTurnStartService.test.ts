@@ -166,6 +166,7 @@ function makeLocalCommandHarness(input: {
    * fallback succeeds, then reading history for its handoff fails.
    */
   readonly historyReadFailureAfterFallback?: unknown;
+  readonly preserveNativeSessionOnResumeFailure?: boolean;
   readonly interruptOpen?: boolean;
   readonly interruptRunBeforeOpenFailure?: boolean;
   readonly writeFailure?: unknown;
@@ -385,9 +386,13 @@ function makeLocalCommandHarness(input: {
     driver: providerThread.driver,
     resumeThread: () =>
       Effect.fail(
-        new ProviderAdapter.ProviderAdapterEventStreamError({
+        new ProviderAdapter.ProviderAdapterResumeThreadError({
           driver: providerThread.driver,
           providerSessionId,
+          providerThreadId,
+          ...(input.preserveNativeSessionOnResumeFailure
+            ? { allowNativeSessionReplacement: false }
+            : {}),
           cause: "native thread is gone",
         }),
       ),
@@ -735,6 +740,41 @@ effectIt.effect(
       expect(harness.projection().runs.at(-1)?.status).toBe("starting");
       expect(harness.events).toEqual([]);
     }),
+);
+
+effectIt.effect("fails a protected resume without replacing the saved native identity", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      historyReadFailureAfterFallback: new Error("must not read history for a fresh session"),
+      preserveNativeSessionOnResumeFailure: true,
+    });
+    yield* harness.start;
+    const projection = harness.projection();
+    expect(projection.runs.at(-1)?.status).toBe("failed");
+    expect(projection.providerThreads.at(-1)?.nativeThreadRef?.nativeId).toBe(
+      "native-resume-thread",
+    );
+    expect(projection.contextTransfers).toEqual([]);
+    expect(harness.startRootRun).not.toHaveBeenCalled();
+  }),
+);
+
+effectIt.effect("retries a protected resume against the same saved native identity", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      historyReadFailureAfterFallback: new Error("must not read history for a fresh session"),
+      preserveNativeSessionOnResumeFailure: true,
+    });
+    const error = yield* harness.startWithRetry.pipe(Effect.flip);
+    expect(error._tag).toBe("ProviderTurnStartError");
+    expect(harness.projection().runs.at(-1)?.status).toBe("starting");
+    expect(harness.projection().providerThreads.at(-1)?.nativeThreadRef?.nativeId).toBe(
+      "native-resume-thread",
+    );
+    expect(harness.writeIfRunCurrent).not.toHaveBeenCalled();
+  }),
 );
 
 effectIt.effect("does not mistake a failed state read for a superseded run", () =>

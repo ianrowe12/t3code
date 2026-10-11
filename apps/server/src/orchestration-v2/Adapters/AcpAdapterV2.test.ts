@@ -2278,6 +2278,51 @@ describe("AcpAdapterV2", () => {
       }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
 
+  it.live("does not replace a protected saved ACP session when eager activation fails", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const path = yield* Path.Path;
+      const selfInvocation = yield* resolveSelfInvocation();
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      const protocolEvents = yield* Queue.unbounded<EffectAcpProtocol.AcpProtocolLogEvent>();
+      const instanceId = ProviderInstanceId.make("acp-test-protected-eager-resume");
+      const adapter = yield* makeAcpAdapterV2({
+        instanceId,
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          preserveNativeSessionOnResumeFailure: true,
+          makeRuntime: makeMockRuntime({
+            childProcessSpawner,
+            mockAgentPath,
+            protocolEvents,
+            environment: () => ({ T3_ACP_FAIL_LOAD_SESSION: "1" }),
+          }),
+        },
+        selfInvocation,
+      });
+      const error = yield* adapter
+        .openSession({
+          threadId: ThreadId.make("thread-acp-protected-eager-resume"),
+          providerSessionId: ProviderSessionId.make("provider-session-acp-protected-eager-resume"),
+          modelSelection: { instanceId, model: "default" },
+          runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            cwd: process.cwd(),
+          }),
+          initialNativeThreadId: "protected-saved-session",
+        })
+        .pipe(Effect.flip);
+      assert.equal(error._tag, "ProviderAdapterOpenSessionError");
+      const methods = yield* pollProtocolMethods(protocolEvents);
+      assert.include(methods, "session/resume");
+      assert.notInclude(methods, "session/new");
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
   it.live("preserves new-session fallback when an eager ACP session load is stale", () =>
     Effect.gen(function* () {
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;

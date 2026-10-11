@@ -91,6 +91,10 @@ running. Commands the agent names with a `$` prefix appear in T3 Code's `$` skil
 
 ## Native sessions
 
+In this fork, Copilot resume failures preserve the saved native session identity. The turn fails
+explicitly rather than silently creating a replacement conversation and summarizing its history.
+Retry after resolving the native session or lock error.
+
 When an agent advertises ACP session listing and import support, expand its provider card,
 choose a project, and select **List sessions**. Importing one creates a deterministic T3 thread
 backed by that native session. Importing the same agent session again returns the existing thread,

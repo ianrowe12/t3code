@@ -317,6 +317,8 @@ export interface AcpAdapterV2Flavor {
    * the agent supports both. Antigravity's load replays history slowly.
    */
   readonly preferResumeSession?: boolean;
+  /** Keep the saved native identity when loading it fails instead of replacing its history. */
+  readonly preserveNativeSessionOnResumeFailure?: boolean;
   readonly onSessionEvent?: (
     event: AcpSessionRuntime.AcpSessionRuntimeEvent,
   ) => Effect.Effect<void>;
@@ -6323,6 +6325,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 "method" in initialStart.failure ? initialStart.failure.method : undefined;
               if (
                 input.initialNativeThreadId === undefined ||
+                flavor.preserveNativeSessionOnResumeFailure === true ||
                 (failedMethod !== "session/load" && failedMethod !== "session/resume")
               ) {
                 return yield* initialStart.failure;
@@ -7569,6 +7572,9 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                       driver,
                       providerSessionId: input.providerSessionId,
                       providerThreadId: threadInput.providerThread.id,
+                      ...(flavor.preserveNativeSessionOnResumeFailure === true
+                        ? { allowNativeSessionReplacement: false }
+                        : {}),
                       cause,
                     }),
                 ),
