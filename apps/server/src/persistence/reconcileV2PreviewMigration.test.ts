@@ -28,6 +28,107 @@ const seedPreview = Effect.gen(function* () {
 });
 
 describe("V2 preview upgrade", () => {
+  it.effect("upgrades the early migration 51 fork without replaying V2", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 50 });
+      yield* Migrator.make({})({
+        loader: Migrator.fromRecord({ "51_OrchestrationV2": OrchestrationV2 }),
+      });
+      yield* sql`
+        INSERT INTO orchestration_v2_legacy_imports
+          (thread_id, source_updated_at, shell_imported_at, transcript_imported_at, imported_message_count)
+        VALUES ('fork-thread', '2026-09-10', '2026-09-10', '2026-09-11', 42)
+      `;
+      yield* sql`
+        UPDATE effect_sql_migrations SET created_at = '2026-09-10 00:00:00' WHERE migration_id = 51
+      `;
+      const imports = yield* sql`SELECT * FROM orchestration_v2_legacy_imports`;
+      assert.deepStrictEqual(yield* runMigrations(), [
+        [51, "ProjectionThreadMessageContext"],
+        [52, "ProjectionThreadTitleState"],
+        [53, "PullRequestFilesViewed"],
+        [54, "ProjectionThreadsAutoSettleDisabledAt"],
+        [56, "RemoveRedundantProjectionIndexes"],
+        [57, "ScheduledTaskWebhooks"],
+        [58, "WebhookRelayDeliveries"],
+        [59, "McpAppModelContext"],
+        [60, "ThreadSnapshotWindowIndexes"],
+        [61, "PullRequestReviewGuides"],
+      ]);
+      assert.deepStrictEqual(yield* runMigrations(), []);
+      assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_legacy_imports`, imports);
+      const history = yield* sql<{ readonly migration_id: number; readonly name: string }>`
+        SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id
+      `;
+      assert.deepStrictEqual(
+        history.map((row) => [row.migration_id, row.name] as const),
+        migrationManifest,
+      );
+      assert.deepStrictEqual(
+        yield* sql`SELECT created_at FROM effect_sql_migrations WHERE migration_id = 55`,
+        [{ created_at: "2026-09-10 00:00:00" }],
+      );
+      const columns = yield* sql<{ readonly name: string }>`PRAGMA table_info(projection_threads)`;
+      assert.ok(columns.some((column) => column.name === "title_state_json"));
+      const messageColumns = yield* sql<{
+        readonly name: string;
+      }>`PRAGMA table_info(projection_thread_messages)`;
+      assert.ok(messageColumns.some((column) => column.name === "context_json"));
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
+  it.effect.each(["ProjectionThreadMessageContext", "ProjectionThreadTitleState"])(
+    "rolls back an early fork upgrade if recording %s fails",
+    (failedMigration) =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* runMigrations({ toMigrationInclusive: 50 });
+        yield* Migrator.make({})({
+          loader: Migrator.fromRecord({ "51_OrchestrationV2": OrchestrationV2 }),
+        });
+        const history = yield* sql`SELECT * FROM effect_sql_migrations ORDER BY migration_id`;
+        yield* sql`
+          CREATE TRIGGER fail_fork_upgrade BEFORE INSERT ON effect_sql_migrations
+          WHEN NEW.name = ${sql.literal(`'${failedMigration}'`)}
+          BEGIN SELECT RAISE(ABORT, 'injected failure'); END
+        `;
+        assert.ok(Exit.isFailure(yield* Effect.exit(runMigrations())));
+        assert.deepStrictEqual(
+          yield* sql`SELECT * FROM effect_sql_migrations ORDER BY migration_id`,
+          history,
+        );
+        const columns = yield* sql<{
+          readonly name: string;
+        }>`PRAGMA table_info(projection_threads)`;
+        assert.ok(!columns.some((column) => column.name === "title_state_json"));
+        const messageColumns = yield* sql<{
+          readonly name: string;
+        }>`PRAGMA table_info(projection_thread_messages)`;
+        assert.ok(!messageColumns.some((column) => column.name === "context_json"));
+        yield* sql`DROP TRIGGER fail_fork_upgrade`;
+        yield* runMigrations();
+        assert.deepStrictEqual(yield* runMigrations(), []);
+      }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
+  it.effect("refuses an early fork with unexpected later migrations", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations({ toMigrationInclusive: 50 });
+      yield* Migrator.make({})({
+        loader: Migrator.fromRecord({ "51_OrchestrationV2": OrchestrationV2 }),
+      });
+      yield* sql`INSERT INTO effect_sql_migrations (migration_id, name) VALUES (52, 'UnknownFork')`;
+      const history = yield* sql`SELECT * FROM effect_sql_migrations ORDER BY migration_id`;
+      assert.ok(Exit.isFailure(yield* Effect.exit(runMigrations())));
+      assert.deepStrictEqual(
+        yield* sql`SELECT * FROM effect_sql_migrations ORDER BY migration_id`,
+        history,
+      );
+    }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+  );
+
   it.effect("upgrades a published preview without replaying V2 or losing import progress", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;

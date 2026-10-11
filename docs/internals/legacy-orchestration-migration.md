@@ -51,6 +51,11 @@ differs from the manifest so the skipped schema change is diagnosable. There is 
 for a fork inside this ledger: any id at or below a future upstream id masks it forever, so fork
 schema changes belong in a separate migration table or outside the migrator entirely.
 
+The upgrade reconciles the unchanged V2 schema recorded as migration 51 by early forks or as 53/54
+by published previews. It applies the displaced main migrations and moves the existing V2 ledger
+entry to 55 in one transaction without replaying V2 or resetting import progress. Unexpected
+later entries stop reconciliation; do not renumber an unfamiliar fork ledger manually.
+
 ## Recovery
 
 There is no supported whole-thread export API. Recovery uses an untouched copy of the environment's

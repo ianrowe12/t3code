@@ -2,10 +2,12 @@ import * as Effect from "effect/Effect";
 import * as Migrator from "effect/sql/Migrator";
 import * as SqlClient from "effect/sql/SqlClient";
 
+import MessageContext from "./Migrations/051_ProjectionThreadMessageContext.ts";
+import TitleState from "./Migrations/052_ProjectionThreadTitleState.ts";
 import PullRequestFilesViewed from "./Migrations/053_PullRequestFilesViewed.ts";
 import AutoSettleDisabledAt from "./Migrations/054_ProjectionThreadsAutoSettleDisabledAt.ts";
 
-// Published previews assigned V2 to 53, then 54. Keep their schema and import
+// Early forks assigned V2 to 51; published previews used 53, then 54. Keep their schema and import
 // progress intact while reserving main's migration ids for upgrades from main.
 export const reconcileV2PreviewMigration = Effect.fn("reconcileV2PreviewMigration")(function* () {
   const sql = yield* SqlClient.SqlClient;
@@ -16,16 +18,20 @@ export const reconcileV2PreviewMigration = Effect.fn("reconcileV2PreviewMigratio
       `;
       if (tables.length === 0) return [];
       const history = yield* sql<{ readonly migration_id: number; readonly name: string }>`
-        SELECT migration_id, name FROM effect_sql_migrations WHERE migration_id >= 53
+        SELECT migration_id, name FROM effect_sql_migrations WHERE migration_id >= 51
       `;
       const legacy = history.find(
         (row) =>
-          row.name === "OrchestrationV2" && (row.migration_id === 53 || row.migration_id === 54),
+          row.name === "OrchestrationV2" &&
+          (row.migration_id === 51 || row.migration_id === 53 || row.migration_id === 54),
       );
       if (!legacy) return [];
       const valid = history.every(
         (row) =>
           row === legacy ||
+          (legacy.migration_id !== 51 &&
+            ((row.migration_id === 51 && row.name === "ProjectionThreadMessageContext") ||
+              (row.migration_id === 52 && row.name === "ProjectionThreadTitleState"))) ||
           (legacy.migration_id === 54 &&
             ((row.migration_id === 53 && row.name === "PullRequestFilesViewed") ||
               (row.migration_id === 55 && row.name === "RemoveRedundantProjectionIndexes"))),
@@ -37,7 +43,13 @@ export const reconcileV2PreviewMigration = Effect.fn("reconcileV2PreviewMigratio
         });
       }
       const executed: Array<readonly [number, string]> = [];
-      if (legacy.migration_id === 53) {
+      if (legacy.migration_id === 51) {
+        yield* MessageContext;
+        executed.push([51, "ProjectionThreadMessageContext"]);
+        yield* TitleState;
+        executed.push([52, "ProjectionThreadTitleState"]);
+      }
+      if (legacy.migration_id === 51 || legacy.migration_id === 53) {
         yield* PullRequestFilesViewed;
         executed.push([53, "PullRequestFilesViewed"]);
       }
@@ -46,7 +58,11 @@ export const reconcileV2PreviewMigration = Effect.fn("reconcileV2PreviewMigratio
       // Move the later entry first to avoid a primary-key collision.
       yield* sql`UPDATE effect_sql_migrations SET migration_id = 56 WHERE migration_id = 55 AND name = 'RemoveRedundantProjectionIndexes'`;
       yield* sql`UPDATE effect_sql_migrations SET migration_id = 55 WHERE migration_id = ${legacy.migration_id} AND name = 'OrchestrationV2'`;
-      if (legacy.migration_id === 53) {
+      if (legacy.migration_id === 51) {
+        yield* sql`INSERT INTO effect_sql_migrations (migration_id, name) VALUES (51, 'ProjectionThreadMessageContext')`;
+        yield* sql`INSERT INTO effect_sql_migrations (migration_id, name) VALUES (52, 'ProjectionThreadTitleState')`;
+      }
+      if (legacy.migration_id === 51 || legacy.migration_id === 53) {
         yield* sql`INSERT INTO effect_sql_migrations (migration_id, name) VALUES (53, 'PullRequestFilesViewed')`;
       }
       yield* sql`INSERT INTO effect_sql_migrations (migration_id, name) VALUES (54, 'ProjectionThreadsAutoSettleDisabledAt')`;
