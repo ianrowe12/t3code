@@ -97,7 +97,7 @@ const writeFakeRuntime = (
     return entryPath;
   });
 
-it.layer(NodeServices.layer)("service state persistence", (it) => {
+it.layer(NodeServices.layer, { excludeTestServices: true })("service state persistence", (it) => {
   it.effect("durably replaces and strictly reads one state document", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -121,11 +121,12 @@ it.layer(NodeServices.layer)("service state persistence", (it) => {
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-service-launcher-restart-" });
       const statePath = path.join(root, "runtime", "service-state.json");
       const restartPending = path.join(root, "runtime", SERVICE_RESTART_PENDING_FILE);
+      const started = path.join(root, "runtime", "child-started");
       yield* writeFakeRuntime(
         fs,
         path,
         path.join(root, "runtime", "versions", "1.0.0"),
-        "setInterval(() => {}, 1_000);\n",
+        `require("node:fs").writeFileSync(${JSON.stringify(started)}, "");\nsetInterval(() => {}, 1_000);\n`,
       );
       yield* Effect.promise(() =>
         writeServiceState(statePath, {
@@ -139,8 +140,16 @@ it.layer(NodeServices.layer)("service state persistence", (it) => {
             root,
             yield* Effect.promise(() => readServiceState(statePath)),
           );
+          yield* fs.remove(started, { force: true });
           const running = launcher.run();
-          yield* Effect.promise(() => launcher.stop("SIGTERM"));
+          yield* Effect.gen(function* () {
+            while (!(yield* fs.exists(started))) {
+              yield* Effect.sleep("10 millis");
+            }
+          }).pipe(
+            Effect.timeout("5 seconds"),
+            Effect.ensuring(Effect.promise(() => launcher.stop("SIGTERM"))),
+          );
           yield* Effect.promise(() => running);
         });
 
