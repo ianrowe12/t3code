@@ -943,6 +943,7 @@ interface ResolvedBuildOptions {
 
 interface StagePackageJson {
   readonly name: string;
+  readonly productName?: string;
   readonly version: string;
   readonly buildVersion: string;
   readonly t3codeCommitHash: string;
@@ -2753,6 +2754,17 @@ export function resolveDesktopProductName(version: string): string {
     : (desktopPackageJson.productName ?? "T3 Code");
 }
 
+export function resolveDesktopProfilePackageMetadata(
+  profile: "copilot" | "ianrowe12" | undefined,
+): Pick<StagePackageJson, "t3codeDesktopProfile" | "productName"> {
+  return profile === undefined
+    ? {}
+    : {
+        t3codeDesktopProfile: profile,
+        ...(profile === "copilot" ? { productName: "T3 Code Copilot" } : {}),
+      };
+}
+
 export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
   platform: typeof BuildPlatform.Type,
   target: string,
@@ -3873,8 +3885,8 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     buildVersion: appVersion,
     t3codeCommitHash: commitHash,
     ...Option.match(yield* DesktopProfileConfig, {
-      onNone: () => ({}),
-      onSome: (t3codeDesktopProfile) => ({ t3codeDesktopProfile }),
+      onNone: () => resolveDesktopProfilePackageMetadata(undefined),
+      onSome: resolveDesktopProfilePackageMetadata,
     }),
     // Read by apps/desktop/src/preview/Passkeys.ts; must match the signed entitlements.
     ...(macWebAuthn ? { t3codeWebAuthn: macWebAuthn } : {}),

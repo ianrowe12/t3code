@@ -54,6 +54,7 @@ import {
   resolveBuildOptions,
   resolveDesktopBuildIconAssets,
   resolveDesktopProductName,
+  resolveDesktopProfilePackageMetadata,
   resolveDesktopUpdateChannel,
   resolveDesktopWebAssetBrand,
   resolveResourceMonitorRustTargets,
@@ -335,6 +336,17 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       });
     }),
   );
+
+  it("preserves the historical Copilot safe-storage name in package metadata", () => {
+    assert.deepStrictEqual(resolveDesktopProfilePackageMetadata("copilot"), {
+      t3codeDesktopProfile: "copilot",
+      productName: "T3 Code Copilot",
+    });
+    assert.deepStrictEqual(resolveDesktopProfilePackageMetadata("ianrowe12"), {
+      t3codeDesktopProfile: "ianrowe12",
+    });
+    assert.deepStrictEqual(resolveDesktopProfilePackageMetadata(undefined), {});
+  });
 
   it.effect.each(["copilot", "ianrowe12"])(
     "packages the %s fork identity without an upstream update feed",

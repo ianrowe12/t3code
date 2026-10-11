@@ -76,6 +76,17 @@ The `.deb` updates itself like the other desktop builds. It asks for your
 password to install each update. If your desktop has no password prompt, the
 update fails. Download the new `.deb` and install it the same way.
 
+### Fork desktop profiles
+
+The `ianrowe12` and `copilot` fork packages retain their existing backend homes
+and Chromium profiles. Install the matching fork package rather than an upstream
+desktop update; fork packages do not use the upstream automatic-update feed.
+
+On macOS, the Copilot package must also retain `T3 Code Copilot` as its packaged
+`productName`. Electron uses that startup name for the Safe Storage keychain
+service. Keeping only the bundle identifier and profile paths is insufficient
+to decrypt existing saved connection credentials.
+
 ### The `t3` command
 
 The desktop app includes the `t3` command-line tool. To run it from any
