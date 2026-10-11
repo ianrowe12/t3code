@@ -46,10 +46,17 @@ export type ProviderOptionDescriptor = typeof ProviderOptionDescriptor.Type;
 export const ProviderOptionSelectionValue = Schema.Union([TrimmedNonEmptyString, Schema.Boolean]);
 export type ProviderOptionSelectionValue = typeof ProviderOptionSelectionValue.Type;
 
-export const ProviderOptionSelection = Schema.Struct({
-  id: TrimmedNonEmptyString,
-  value: ProviderOptionSelectionValue,
-});
+export const ProviderOptionSelection = Schema.Union([
+  Schema.Struct({
+    id: TrimmedNonEmptyString,
+    value: ProviderOptionSelectionValue,
+  }),
+  // Copilot uses an empty agent id to select its default assistant.
+  Schema.Struct({
+    id: Schema.Literal("agent"),
+    value: Schema.Literal(""),
+  }),
+]);
 export type ProviderOptionSelection = typeof ProviderOptionSelection.Type;
 
 /**

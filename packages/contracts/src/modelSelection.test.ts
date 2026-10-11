@@ -22,6 +22,28 @@ import { ProviderInstanceId } from "./providerInstance.ts";
 const decodeModelSelection = Schema.decodeUnknownEffect(ModelSelection);
 const encodeModelSelection = Schema.encodeUnknownEffect(ModelSelection);
 
+it.effect(
+  "preserves Copilot's explicit default assistant selection without accepting other empty options",
+  () =>
+    Effect.gen(function* () {
+      const selection = {
+        instanceId: "github_copilot",
+        model: "gpt-6.1-sol",
+        options: [{ id: "agent", value: "" }],
+      };
+      const decoded = yield* decodeModelSelection(selection);
+      assert.deepStrictEqual(decoded.options, selection.options);
+      assert.deepStrictEqual(yield* encodeModelSelection(decoded), selection);
+      const invalid = yield* Effect.exit(
+        decodeModelSelection({
+          ...selection,
+          options: [{ id: "reasoningEffort", value: "" }],
+        }),
+      );
+      assert.strictEqual(invalid._tag, "Failure");
+    }),
+);
+
 it.effect("ModelSelection migrates legacy `provider` field to `instanceId`", () =>
   Effect.gen(function* () {
     const parsed = yield* decodeModelSelection({
