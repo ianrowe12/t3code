@@ -13,6 +13,7 @@ import { modelSelectionCommandType } from "@t3tools/shared/model";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import {
   dispatchFailure,
+  assertLiveCaller,
   newCommandId,
   readCaller,
   readThread,
@@ -21,6 +22,7 @@ import {
 import * as ThreadSearch from "../../../orchestration-v2/ThreadSearch.ts";
 import * as ScheduledTasks from "../../../scheduledTasks/ScheduledTaskService.ts";
 import { queuedRunsInDeliveryOrder } from "../../../orchestration-v2/QueuedRunOrder.ts";
+import { ThreadInbox } from "../../ThreadInbox.ts";
 import { ThreadToolkit } from "./tools.ts";
 
 function queueEntry(
@@ -289,6 +291,28 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
       queuedRunId: input.queuedRunId,
       targetRunId: input.targetRunId,
     })),
+  ),
+  t3_inbox_wait: McpToolAccess.writesThreads(
+    () => [undefined],
+    (input) =>
+      Effect.gen(function* () {
+        const context = yield* readCaller();
+        yield* assertLiveCaller(context);
+        const { scope, caller } = context;
+        const inbox = yield* ThreadInbox;
+        if (caller === undefined || caller.activeRunId === null) {
+          return yield* new OrchestratorMcpFailure({
+            code: "parent_not_active",
+            message: "Inbox delivery requires an active calling thread run.",
+          });
+        }
+        return yield* inbox.wait({
+          scope,
+          expectedRunId: caller.activeRunId,
+          timeoutMs: input.timeoutMs ?? 60_000,
+          includeNotices: input.includeNotices ?? true,
+        });
+      }),
   ),
   t3_thread_organize: writesThread((input) =>
     Effect.gen(function* () {

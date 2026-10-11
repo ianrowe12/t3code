@@ -170,6 +170,7 @@ function commandThreadIds(command: OrchestrationV2Command): ReadonlyArray<Thread
     case "run.interrupt":
     case "queued-message.promote-to-steer":
     case "queue.resume":
+    case "queued-message.deliver-in-turn":
     case "queued-run.reorder":
     case "queued-run.cancel":
     case "queued-run.edit":

@@ -34,6 +34,7 @@ import { AttachmentToolkit } from "./toolkits/attachment/tools.ts";
 import * as AttachmentHandlers from "./toolkits/attachment/handlers.ts";
 import { ThreadToolkit } from "./toolkits/thread/tools.ts";
 import * as ThreadHandlers from "./toolkits/thread/handlers.ts";
+import * as ThreadInbox from "./ThreadInbox.ts";
 import * as ThreadMetadataMcpService from "./ThreadMetadataMcpService.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
@@ -761,19 +762,22 @@ const registerHtmlPreview = Effect.fn("McpHttpServer.registerHtmlPreview")(funct
 });
 
 /**
- * `McpServer.toolkit` for handlers that declared their access (see
+ * Register handlers that declared their access (see
  * `McpToolAccess`). Every toolkit on `/mcp` registers through this.
  *
- * `McpServer.toolkit` asks for every service its tools declare when it
+ * Toolkit registration asks for every service its tools declare when it
  * registers them, but the auth middleware provides `McpInvocationContext` to
  * each request instead. Registration must not get one: the services it
  * captures would replace the request's.
+ *
+ * Use the provided server: `McpServer.toolkit` builds its own and bypasses
+ * the inbox-delivering wrapper.
  */
 export const toolkitRegistration = <Tools extends Record<string, Tool.Any>, EX, RX>(
   toolkit: Toolkit.Toolkit<Tools>,
   handlers: McpToolAccess.HandlersLayer<Tools, EX, RX>,
 ) => {
-  const registration = McpServer.toolkit(toolkit);
+  const registration = Layer.effectDiscard(McpServer.registerToolkit(toolkit));
   // @effect-diagnostics-next-line unsafeEffectTypeAssertion:off - the auth middleware provides it per request.
   const registered = registration as Layer.Layer<
     never,
@@ -793,6 +797,72 @@ export const layerHtmlToolkit = Layer.mergeAll(
   toolkitRegistration(HtmlRenderToolkit, HtmlHandlers.layerRender),
   imageToolRegistration(registerHtmlPreview(), HtmlHandlers.layerPreview),
 ).pipe(Layer.provide(HtmlRender.layer));
+
+/** Tools that already read or change the queue themselves. */
+const isInboxExemptTool = (name: string) =>
+  name === "t3_inbox_wait" || name.startsWith("t3_queue_");
+
+/**
+ * Wraps McpServer.addTool so any T3 tool result from a live caller whose
+ * provider cannot steer also carries that thread's queued messages. A tool
+ * call is the one point where such a provider reads new input mid-turn.
+ */
+export const InboxDeliveryMcpServerLive = Layer.effect(
+  McpServer.McpServer,
+  Effect.gen(function* () {
+    const server = yield* McpServer.McpServer;
+    const inbox = yield* ThreadInbox.ThreadInbox;
+    const appendInbox = (
+      result: McpSchema.CallToolResult | McpSchema.InputRequired,
+    ): Effect.Effect<McpSchema.CallToolResult | McpSchema.InputRequired> => {
+      if (result instanceof McpSchema.InputRequired) return Effect.succeed(result);
+      return Effect.serviceOption(McpInvocationContext.McpInvocationContext).pipe(
+        Effect.flatMap((scope) =>
+          Option.isNone(scope) ? Effect.succeed(null) : inbox.piggyback(scope.value),
+        ),
+        Effect.map((delivery) =>
+          delivery === null
+            ? result
+            : new McpSchema.CallToolResult({
+                ...result,
+                content: [
+                  ...result.content,
+                  { type: "text", text: ThreadInbox.formatPiggybackBlock(delivery) },
+                ],
+              }),
+        ),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("mcp.thread-inbox.piggyback-failed", { cause }).pipe(
+            Effect.as(
+              new McpSchema.CallToolResult({
+                ...result,
+                content: [
+                  ...result.content,
+                  {
+                    type: "text",
+                    text: "T3 inbox delivery failed. Check queued input with t3_inbox_wait before continuing.",
+                  },
+                ],
+              }),
+            ),
+          ),
+        ),
+      );
+    };
+    return McpServer.McpServer.of({
+      ...server,
+      addTool: (options) =>
+        server.addTool(
+          isInboxExemptTool(options.tool.name)
+            ? options
+            : {
+                ...options,
+                handle: (payload) => options.handle(payload).pipe(Effect.flatMap(appendInbox)),
+              },
+        ),
+    });
+  }),
+).pipe(Layer.provide(ThreadInbox.layer));
 
 const layerPreviewStandardToolkitRegistration = toolkitRegistration(
   PreviewStandardToolkit,
@@ -814,7 +884,9 @@ export const layerOrchestratorToolkit = toolkitRegistration(
   OrchestratorHandlers.layer,
 ).pipe(Layer.provide(OrchestratorMcpService.layer), Layer.provide(ThreadMetadataMcpService.layer));
 
-export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer);
+export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandlers.layer).pipe(
+  Layer.provide(ThreadInbox.layer),
+);
 
 const layerWorktreeToolkitRegistration = toolkitRegistration(
   WorktreeToolkit,
@@ -878,4 +950,4 @@ export const layer = Layer.mergeAll(
   layerPullRequestsToolkit,
   layerDeviceToolkit,
   layerHtmlToolkit,
-).pipe(Layer.provideMerge(layerMcpTransport));
+).pipe(Layer.provide(InboxDeliveryMcpServerLive), Layer.provideMerge(layerMcpTransport));
