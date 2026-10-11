@@ -218,6 +218,14 @@ export interface AcpAdapterV2Flavor {
   readonly promptFailure?: (cause: unknown) => OrchestrationV2ProviderFailure;
   readonly driver: ProviderDriverKind;
   readonly capabilities: OrchestrationV2ProviderCapabilities;
+  readonly fixedConfigOptions?: ReadonlyArray<{
+    readonly id: string;
+    readonly value: string | boolean;
+  }>;
+  /** Final completion text returned by a provider instead of an assistant chunk. */
+  readonly extractPromptFinalAnswer?: (
+    response: EffectAcpSchema.PromptResponse,
+  ) => string | undefined;
   readonly clientCapabilitiesMeta?: NonNullable<
     EffectAcpSchema.InitializeRequest["clientCapabilities"]
   >["_meta"];
@@ -6331,9 +6339,18 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               };
             });
           }
-          const optionSelections = modelSelection.options ?? [];
+          const fixedConfigOptions = flavor.fixedConfigOptions ?? [];
+          const optionSelections = (modelSelection.options ?? []).filter(
+            (selection) => !fixedConfigOptions.some((fixed) => fixed.id === selection.id),
+          );
           const configOptions = yield* runtime.getConfigOptions;
           const availableConfigIds = new Set(configOptions.map((option) => option.id));
+          for (const fixed of fixedConfigOptions) {
+            const option = configOptions.find((candidate) => candidate.id === fixed.id);
+            if (option !== undefined && option.currentValue !== fixed.value) {
+              yield* runtime.setConfigOption(fixed.id, fixed.value);
+            }
+          }
           const hasNativeConfigWithSyntheticModeId = availableConfigIds.has(
             ACP_SESSION_MODE_OPTION_ID,
           );
@@ -7187,6 +7204,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                           ? "interrupted"
                           : "cancelled"
                         : "completed";
+                    const finalAnswer = flavor.extractPromptFinalAnswer?.(result);
+                    if (status === "completed" && finalAnswer !== undefined) {
+                      yield* closeTextStreams(context);
+                      yield* appendText(context, "assistant", finalAnswer);
+                    }
                     // Grok monitors (and async subagents) keep working after the root
                     // prompt RPC returns. Defer finalize so their later updates and
                     // wake-turn traffic still project onto this run.

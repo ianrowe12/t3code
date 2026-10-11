@@ -8,6 +8,11 @@ import {
   extractCopilotSubagentUpdate,
   makeCopilotSubagentRouting,
 } from "./copilotAcp.ts";
+import {
+  copilotCompletionCapabilities,
+  copilotPromptFinalAnswer,
+  makeCopilotPromptCompletionRuntime,
+} from "./copilotPromptCompletion.ts";
 import { defaultInstanceIdForDriver, ProviderDriverKind } from "@t3tools/contracts";
 import { AcpRegistrySettings } from "../settings.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -136,6 +141,7 @@ export function acpRegistryPromptFailure(agentId: string, cause: unknown) {
 function makeAcpRegistryRuntime(
   options: AcpRegistryAdapterV2Options,
   catalog: AcpRegistrySupport.AcpRegistryCatalog["Service"],
+  isCopilot: boolean,
 ) {
   return (
     input: AcpAdapterV2RuntimeInput,
@@ -160,6 +166,7 @@ function makeAcpRegistryRuntime(
       const context = yield* Layer.build(
         AcpSessionRuntime.layer({
           ...runtimeInput,
+          ...(isCopilot ? { cancelBehavior: "wait-for-prompt" as const } : {}),
           spawn:
             processEnvironment === undefined
               ? resolved.spawn
@@ -170,9 +177,20 @@ function makeAcpRegistryRuntime(
           ...(options.settings.authMethodId ? { authMethodId: options.settings.authMethodId } : {}),
         }),
       );
-      return yield* Effect.service(AcpSessionRuntime.AcpSessionRuntime).pipe(
+      const runtime = yield* Effect.service(AcpSessionRuntime.AcpSessionRuntime).pipe(
         Effect.provide(context),
       );
+      return isCopilot
+        ? yield* makeCopilotPromptCompletionRuntime(
+            runtime,
+            runtimeInput.onTermination(
+              new EffectAcpErrors.AcpRequestError({
+                code: -32603,
+                errorMessage: "Copilot session recovery failed; a replacement runtime is required.",
+              }),
+            ),
+          )
+        : runtime;
     });
 }
 
@@ -195,7 +213,15 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
   const copilotRouting = isCopilot ? makeCopilotSubagentRouting() : undefined;
   const flavor: AcpAdapterV2Flavor = {
     driver: ACP_REGISTRY_PROVIDER,
-    capabilities: AcpProviderCapabilitiesV2,
+    capabilities: isCopilot
+      ? {
+          ...AcpProviderCapabilitiesV2,
+          turns: {
+            ...AcpProviderCapabilitiesV2.turns,
+            supportsSteeringByInterruptRestart: false,
+          },
+        }
+      : AcpProviderCapabilitiesV2,
     promptFailure: (cause) => acpRegistryPromptFailure(registryAgentId, cause),
     // Per-agent exceptions (Mistral Vibe, Devin, Copilot): see the note above
     // registerMistralVibeAcpExtensions before adding any more.
@@ -216,12 +242,23 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
     ...(copilotRouting === undefined
       ? {}
       : {
-          clientCapabilitiesMeta: copilotClientCapabilitiesMeta,
+          fixedConfigOptions: [{ id: "agent", value: "" }],
+          extractPromptFinalAnswer: copilotPromptFinalAnswer,
+          clientCapabilitiesMeta: {
+            "github.com/copilot": {
+              events: [
+                ...new Set([
+                  ...copilotClientCapabilitiesMeta["github.com/copilot"].events,
+                  ...copilotCompletionCapabilities["github.com/copilot"].events,
+                ]),
+              ],
+            },
+          },
           registerExtensions: copilotRouting.registerExtensions,
           normalizeSessionUpdate: copilotRouting.normalizeSessionUpdate,
           extractSubagentUpdate: extractCopilotSubagentUpdate,
         }),
-    makeRuntime: options.makeRuntime ?? makeAcpRegistryRuntime(options, catalog),
+    makeRuntime: options.makeRuntime ?? makeAcpRegistryRuntime(options, catalog, isCopilot),
     ...(runtimeCoordinator === undefined
       ? {}
       : {

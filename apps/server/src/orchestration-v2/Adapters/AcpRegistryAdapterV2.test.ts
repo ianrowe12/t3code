@@ -167,6 +167,8 @@ describe("AcpRegistryAdapterV2", () => {
       readonly setup: unknown;
       readonly modeFrames: ReadonlyArray<Frame>;
       readonly storedModePick: string;
+      readonly agentId?: string;
+      readonly storedAgentPick?: string;
     }) {
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const fileSystem = yield* FileSystem.FileSystem;
@@ -200,7 +202,7 @@ describe("AcpRegistryAdapterV2", () => {
         selfInvocation: yield* resolveSelfInvocation(),
         instanceId,
         settings: yield* decodeAcpRegistryAdapterSettings({
-          agentId: "fixture-agent",
+          agentId: input.agentId ?? "fixture-agent",
           authMethodId: "test",
         }),
         environment: {},
@@ -221,7 +223,12 @@ describe("AcpRegistryAdapterV2", () => {
           modelSelection: {
             instanceId,
             model: "default",
-            options: [{ id: ACP_SESSION_MODE_OPTION_ID, value: input.storedModePick }],
+            options: [
+              { id: ACP_SESSION_MODE_OPTION_ID, value: input.storedModePick },
+              ...(input.storedAgentPick === undefined
+                ? []
+                : [{ id: "agent", value: input.storedAgentPick }]),
+            ],
           },
           runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
             runtimeMode: "approval-required",
@@ -265,6 +272,35 @@ describe("AcpRegistryAdapterV2", () => {
         storedModePick: "auto",
       }).pipe(Effect.provide(layerTest), Effect.scoped),
     );
+
+    it.effect("resets a stored Copilot custom agent to the default assistant", () => {
+      const agentOption = (currentValue: string) => ({
+        id: "agent",
+        name: "Agent",
+        type: "select",
+        currentValue,
+        options: [
+          { value: "", name: "Default" },
+          { value: "custom-agent", name: "Custom" },
+        ],
+      });
+      return openWithStoredModePick({
+        agentId: "github-copilot-cli",
+        storedModePick: "ask",
+        storedAgentPick: "custom-agent",
+        setup: { configOptions: [permissionModeOption("ask"), agentOption("custom-agent")] },
+        modeFrames: [
+          outbound("session/set_config_option", {
+            sessionId: "agent-session",
+            configId: "agent",
+            value: "",
+          }),
+          answer("session/set_config_option", {
+            configOptions: [permissionModeOption("ask"), agentOption("")],
+          }),
+        ],
+      }).pipe(Effect.provide(layerTest), Effect.scoped);
+    });
   });
 
   it.effect("offers client terminals to Devin only and client fs to no registry agent", () =>
