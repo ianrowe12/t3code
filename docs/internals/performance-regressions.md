@@ -51,6 +51,20 @@ these tests so regressions fail locally.
 
 ## Event store and startup
 
+Copilot assistant and reasoning snapshots persist immediately on first output,
+then coalesce at `T3CODE_TURN_ITEM_PERSIST_THROTTLE_MS` (default 2,000 ms).
+Zero disables throttling. Idle streams flush on the interval, and terminal
+output bypasses the delay. Child assistant messages use the same bound;
+runtime-generation guards prevent old callbacks from publishing after teardown.
+
+Production compaction starts after 20 minutes and repeats every 360 minutes.
+`T3CODE_EVENT_COMPACTION_ENABLED=false` disables it;
+`T3CODE_EVENT_COMPACTION_INITIAL_DELAY_MINUTES` accepts finite nonnegative values,
+and `T3CODE_EVENT_COMPACTION_INTERVAL_MINUTES` accepts finite values of at least
+one. Failures are logged and retried on the next interval. Paged compaction retains
+the first and newest turn-item updates, preserving replay's original ordinal
+allocation while removing intermediate streamed snapshots.
+
 Sequence cursors must seek an index rather than scan retained history. The application sequence
 index contains project events and v2 thread events; the per-thread sequence index contains only v2
 thread events. Legacy-only and unknown threads must return zero without scanning other threads.

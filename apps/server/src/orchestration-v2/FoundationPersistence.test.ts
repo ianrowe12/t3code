@@ -901,7 +901,6 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
           itemEvent("item-2", "final"),
         ],
       });
-      const beforeCompaction = yield* projections.getThreadProjection(threadId);
 
       // A fully imported legacy thread: its v1 events and pre-migration
       // receipts are dead weight; a still-pending import keeps its rows.
@@ -940,9 +939,16 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
         ON CONFLICT(command_id) DO NOTHING
       `;
 
+      yield* eventSink.write({
+        events: Array.from({ length: 600 }, (_, index) =>
+          itemEvent(`item-intermediate-${index}`, `updated ${index}`),
+        ),
+      });
+      yield* eventSink.write({ events: [itemEvent("item-final", "final text")] });
+      const beforeCompaction = yield* projections.getThreadProjection(threadId);
       const summary = yield* maintenance.compactEventStore;
-      // Superseded state spans several discovery pages. Both turn-item updates stay.
-      assert.isAtLeast(summary.deletedEventCount, 507);
+      // Retain first and final text across several discovery pages.
+      assert.isAtLeast(summary.deletedEventCount, 1107);
       assert.isAtLeast(summary.deletedReceiptCount, 1);
 
       const remaining = yield* sql<{ readonly event_id: string }>`
@@ -960,7 +966,7 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
           "event:foundation-compact:visit-2",
           "event:foundation-compact:message-2",
           "event:foundation-compact:node-2",
-          "event:foundation-compact:item-2",
+          "event:foundation-compact:item-final",
         ],
       );
 
