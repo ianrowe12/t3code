@@ -18,6 +18,8 @@ import { AcpRegistrySettings } from "../settings.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { resolveSelfInvocation, type SelfInvocation } from "@t3tools/shared/nodeRuntime";
 import * as Crypto from "effect/Crypto";
+import * as Config from "effect/Config";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -211,6 +213,32 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
     (options.settings.source === "local" &&
       /^copilot(\.exe|\.cmd)?$/i.test(options.settings.commandPath.split(/[\\/]/).pop() ?? ""));
   const copilotRouting = isCopilot ? makeCopilotSubagentRouting() : undefined;
+  const textUpdateIntervalMs = isCopilot
+    ? yield* Config.schema(
+        Schema.Number.check(Schema.isFinite(), Schema.isGreaterThanOrEqualTo(0)),
+        "T3CODE_TURN_ITEM_PERSIST_THROTTLE_MS",
+      ).pipe(
+        Config.withDefault(2_000),
+        Effect.provide(
+          ConfigProvider.layer(
+            ConfigProvider.fromEnv({
+              env: Object.fromEntries(
+                Object.entries(options.environment).filter(
+                  (entry): entry is [string, string] => entry[1] !== undefined,
+                ),
+              ),
+            }),
+          ),
+        ),
+        Effect.mapError(
+          (cause) =>
+            new EffectAcpErrors.AcpSpawnError({
+              command: options.settings.agentId || ACP_REGISTRY_PROVIDER,
+              cause,
+            }),
+        ),
+      )
+    : 0;
   const flavor: AcpAdapterV2Flavor = {
     driver: ACP_REGISTRY_PROVIDER,
     capabilities: isCopilot
@@ -244,6 +272,7 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
       : {
           fixedConfigOptions: [{ id: "agent", value: "" }],
           extractPromptFinalAnswer: copilotPromptFinalAnswer,
+          textUpdateIntervalMs,
           clientCapabilitiesMeta: {
             "github.com/copilot": {
               events: [

@@ -11,6 +11,7 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 import * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/compat";
 import * as NodeBuffer from "node:buffer";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 
 /**
  * Client-side implementation of the ACP `terminal` capability.
@@ -165,6 +166,7 @@ export const makeAcpClientTerminals = Effect.fn("makeAcpClientTerminals")(functi
   options: AcpClientTerminalsOptions,
 ): Effect.fn.Return<AcpClientTerminals, never, ChildProcessSpawner.ChildProcessSpawner> {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const hostEnvironment = yield* HostProcess.Environment;
   const creationPermit = yield* Semaphore.make(1);
   const terminals = new Map<string, ManagedAcpTerminal>();
   let nextTerminalNumber = 1;
@@ -231,12 +233,18 @@ export const makeAcpClientTerminals = Effect.fn("makeAcpClientTerminals")(functi
             (request.env ?? []).map((variable) => [variable.name, variable.value] as const),
           );
           const sessionEnvironment = options.environmentForSession?.(request.sessionId);
-          const environment =
-            options.environment === undefined &&
-            sessionEnvironment === undefined &&
-            (request.env?.length ?? 0) === 0
-              ? undefined
-              : { ...options.environment, ...sessionEnvironment, ...requestEnvironment };
+          const inheritedEnvironment = Object.fromEntries(
+            Object.entries(hostEnvironment).filter(
+              ([key]) =>
+                options.environmentForSession === undefined || !key.startsWith("T3_ACP_MCP_"),
+            ),
+          );
+          const environment = {
+            ...inheritedEnvironment,
+            ...options.environment,
+            ...sessionEnvironment,
+            ...requestEnvironment,
+          };
           // Each terminal owns a scope so the spawned process is reliably reaped:
           // closing the scope kills a still-running command and frees the handle.
           const terminalScope = yield* Scope.make();

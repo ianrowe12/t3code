@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Result from "effect/Result";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import {
   makeAcpClientTerminals,
@@ -18,6 +19,41 @@ const withTerminals = <A, E>(use: (terminals: AcpClientTerminals) => Effect.Effe
   }).pipe(Effect.provide(NodeServices.layer), Effect.scoped);
 
 describe("AcpClientTerminals", () => {
+  it.effect("does not inherit the controlling thread's MCP credentials into unknown sessions", () =>
+    Effect.gen(function* () {
+      const terminals = yield* makeAcpClientTerminals({
+        defaultCwd: process.cwd(),
+        environmentForSession: (sessionId) =>
+          sessionId === "known" ? { T3_ACP_MCP_AUTHORIZATION: "known-token" } : undefined,
+      });
+      yield* Effect.addFinalizer(() => terminals.disposeAll);
+      for (const [sessionId, expected] of [
+        ["unknown", "|kept"],
+        ["known", "known-token|kept"],
+      ]) {
+        const created = yield* terminals.create({
+          sessionId: sessionId!,
+          command: process.execPath,
+          args: [
+            "-e",
+            "process.stdout.write((process.env.T3_ACP_MCP_AUTHORIZATION ?? '') + '|' + process.env.T3_TEST_INHERITED)",
+          ],
+        });
+        yield* terminals.waitForExit({ sessionId: sessionId!, ...created });
+        expect((yield* terminals.output({ sessionId: sessionId!, ...created })).output).toBe(
+          expected,
+        );
+      }
+    }).pipe(
+      Effect.provideService(HostProcess.Environment, {
+        ...process.env,
+        T3_ACP_MCP_AUTHORIZATION: "controlling-thread-token",
+        T3_TEST_INHERITED: "kept",
+      }),
+      Effect.provide(NodeServices.layer),
+      Effect.scoped,
+    ),
+  );
   it.effect("runs a command, buffers output, and reports the exit status", () =>
     withTerminals((terminals) =>
       Effect.gen(function* () {

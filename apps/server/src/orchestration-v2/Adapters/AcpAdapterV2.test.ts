@@ -1054,6 +1054,253 @@ describe("AcpAdapterV2", () => {
     }).pipe(Effect.provide(layerTest), Effect.scoped),
   );
 
+  it.effect("bounds streaming text events and immediately flushes terminal text", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const path = yield* Path.Path;
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      type Runtime = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      let handler: Parameters<Runtime["handleSessionUpdate"]>[0] | undefined;
+      const instanceId = ProviderInstanceId.make("acp-text-throttle");
+      const adapter = yield* makeAcpAdapterV2({
+        instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          textUpdateIntervalMs: 2_000,
+          normalizeSessionUpdate: normalizeDevinSessionUpdate,
+          extractSubagentUpdate: extractDevinSubagentUpdate,
+          makeRuntime: makeMockRuntime({
+            childProcessSpawner,
+            mockAgentPath,
+            wrapRuntime: (runtime) => ({
+              ...runtime,
+              handleSessionUpdate: (next) =>
+                Effect.sync(() => {
+                  handler = next;
+                }).pipe(Effect.andThen(runtime.handleSessionUpdate(next))),
+              prompt: () =>
+                Effect.gen(function* () {
+                  yield* handler!({
+                    sessionId: "mock-session-1",
+                    update: {
+                      sessionUpdate: "tool_call_update",
+                      toolCallId: "child-throttle",
+                      status: "in_progress",
+                      _meta: {
+                        "cognition.ai/subagent_started": {
+                          agentId: "child-throttle",
+                          task: "Write a report.",
+                        },
+                      },
+                    },
+                  });
+                  for (let index = 0; index < 200; index += 1) {
+                    yield* handler!({
+                      sessionId: "mock-session-1",
+                      update: {
+                        sessionUpdate: "agent_message_chunk",
+                        content: { type: "text", text: `${index},` },
+                      },
+                    });
+                    yield* handler!({
+                      sessionId: "mock-session-1",
+                      update: {
+                        sessionUpdate: "agent_message_chunk",
+                        content: { type: "text", text: `${index},` },
+                        _meta: {
+                          "cognition.ai/subagent_context": { parentAgentId: "child-throttle" },
+                        },
+                      },
+                    });
+                  }
+                  yield* handler!({
+                    sessionId: "mock-session-1",
+                    update: {
+                      sessionUpdate: "tool_call_update",
+                      toolCallId: "child-throttle",
+                      status: "completed",
+                      _meta: {
+                        "cognition.ai/subagent_completed": {
+                          agentId: "child-throttle",
+                          success: true,
+                        },
+                      },
+                    },
+                  });
+                  return { stopReason: "end_turn" as const };
+                }),
+            }),
+          }),
+        },
+      });
+      const threadId = ThreadId.make("acp-text-throttle");
+      const modelSelection = { instanceId, model: "default" };
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("acp-text-throttle-session"),
+        modelSelection,
+        runtimePolicy,
+      });
+      const providerThread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      yield* runtime.startTurn(
+        makeTurnInput({
+          threadId,
+          providerThread,
+          instanceId,
+          runtimePolicy,
+          now: yield* DateTime.now,
+        }),
+      );
+      const items = Array.from(
+        yield* runtime.events.pipe(
+          Stream.takeUntil((event) => event.type === "turn.terminal"),
+          Stream.runCollect,
+        ),
+      ).flatMap((event) =>
+        event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+          ? [event.turnItem]
+          : [],
+      );
+      const rootItems = items.filter((item) => item.threadId === threadId);
+      const childItems = items.filter((item) => item.threadId !== threadId);
+      assert.equal(rootItems.length, 2);
+      assert.equal(childItems.length, 2);
+      for (const group of [rootItems, childItems]) {
+        assert.equal(group[0]?.text, "0,");
+        assert.equal(
+          group[1]?.text,
+          Array.from({ length: 200 }, (_, index) => `${index},`).join(""),
+        );
+        assert.equal(group[1]?.streaming, false);
+        assert.equal(group[1]?.status, "completed");
+      }
+      assert.equal(rootItems[0]?.streaming, true);
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
+  it.effect("flushes idle text at the interval and discards timers after terminal completion", () =>
+    Effect.gen(function* () {
+      const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const path = yield* Path.Path;
+      const mockAgentPath = yield* path.fromFileUrl(
+        new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+      );
+      type Runtime = AcpSessionRuntime.AcpSessionRuntime["Service"];
+      let handler: Parameters<Runtime["handleSessionUpdate"]>[0] | undefined;
+      const ready = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const instanceId = ProviderInstanceId.make("acp-text-timer");
+      const adapter = yield* makeAcpAdapterV2({
+        instanceId,
+        selfInvocation: yield* resolveSelfInvocation(),
+        flavor: {
+          driver: ACP_TEST_DRIVER,
+          capabilities: AcpProviderCapabilitiesV2,
+          textUpdateIntervalMs: 2_000,
+          makeRuntime: makeMockRuntime({
+            childProcessSpawner,
+            mockAgentPath,
+            wrapRuntime: (runtime) => ({
+              ...runtime,
+              handleSessionUpdate: (next) =>
+                Effect.sync(() => {
+                  handler = next;
+                }).pipe(Effect.andThen(runtime.handleSessionUpdate(next))),
+              prompt: () =>
+                Effect.gen(function* () {
+                  yield* Deferred.succeed(ready, undefined);
+                  yield* Deferred.await(finish);
+                  return { stopReason: "end_turn" as const };
+                }),
+            }),
+          }),
+        },
+      });
+      const threadId = ThreadId.make("acp-text-timer");
+      const modelSelection = { instanceId, model: "default" };
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        cwd: process.cwd(),
+      });
+      const runtime = yield* adapter.openSession({
+        threadId,
+        providerSessionId: ProviderSessionId.make("acp-text-timer-session"),
+        modelSelection,
+        runtimePolicy,
+      });
+      const providerThread = yield* runtime.ensureThread({
+        threadId,
+        modelSelection,
+        runtimePolicy,
+      });
+      const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) => Queue.offer(events, event)),
+        Effect.forkScoped,
+      );
+      yield* runtime.startTurn(
+        makeTurnInput({
+          threadId,
+          providerThread,
+          instanceId,
+          runtimePolicy,
+          now: yield* DateTime.now,
+        }),
+      );
+      yield* Deferred.await(ready);
+      const send = (text: string) =>
+        handler!({
+          sessionId: "mock-session-1",
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+        });
+      const nextItem = Effect.gen(function* () {
+        while (true) {
+          const event = yield* Queue.take(events);
+          if (event.type === "turn_item.updated" && event.turnItem.type === "assistant_message") {
+            return event.turnItem;
+          }
+        }
+      });
+      yield* send("first");
+      assert.equal((yield* nextItem).text, "first");
+      yield* send(" second");
+      yield* TestClock.adjust("1999 millis");
+      while (true) {
+        const event = yield* Queue.poll(events);
+        if (Option.isNone(event)) break;
+        assert.notEqual(event.value.type, "turn_item.updated");
+      }
+      yield* TestClock.adjust("1 millis");
+      assert.equal((yield* nextItem).text, "first second");
+      yield* send(" final");
+      yield* Deferred.succeed(finish, undefined);
+      const final = yield* nextItem;
+      assert.equal(final.text, "first second final");
+      assert.equal(final.streaming, false);
+      while ((yield* Queue.take(events)).type !== "turn.terminal") {}
+      yield* TestClock.adjust("10 seconds");
+      while (true) {
+        const event = yield* Queue.poll(events);
+        if (Option.isNone(event)) break;
+        assert.notEqual(event.value.type, "turn_item.updated");
+      }
+    }).pipe(Effect.provide(layerTest), Effect.scoped),
+  );
+
   it.effect("persists a bounded subset of streamed root and child tool updates", () =>
     Effect.gen(function* () {
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;

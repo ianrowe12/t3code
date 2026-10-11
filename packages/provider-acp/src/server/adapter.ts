@@ -226,6 +226,7 @@ export interface AcpAdapterV2Flavor {
   readonly extractPromptFinalAnswer?: (
     response: EffectAcpSchema.PromptResponse,
   ) => string | undefined;
+  readonly textUpdateIntervalMs?: number;
   readonly clientCapabilitiesMeta?: NonNullable<
     EffectAcpSchema.InitializeRequest["clientCapabilities"]
   >["_meta"];
@@ -1127,6 +1128,8 @@ interface ActiveTextSegment {
   readonly startedAt: DateTime.Utc;
   sourceMessageId: string | null;
   text: string;
+  lastEmittedAt?: number;
+  flushScheduled?: boolean;
 }
 
 interface ActiveTextStream {
@@ -1395,6 +1398,10 @@ interface ActiveAcpSubagent {
   childSessionId: string | null;
   assistantText: string;
   readonly assistantMessages: Map<string, string>;
+  readonly assistantEmissions: Map<
+    string,
+    { lastEmittedAt: number; flushScheduled: boolean; dirty: boolean }
+  >;
   readonly childItemOrdinals: Map<string, number>;
   nextChildOrdinal: number;
   /**
@@ -2422,11 +2429,38 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           context: ActiveAcpTurn,
           kind: "user" | "assistant" | "reasoning",
           completed: boolean,
-        ) {
+        ): Effect.fn.Return<void> {
           const stream = textStreamFor(context, kind);
           const segment = stream.current;
           if (segment === null) return;
           const now = yield* DateTime.now;
+          const nowMillis = DateTime.toEpochMillis(now);
+          const interval = kind === "user" ? 0 : (flavor.textUpdateIntervalMs ?? 0);
+          if (
+            !completed &&
+            segment.lastEmittedAt !== undefined &&
+            nowMillis - segment.lastEmittedAt < interval
+          ) {
+            if (!segment.flushScheduled) {
+              segment.flushScheduled = true;
+              const generation = yield* Ref.get(runtimeCallbackGeneration);
+              yield* Effect.sleep(`${interval - (nowMillis - segment.lastEmittedAt)} millis`).pipe(
+                Effect.andThen(
+                  runRuntimeCallbackAtGeneration(
+                    generation,
+                    Effect.gen(function* () {
+                      if (stream.current !== segment || context.finalized) return;
+                      segment.flushScheduled = false;
+                      yield* emitTextSegment(context, kind, false);
+                    }),
+                  ),
+                ),
+                Effect.forkIn(sessionScope),
+              );
+            }
+            return;
+          }
+          segment.lastEmittedAt = nowMillis;
           const ordinal = yield* resolveItemOrdinal(context, segment.nativeItemId);
           const nodeId = providerNodeId(segment.nativeItemId);
           const turnItemId = providerTurnItemId(segment.nativeItemId);
@@ -2641,6 +2675,70 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           yield* emitTextSegment(context, kind, false);
         });
 
+        const persistSubagentAssistant = Effect.fnUntraced(function* (
+          subagent: ActiveAcpSubagent,
+          nativeItemId: string,
+          force = false,
+        ): Effect.fn.Return<void> {
+          const text = subagent.assistantMessages.get(nativeItemId);
+          if (text === undefined) return;
+          const now = yield* DateTime.now;
+          const nowMillis = DateTime.toEpochMillis(now);
+          const emission = subagent.assistantEmissions.get(nativeItemId);
+          const interval = flavor.textUpdateIntervalMs ?? 0;
+          if (!force && emission !== undefined && nowMillis - emission.lastEmittedAt < interval) {
+            emission.dirty = true;
+            if (!emission.flushScheduled) {
+              emission.flushScheduled = true;
+              const generation = yield* Ref.get(runtimeCallbackGeneration);
+              yield* Effect.sleep(`${interval - (nowMillis - emission.lastEmittedAt)} millis`).pipe(
+                Effect.andThen(
+                  runRuntimeCallbackAtGeneration(
+                    generation,
+                    Effect.gen(function* () {
+                      emission.flushScheduled = false;
+                      if (!emission.dirty) return;
+                      yield* persistSubagentAssistant(subagent, nativeItemId);
+                    }),
+                  ),
+                ),
+                Effect.forkIn(sessionScope),
+              );
+            }
+            return;
+          }
+          if (emission === undefined) {
+            subagent.assistantEmissions.set(nativeItemId, {
+              lastEmittedAt: nowMillis,
+              flushScheduled: false,
+              dirty: false,
+            });
+          } else {
+            emission.lastEmittedAt = nowMillis;
+            emission.dirty = false;
+          }
+          const ordinal = resolveSubagentChildOrdinal(subagent, nativeItemId);
+          const artifacts = makeSubagentConversationArtifacts({
+            messageId: providerMessageId(nativeItemId),
+            turnItemId: providerTurnItemId(nativeItemId),
+            threadId: subagent.childThreadId,
+            rootNodeId: subagent.childRootNodeId,
+            providerThreadId: subagent.task.providerThreadId,
+            providerTurnId: null,
+            nativeItemRef: { driver, nativeId: nativeItemId, strength: "weak" },
+            role: "assistant",
+            text,
+            ordinal,
+            now,
+          });
+          yield* emitProviderEvent({ type: "message.updated", driver, message: artifacts.message });
+          yield* emitProviderEvent({
+            type: "turn_item.updated",
+            driver,
+            turnItem: artifacts.turnItem,
+          });
+        });
+
         const emitSubagentAssistant = Effect.fnUntraced(function* (
           subagent: ActiveAcpSubagent,
           text: string,
@@ -2653,27 +2751,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           const messageText = mode === "replace" ? text : `${previous}${text}`;
           subagent.assistantMessages.set(nativeItemId, messageText);
           subagent.assistantText = messageText;
-          const now = yield* DateTime.now;
-          const ordinal = resolveSubagentChildOrdinal(subagent, nativeItemId);
-          const artifacts = makeSubagentConversationArtifacts({
-            messageId: providerMessageId(nativeItemId),
-            turnItemId: providerTurnItemId(nativeItemId),
-            threadId: subagent.childThreadId,
-            rootNodeId: subagent.childRootNodeId,
-            providerThreadId: subagent.task.providerThreadId,
-            providerTurnId: null,
-            nativeItemRef: { driver, nativeId: nativeItemId, strength: "weak" },
-            role: "assistant",
-            text: subagent.assistantText,
-            ordinal,
-            now,
-          });
-          yield* emitProviderEvent({ type: "message.updated", driver, message: artifacts.message });
-          yield* emitProviderEvent({
-            type: "turn_item.updated",
-            driver,
-            turnItem: artifacts.turnItem,
-          });
+          yield* persistSubagentAssistant(
+            subagent,
+            nativeItemId,
+            acpSubagentStatusIsTerminal(subagent.task.status),
+          );
         });
 
         const projectSubagentNotification = Effect.fnUntraced(function* (
@@ -2791,6 +2873,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             childSessionId: null,
             assistantText: "",
             assistantMessages: new Map(),
+            assistantEmissions: new Map(),
             childItemOrdinals: new Map(),
             nextChildOrdinal: 101,
             terminalStatusProjected: false,
@@ -2892,6 +2975,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             update.result !== null
           ) {
             yield* emitSubagentAssistant(subagent, update.result);
+          }
+          if (acpSubagentStatusIsTerminal(taskStatus)) {
+            for (const [nativeItemId, emission] of subagent.assistantEmissions) {
+              if (emission.dirty) yield* persistSubagentAssistant(subagent, nativeItemId, true);
+            }
           }
           const result = update.result ?? subagent.task.result ?? (subagent.assistantText || null);
           subagent.task = {

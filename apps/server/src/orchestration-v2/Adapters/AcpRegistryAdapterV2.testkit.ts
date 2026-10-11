@@ -67,7 +67,7 @@ function layerAcpRegistryProviderAdapterRegistryReplay(
           ...(replayGate === undefined ? {} : { replayGate }),
         }),
         assertComplete: makeAcpReplayCompletenessAssertion(fileSystem, statusPath, transcript),
-      });
+      }).pipe(Effect.orDie);
       return [adapter];
     }),
   ).pipe(
