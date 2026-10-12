@@ -74,3 +74,9 @@ export const AcpRegistrySettings = makeProviderSettingsSchema(
   },
 );
 export type AcpRegistrySettings = typeof AcpRegistrySettings.Type;
+
+export function isCopilotAcpSettings(settings: AcpRegistrySettings): boolean {
+  return settings.source === "local"
+    ? /^copilot(\.exe|\.cmd)?$/i.test(settings.commandPath.split(/[\\/]/).pop() ?? "")
+    : settings.agentId === "github-copilot-cli";
+}

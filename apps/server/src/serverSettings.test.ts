@@ -727,6 +727,67 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       }).pipe(Effect.provide(layerServerSettings())),
   );
 
+  it.effect.each([
+    { source: "registry", agentId: "github-copilot-cli", commandPath: "" },
+    { source: "local", agentId: "", commandPath: "/opt/homebrew/bin/copilot" },
+  ])(
+    "retains enabled $source Copilot text generation selection instead of falling back to Codex",
+    (config) =>
+      Effect.gen(function* () {
+        const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+        const instanceId = ProviderInstanceId.make("acpRegistry_github_copilot");
+        const selection = { instanceId, model: "default" };
+        const next = yield* serverSettings.updateSettings({
+          providerInstances: {
+            [ProviderInstanceId.make("codex")]: {
+              driver: ProviderDriverKind.make("codex"),
+              enabled: true,
+              config: {},
+            },
+            [instanceId]: {
+              driver: ProviderDriverKind.make("acpRegistry"),
+              enabled: true,
+              config,
+            },
+          },
+          textGenerationModelSelection: selection,
+        });
+
+        assert.deepEqual(next.textGenerationModelSelection, selection);
+        assert.deepEqual(
+          (yield* serverSettings.getSettings).textGenerationModelSelection,
+          selection,
+        );
+      }).pipe(Effect.provide(layerServerSettings())),
+  );
+
+  it.effect("does not select unsupported ACP Registry text generation", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const instanceId = ProviderInstanceId.make("other-acp");
+      const next = yield* serverSettings.updateSettings({
+        providerInstances: {
+          [ProviderInstanceId.make("codex")]: {
+            driver: ProviderDriverKind.make("codex"),
+            enabled: true,
+            config: {},
+          },
+          [instanceId]: {
+            driver: ProviderDriverKind.make("acpRegistry"),
+            enabled: true,
+            config: { agentId: "other-acp" },
+          },
+        },
+        textGenerationModelSelection: { instanceId, model: "default" },
+      });
+
+      assert.deepEqual(next.textGenerationModelSelection, {
+        instanceId: ProviderInstanceId.make("codex"),
+        model: DEFAULT_SERVER_SETTINGS.textGenerationModelSelection.model,
+      });
+    }).pipe(Effect.provide(layerServerSettings())),
+  );
+
   // Only driver-keyed instances are fallback candidates; a custom instance id
   // is not one, so the selection stays put until the user changes it.
   it.effect.each(["codex"])(

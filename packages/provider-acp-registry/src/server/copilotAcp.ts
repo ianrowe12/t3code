@@ -6,13 +6,7 @@ import type {
   AcpAdapterV2ExtensionContext,
   AcpAdapterV2SubagentUpdate,
 } from "@t3tools/provider-acp/server/adapter";
-import type { AcpRegistrySettings } from "../settings.ts";
-
-export function isCopilotAcpSettings(settings: AcpRegistrySettings): boolean {
-  return settings.source === "local"
-    ? /^copilot(\.exe|\.cmd)?$/i.test(settings.commandPath.split(/[\\/]/).pop() ?? "")
-    : settings.agentId === "github-copilot-cli";
-}
+export { isCopilotAcpSettings } from "../settings.ts";
 
 // Copilot CLI streams subagent text as plain `agent_message_chunk`s on the
 // root session. Only its opt-in raw event feed says who wrote a chunk: each

@@ -33,6 +33,7 @@ import {
   ServerSettingsError,
   type ServerSettingsPatch,
 } from "@t3tools/contracts";
+import { AcpRegistrySettings, isCopilotAcpSettings } from "@t3tools/provider-acp-registry/settings";
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
@@ -80,6 +81,7 @@ export {
 const encodeServerSettings = Schema.encodeEffect(ServerSettings);
 const encodeServerSettingsJson = Schema.encodeUnknownEffect(fromJsonStringPretty(ServerSettings));
 const decodeServerSettings = Schema.decodeUnknownEffect(ServerSettings);
+const decodeAcpRegistrySettings = Schema.decodeUnknownOption(AcpRegistrySettings);
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -571,12 +573,18 @@ const TEXT_GENERATION_FALLBACK_DRIVERS = [
   "antigravity",
 ].map((driver) => ProviderDriverKind.make(driver));
 
-/** ACP Registry instances reject every application text-generation operation. */
 function selectionSupportsTextGeneration(
   settings: ServerSettings,
   selection: ModelSelection,
 ): boolean {
-  return settings.providerInstances[selection.instanceId]?.driver !== ACP_REGISTRY_DRIVER;
+  const instance = settings.providerInstances[selection.instanceId];
+  if (instance?.driver !== ACP_REGISTRY_DRIVER) {
+    return true;
+  }
+  return Option.match(decodeAcpRegistrySettings(instance.config), {
+    onNone: () => false,
+    onSome: isCopilotAcpSettings,
+  });
 }
 
 function resolveTextGenerationProvider(settings: ServerSettings): ServerSettings {
