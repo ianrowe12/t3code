@@ -3684,11 +3684,25 @@ it.effect("emits run_interrupt_result when hard-stop finalizes the active attemp
       written.map((item) => item.type),
       ["run_interrupt_result"],
     );
+
     assert.deepEqual(observed, ["run:interrupted", "pull-requests-refreshed"]);
     assert.deepEqual(
       committedEffects.map((effect) => effect.request.type),
       ["checkpoint.capture"],
     );
+  }),
+);
+
+it.effect("does not attribute an agent or provider interruption to the user", () =>
+  Effect.gen(function* () {
+    const { written } = yield* captureRootRunTermination({
+      key: "unattributed-interrupt",
+      shouldFinalizeRun: () => Effect.succeed(true),
+    });
+    const result = written.find((item) => item.type === "run_interrupt_result");
+    assert.isDefined(result);
+    if (result?.type !== "run_interrupt_result") return assert.fail("Missing interrupt result");
+    assert.equal(result.message, "Run interrupted");
   }),
 );
 
