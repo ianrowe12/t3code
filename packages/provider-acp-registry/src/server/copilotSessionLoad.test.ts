@@ -104,6 +104,58 @@ const makeFixture = Effect.fnUntraced(function* (allowSessionLoadReplayIdle: boo
 });
 
 it.layer(NodeServices.layer)("Copilot session load readiness", (it) => {
+  it.effect(
+    "quarantines historical replay and keeps current thought and answer channels separate",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* makeFixture(false);
+        const deltas = yield* fixture.runtime.getEvents().pipe(
+          Stream.filter((event) => event._tag === "ThoughtDelta" || event._tag === "ContentDelta"),
+          Stream.map((event) => ({ kind: event._tag, text: event.text })),
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        const prompt = yield* fixture.runtime
+          .prompt({ prompt: [{ type: "text", text: "Continue" }] })
+          .pipe(Effect.forkChild);
+        const load = yield* fixture.replay;
+        const update = (sessionUpdate: string, text: string, extra = {}) =>
+          fixture.send({
+            method: "session/update",
+            params: {
+              sessionId: "saved-native-session",
+              update: { sessionUpdate, content: { type: "text", text } },
+              ...extra,
+            },
+          });
+        yield* update("agent_thought_chunk", "Historical thought");
+        yield* fixture.respond(load, {});
+        const request = yield* fixture.takeRequest;
+        assert.equal(request.method, "session/prompt");
+        yield* update("agent_message_chunk", "Late historical answer", {
+          _meta: { isReplay: true },
+        });
+        yield* update("agent_thought_chunk", "Current thought");
+        yield* update("agent_message_chunk", "Foreign child answer", {
+          sessionId: "child-session",
+        });
+        yield* update("agent_message_chunk", "Current answer");
+        for (const type of ["user.message", "assistant.turn_start", "assistant.idle"]) {
+          yield* fixture.send({
+            method: "github.com/copilot/sessionEvent",
+            params: { sessionId: "saved-native-session", type, data: { interactionId: "current" } },
+          });
+        }
+        yield* fixture.respond(request, { stopReason: "end_turn" });
+        assert.deepEqual(yield* Fiber.join(deltas), [
+          { kind: "ThoughtDelta", text: "Current thought" },
+          { kind: "ContentDelta", text: "Current answer" },
+        ]);
+        assert.equal((yield* Fiber.join(prompt)).stopReason, "end_turn");
+      }),
+  );
+
   it.effect("does not dispatch a prompt until the saved native session acknowledges its load", () =>
     Effect.gen(function* () {
       const fixture = yield* makeFixture(false);
