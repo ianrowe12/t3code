@@ -168,7 +168,9 @@ function makeAcpRegistryRuntime(
       const context = yield* Layer.build(
         AcpSessionRuntime.layer({
           ...runtimeInput,
-          ...(isCopilot ? { cancelBehavior: "wait-for-prompt" as const } : {}),
+          ...(isCopilot
+            ? { cancelBehavior: "wait-for-prompt" as const, allowSessionLoadReplayIdle: false }
+            : {}),
           spawn:
             processEnvironment === undefined
               ? resolved.spawn

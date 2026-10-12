@@ -95,6 +95,10 @@ In this fork, Copilot resume failures preserve the saved native session identity
 explicitly rather than silently creating a replacement conversation and summarizing its history.
 Retry after resolving the native session or lock error.
 
+Copilot must acknowledge loading its saved session before T3 sends another prompt.
+A pause in replayed history is not proof that the native session is ready. Load
+timeouts and errors remain explicit, without replacing the saved conversation.
+
 When an agent advertises ACP session listing and import support, expand its provider card,
 choose a project, and select **List sessions**. Importing one creates a deterministic T3 thread
 backed by that native session. Importing the same agent session again returns the existing thread,

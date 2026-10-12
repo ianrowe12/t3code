@@ -98,6 +98,8 @@ export interface AcpSessionRuntimeOptions {
   readonly resumeMethod?: "load" | "resume";
   readonly sessionLoadTimeout?: Duration.Input;
   readonly sessionLoadReplayIdleGap?: Duration.Input;
+  /** Set false when replay idleness cannot substitute for the agent's load acknowledgement. */
+  readonly allowSessionLoadReplayIdle?: boolean;
   readonly interruptPromptOnCancel?: boolean;
   /** Optional provider metadata forwarded on `session/cancel`. */
   readonly cancelMeta?: EffectAcpSchema.CancelNotification["_meta"];
@@ -2081,14 +2083,19 @@ export const make = (
               status: "started",
             });
 
-            const idleFiber = yield* waitForSessionLoadReplayIdle({
-              gateRef: sessionLoadGateRef,
-            }).pipe(Effect.forkIn(runtimeScope));
-            const loaded = yield* Effect.raceFirst(
-              acp.agent.loadSession(loadPayload),
-              Fiber.join(idleFiber),
-            ).pipe(
-              Effect.ensuring(Fiber.interrupt(idleFiber).pipe(Effect.ignore)),
+            const load = acp.agent.loadSession(loadPayload);
+            const readiness =
+              options.allowSessionLoadReplayIdle === false
+                ? load
+                : Effect.gen(function* () {
+                    const idleFiber = yield* waitForSessionLoadReplayIdle({
+                      gateRef: sessionLoadGateRef,
+                    }).pipe(Effect.forkIn(runtimeScope));
+                    return yield* Effect.raceFirst(load, Fiber.join(idleFiber)).pipe(
+                      Effect.ensuring(Fiber.interrupt(idleFiber).pipe(Effect.ignore)),
+                    );
+                  });
+            const loaded = yield* readiness.pipe(
               Effect.timeoutOption(sessionLoadTimeout),
               Effect.flatMap((result) =>
                 Option.match(result, {
@@ -2098,7 +2105,9 @@ export const make = (
                         operation: "call-rpc",
                         method: "session/load",
                         detail:
-                          "session/load timed out waiting for RPC response or replay idle gap",
+                          options.allowSessionLoadReplayIdle === false
+                            ? "session/load timed out waiting for the native load acknowledgement"
+                            : "session/load timed out waiting for RPC response or replay idle gap",
                         cause: undefined,
                       }),
                     ),
