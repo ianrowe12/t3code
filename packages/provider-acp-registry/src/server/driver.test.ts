@@ -44,6 +44,21 @@ function catalogWithInspection(
 }
 
 describe("acpRegistrySnapshotReadiness", () => {
+  it("offers automatic thread titles through the installed GitHub Copilot instance", () => {
+    const snapshot = buildCheckedAcpRegistrySnapshot({
+      ...identity,
+      settings: decodeSettings({ agentId: "github-copilot-cli" }),
+      checkedAt: "2026-10-12T19:40:48.321Z",
+      inspection: {
+        status: "ready",
+        agentId: "github-copilot-cli",
+        version: "1.0.96",
+        distribution: "binary",
+      },
+    });
+    expect(snapshot.supportsTextGeneration).toBe(true);
+  });
+
   it("treats a live empty command advertisement as an authoritative replacement", () => {
     const provider = buildCheckedAcpRegistrySnapshot({
       ...identity,

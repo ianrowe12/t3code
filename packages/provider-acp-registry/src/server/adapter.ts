@@ -6,6 +6,7 @@ import {
 import {
   copilotClientCapabilitiesMeta,
   extractCopilotSubagentUpdate,
+  isCopilotAcpSettings,
   makeCopilotSubagentRouting,
 } from "./copilotAcp.ts";
 import {
@@ -210,10 +211,7 @@ export const makeAcpRegistryAdapterV2 = Effect.fn("makeAcpRegistryAdapterV2")(fu
     options.settings.source === "local" ? `local:${options.instanceId}` : registryAgentId;
   const isDevin = registryAgentId === "devin";
   // Local installs launch the `copilot` binary directly with no registry id.
-  const isCopilot =
-    registryAgentId === "github-copilot-cli" ||
-    (options.settings.source === "local" &&
-      /^copilot(\.exe|\.cmd)?$/i.test(options.settings.commandPath.split(/[\\/]/).pop() ?? ""));
+  const isCopilot = isCopilotAcpSettings(options.settings);
   const copilotRouting = isCopilot ? makeCopilotSubagentRouting() : undefined;
   const textUpdateIntervalMs = isCopilot
     ? yield* Config.schema(
