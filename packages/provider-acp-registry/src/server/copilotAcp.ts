@@ -1,6 +1,7 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as AcpSchema from "effect-acp/compat";
+import * as AcpErrors from "effect-acp/errors";
 import type { AcpToolCallState } from "@t3tools/provider-acp/server/runtimeModel";
 import type {
   AcpAdapterV2ExtensionContext,
@@ -23,6 +24,27 @@ export const copilotClientCapabilitiesMeta = {
     ],
   },
 };
+
+const isAcpRequestError = Schema.is(AcpErrors.AcpRequestError);
+const isCopilotErrorData = Schema.is(Schema.Struct({ details: Schema.String }));
+
+/** Copilot keeps failing every prompt with these until its process is replaced. */
+const COPILOT_LOST_SESSION_MARKERS = [
+  "session event delivery failed: session not found: ",
+  "session lock unavailable during is_session_generation_current: acquisition timed out",
+];
+
+export function isCopilotLostSessionError(error: unknown): boolean {
+  if (!isAcpRequestError(error) || error.method !== "session/prompt" || error.code !== -32603) {
+    return false;
+  }
+  // Older Copilot reports the cause in data.details; its native ACP layer (1.0.105) in the message.
+  const texts = [
+    error.errorMessage,
+    ...(isCopilotErrorData(error.data) ? [error.data.details] : []),
+  ];
+  return texts.some((text) => COPILOT_LOST_SESSION_MARKERS.some((marker) => text.includes(marker)));
+}
 
 const CopilotSessionEvent = Schema.Struct({
   sessionId: Schema.String,
