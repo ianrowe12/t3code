@@ -98,10 +98,12 @@ function parseEvent(parsed: unknown, state: CopilotScanState): readonly UsageRec
     outputTokens,
     reasoningTokens: Math.min(outputTokens, usage.reasoningTokens ?? 0),
   };
-  const nanoAiu = usage.copilotUsage?.totalNanoAiu ?? 0;
-  // Partial and unavailable credits are not the full charge, and zero has no API-equivalent value.
+  const nanoAiu = usage.copilotUsage?.totalNanoAiu;
+  // Partial and unavailable credits are not the full charge; a complete zero is a real zero.
   const reportedCostUsd =
-    usage.aiCreditsStatus === "complete" && nanoAiu > 0 ? nanoAiu / COPILOT_NANO_AIU_PER_USD : null;
+    usage.aiCreditsStatus === "complete" && nanoAiu !== undefined
+      ? nanoAiu / COPILOT_NANO_AIU_PER_USD
+      : null;
   if (totalTokens(totals) === 0 && reportedCostUsd === null) return [];
   const identity = usage.accounting?.usageId ?? receipt.id;
   return [

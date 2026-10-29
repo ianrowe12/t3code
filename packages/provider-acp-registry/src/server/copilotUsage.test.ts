@@ -167,7 +167,8 @@ describe("copilotUsageFormat", () => {
   it.each([
     ["partial credits", { aiCreditsStatus: "partial" }, "price"],
     ["unavailable credits", { aiCreditsStatus: "unavailable" }, "price"],
-    ["zero credits", { copilotUsage: { totalNanoAiu: 0 } }, "price"],
+    ["zero credits", { copilotUsage: { totalNanoAiu: 0 } }, "zero"],
+    ["missing credits", { copilotUsage: undefined }, "price"],
     ["a BYOK model", { isByok: true, copilotUsage: undefined }, "byok"],
     ["cache tokens above input", { cacheReadTokens: 1 }, "malformed"],
     ["a non-integer counter", { outputTokens: 1.5 }, "malformed"],
@@ -194,7 +195,7 @@ describe("copilotUsageFormat", () => {
     }
     expect(malformedRecords).toBe(0);
     expect(records).toHaveLength(1);
-    expect(records[0]?.reportedCostUsd).toBeNull();
+    expect(records[0]?.reportedCostUsd).toBe(expected === "zero" ? 0 : null);
     expect(records[0]?.rateModel).toBe(
       expected === "byok" ? undefined : "github_copilot/claude-opus-5.5",
     );
