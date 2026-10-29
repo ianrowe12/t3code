@@ -204,6 +204,7 @@ const layerService = (input: {
       Layer.succeed(HostProcess.Environment, {
         HOME: input.home,
         GROK_HOME: NodePath.join(input.home, "grok"),
+        COPILOT_HOME: NodePath.join(input.home, "copilot"),
         PI_CODING_AGENT_DIR: NodePath.join(input.home, "pi"),
         OPENCODE_DATA_DIR: NodePath.join(input.home, "opencode"),
         ANTIGRAVITY_DATA_DIR: NodePath.join(input.home, "antigravity"),
@@ -1328,6 +1329,110 @@ describe("UsageService", () => {
           Effect.provideService(HostProcess.HomeDirectory, home),
         );
       }
+    }).pipe(Effect.scoped),
+  );
+
+  it.live("reads Copilot homes once and counts a resumed session's receipts once", () =>
+    Effect.gen(function* () {
+      const { home, settings } = yield* setup;
+      const receipt = (usageId: string, outputTokens: number, agentId?: string) => ({
+        type: "session.usage_record",
+        ...(agentId === undefined ? {} : { agentId }),
+        timestamp: "2026-08-01T10:00:00Z",
+        data: {
+          usage: {
+            model: agentId === undefined ? "claude-opus-5.5" : "gpt-6.1-sol",
+            inputTokens: 30,
+            outputTokens,
+            cacheReadTokens: 10,
+            cacheWriteTokens: 15,
+            accounting: { sourceSessionId: agentId ?? "session", sequence: 1, usageId },
+            copilotUsage: { totalNanoAiu: 1_000_000_000 },
+            aiCreditsStatus: "complete",
+          },
+        },
+      });
+      const writeSession = (homeDir: string, sessionId: string, lines: readonly unknown[]) =>
+        Effect.promise(async () => {
+          const dir = NodePath.join(home, homeDir, "session-state", sessionId);
+          await NodeFSP.mkdir(dir, { recursive: true });
+          await NodeFSP.appendFile(
+            NodePath.join(dir, "events.jsonl"),
+            lines.map((line) => encodeUnknownJsonString(line) + "\n").join(""),
+          );
+        });
+      const start = (sessionId: string) => ({ type: "session.start", data: { sessionId } });
+      yield* writeSession("copilot", "host", [start("host"), receipt("host-1", 3)]);
+      yield* writeSession("copilot-work", "work", [start("work"), receipt("work-1", 5)]);
+      yield* writeSession("devin-home", "devin", [start("devin"), receipt("devin-1", 7)]);
+      const copilotInstance = (agentId: string, copilotHome: string) => ({
+        driver: ProviderDriverKind.make("acpRegistry"),
+        config: { agentId },
+        environment: [{ name: "COPILOT_HOME", value: copilotHome, sensitive: false }],
+      });
+      yield* Effect.gen(function* () {
+        const service = yield* UsageService.make;
+        const copilot = (summary: UsageSummary) => ({
+          output: summary.buckets
+            .filter((bucket) => bucket.provider === "copilot")
+            .reduce((sum, bucket) => sum + bucket.totals.outputTokens, 0),
+          sources: summary.sources
+            .filter((source) => source.fingerprint.provider === "copilot")
+            .map((source) => [
+              NodePath.relative(home, source.fingerprint.resolvedHomePath),
+              source.distinctSessions,
+            ]),
+        });
+        const first = yield* service.readSummary(WINDOW);
+        assert.deepStrictEqual(copilot(first), {
+          output: 8,
+          sources: [
+            ["copilot-work/session-state", 1],
+            ["copilot/session-state", 1],
+          ],
+        });
+        assert.isTrue(
+          first.buckets.every(
+            (bucket) => bucket.provider !== "copilot" || bucket.costSource === "providerReported",
+          ),
+        );
+
+        yield* writeSession("copilot", "host", [
+          { type: "session.resume", data: { eventCount: 2 } },
+          receipt("host-1", 3),
+          receipt("host-subagent-1", 11, "subagent"),
+        ]);
+        assert.deepStrictEqual(copilot(yield* service.readSummary(WINDOW)), {
+          output: 19,
+          sources: [
+            ["copilot-work/session-state", 1],
+            ["copilot/session-state", 1],
+          ],
+        });
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          layerService({
+            prefix: "usage-copilot",
+            home,
+            settings: {
+              ...settings,
+              providerInstances: {
+                ...settings.providerInstances,
+                [ProviderInstanceId.make("copilot-work")]: copilotInstance(
+                  "github-copilot-cli",
+                  "~/copilot-work",
+                ),
+                [ProviderInstanceId.make("devin")]: copilotInstance(
+                  "devin",
+                  NodePath.join(home, "devin-home"),
+                ),
+              },
+            },
+          }),
+        ),
+        Effect.provideService(HostProcess.HomeDirectory, home),
+      );
     }).pipe(Effect.scoped),
   );
 

@@ -374,7 +374,11 @@ export function UsageLimitsSection({
 }) {
   const presentations = useAtomValue(environmentPresentations.presentationsWithProvidersAtom);
   const hiddenDrivers = new Set<ServerProvider["driver"]>(
-    [...hiddenProviders].map((provider) => PROVIDER_PRESENTATION[provider].driverKind),
+    // ACP Registry limits can belong to any registry agent, not only the one a usage series names.
+    [...hiddenProviders].flatMap((provider) => {
+      const { driverKind, acpRegistryAgentId } = PROVIDER_PRESENTATION[provider];
+      return acpRegistryAgentId === undefined ? [driverKind] : [];
+    }),
   );
   const isVisible = (driver: ServerProvider["driver"]) => !hiddenDrivers.has(driver);
   const selected = new Map(
