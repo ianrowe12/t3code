@@ -41,7 +41,7 @@ export function useProviderColors(): Record<UsageProviderKind, string> {
     antigravity: "#8c7bd1",
     pi: "#4d9f8a",
     muse: "#0866ff",
-    copilot: "#d29922",
+    copilot: "#8534f3",
   };
 }
 

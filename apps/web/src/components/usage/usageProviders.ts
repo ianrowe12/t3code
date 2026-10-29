@@ -48,7 +48,7 @@ export const PROVIDER_PRESENTATION: Record<UsageProviderKind, UsageProviderPrese
   },
   copilot: {
     label: "GitHub Copilot",
-    color: "#d29922",
+    color: "#8534f3",
     driverKind: ProviderDriverKind.make("acpRegistry"),
     acpRegistryAgentId: "github-copilot-cli",
   },
