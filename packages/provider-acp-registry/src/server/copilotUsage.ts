@@ -1,6 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils";
-import { NonNegativeInt } from "@t3tools/contracts";
+import { NonNegativeInt, ProviderInstanceId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
@@ -17,10 +17,14 @@ import {
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import type { AcpRegistrySettings } from "../settings.ts";
+import { ACP_REGISTRY_PROVIDER } from "./adapter.ts";
 import { isCopilotAgent } from "./copilotAcp.ts";
 
 /** GitHub bills one AI credit at $0.01, and Copilot records credits in nano-AIU (1e-9 credits). */
 const COPILOT_NANO_AIU_PER_USD = 100_000_000_000;
+
+/** Usage adds an unconfigured entry under this ID for the host's Copilot CLI when no instance claims it. */
+const HOST_INSTANCE_ID = ProviderInstanceId.make(ACP_REGISTRY_PROVIDER);
 
 const CopilotScanState = Schema.Struct({
   sessionId: Schema.mutableKey(Schema.String),
@@ -164,15 +168,17 @@ export const copilotUsageReader: ProviderUsageReader<AcpRegistrySettings, Path.P
   provider: "copilot",
   format: copilotUsageFormat,
   directories: Effect.fn("copilotUsageReader.directories")(function* ({
+    instanceId,
     config,
     environment,
-    configured,
   }) {
-    // The unconfigured default entry reads the host's Copilot CLI history; other ACP agents have none.
-    if (configured && (config === undefined || !isCopilotAgent(config))) return [];
+    const runsCopilot = config !== undefined && isCopilotAgent(config);
+    // An instance holding the host ID still owns the host's Copilot CLI history, whichever agent it runs.
+    if (!runsCopilot && instanceId !== HOST_INSTANCE_ID) return [];
     const path = yield* Path.Path;
     const homeDirectory = yield* HostProcess.HomeDirectory;
-    const copilotHome = environment.COPILOT_HOME?.trim();
+    const copilotEnvironment = runsCopilot ? environment : yield* HostProcess.Environment;
+    const copilotHome = copilotEnvironment.COPILOT_HOME?.trim();
     const home = copilotHome
       ? expandHomePath(copilotHome, homeDirectory)
       : path.join(homeDirectory, ".copilot");
