@@ -26,7 +26,6 @@ export const copilotClientCapabilitiesMeta = {
 };
 
 const isAcpRequestError = Schema.is(AcpErrors.AcpRequestError);
-const isCopilotErrorData = Schema.is(Schema.Struct({ details: Schema.String }));
 
 /** Copilot keeps failing every prompt with these until its process is replaced. */
 const COPILOT_LOST_SESSION_MARKERS = [
@@ -39,11 +38,11 @@ export function isCopilotLostSessionError(error: unknown): boolean {
     return false;
   }
   // Older Copilot reports the cause in data.details; its native ACP layer (1.0.105) in the message.
-  const texts = [
-    error.errorMessage,
-    ...(isCopilotErrorData(error.data) ? [error.data.details] : []),
-  ];
-  return texts.some((text) => COPILOT_LOST_SESSION_MARKERS.some((marker) => text.includes(marker)));
+  return [error.errorMessage, record(error.data)?.details].some(
+    (text) =>
+      typeof text === "string" &&
+      COPILOT_LOST_SESSION_MARKERS.some((marker) => text.includes(marker)),
+  );
 }
 
 const CopilotSessionEvent = Schema.Struct({
