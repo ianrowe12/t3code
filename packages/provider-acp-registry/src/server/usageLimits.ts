@@ -237,6 +237,7 @@ export const readCopilotUsageLimits = Effect.fn("readCopilotUsageLimits")(functi
     : probeFailed(checkedAt);
   return {
     ...limits,
+    providerLabel: "GitHub Copilot",
     ...(credentialFingerprint ? { credentialFingerprint } : {}),
   };
 });

@@ -669,6 +669,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
                   ...provider,
                   usageLimits: {
                     checkedAt: provider.checkedAt,
+                    providerLabel: "GitHub Copilot",
                     windows: [],
                     unavailable: {
                       reason: "probeFailed" as const,

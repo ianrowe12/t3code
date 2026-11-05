@@ -77,7 +77,12 @@ describe("applyUsageLimitsUpdate", () => {
   it("preserves reset credits when a streamed window update changes usage", () => {
     const resetCredits = { availableCount: 2, nextExpiresAt: "2026-10-01T00:00:00.000Z" };
     const next = applyUsageLimitsUpdate({
-      previous: { ...published, resetCredits, credentialFingerprint: "same-account" },
+      previous: {
+        ...published,
+        resetCredits,
+        credentialFingerprint: "same-account",
+        providerLabel: "GitHub Copilot",
+      },
       checkedAt: "2026-09-03T12:00:05.000Z",
       update: { windows: [{ ...session, usedPercent: 55 }] },
     });
@@ -87,6 +92,7 @@ describe("applyUsageLimitsUpdate", () => {
       windows: [{ ...session, usedPercent: 55 }, weekly],
       resetCredits,
       credentialFingerprint: "same-account",
+      providerLabel: "GitHub Copilot",
     });
   });
 });

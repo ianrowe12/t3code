@@ -83,6 +83,7 @@ export function applyUsageLimitsUpdate(input: {
     previous === undefined ? { reason: "probeFailed" as const } : previous.unavailable;
   return {
     ...makeUsageLimits({ checkedAt: input.checkedAt, windows: merged.values() }),
+    ...(previous?.providerLabel !== undefined ? { providerLabel: previous.providerLabel } : {}),
     ...(previous?.credentialFingerprint !== undefined
       ? { credentialFingerprint: previous.credentialFingerprint }
       : {}),

@@ -22,8 +22,18 @@ const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 
-export function usageLimitsDriverLabel(driver: ServerProvider["driver"]): string {
-  return PROVIDER_DISPLAY_NAMES[driver] ?? String(driver);
+export function usageLimitsDriverLabel(
+  driver: ServerProvider["driver"],
+  limits?: ServerProviderUsageLimits,
+): string {
+  return limits?.providerLabel ?? PROVIDER_DISPLAY_NAMES[driver] ?? String(driver);
+}
+
+function usageLimitsProviderKey(
+  driver: ServerProvider["driver"],
+  limits?: ServerProviderUsageLimits,
+): string {
+  return limits?.providerLabel ? `${driver}:${limits.providerLabel}` : String(driver);
 }
 
 export function exhaustedUsageWindow(
@@ -199,9 +209,10 @@ function accountKey(
   limits?: ServerProviderUsageLimits,
 ): string | null {
   const normalizedEmail = email?.trim().toLowerCase();
-  if (normalizedEmail) return `${driver}:${normalizedEmail}`;
+  const providerKey = usageLimitsProviderKey(driver, limits);
+  if (normalizedEmail) return `${providerKey}:${normalizedEmail}`;
   return limits?.credentialFingerprint
-    ? `${driver}:credential:${limits.credentialFingerprint}`
+    ? `${providerKey}:credential:${limits.credentialFingerprint}`
     : null;
 }
 
@@ -314,7 +325,8 @@ export function collectLimitAccounts(presentations: LimitPresentations): readonl
       ...previous,
       displayName:
         hubEmail &&
-        displayName?.toLowerCase() === PROVIDER_DISPLAY_NAMES[previous.driver]?.toLowerCase()
+        displayName?.toLowerCase() ===
+          (previous.limits.providerLabel ?? PROVIDER_DISPLAY_NAMES[previous.driver])?.toLowerCase()
           ? null
           : displayName,
       plan: planSources.get(key)?.plan ?? previous.plan ?? next.plan,
@@ -403,7 +415,9 @@ export function collectLimitNotices(presentations: LimitPresentations): readonly
     for (const provider of providersWithLimits(presentation.serverConfig?.providers ?? [])) {
       if (provider.usageLimits?.unavailable?.reason === "unsupported") continue;
       const notice = provider.usageLimits ? limitsNotice(provider.usageLimits) : null;
-      const name = provider.displayName?.trim() || usageLimitsDriverLabel(provider.driver);
+      const name =
+        provider.displayName?.trim() ||
+        usageLimitsDriverLabel(provider.driver, provider.usageLimits);
       if (notice) notices.push(`${label(environmentLabel, name)}: ${notice}`);
     }
     for (const source of presentation.serverConfig?.usageLimitSources ?? []) {
@@ -443,6 +457,8 @@ export interface LimitPoolWindow {
 }
 
 export interface LimitPool {
+  readonly key: string;
+  readonly label: string;
   readonly driver: ServerProvider["driver"];
   readonly accounts: readonly LimitAccount[];
   readonly windows: readonly LimitPoolWindow[];
@@ -479,13 +495,15 @@ export function collectLimitPools(
   accounts: readonly LimitAccount[],
   now: number,
 ): readonly LimitPool[] {
-  const byDriver = new Map<ServerProvider["driver"], LimitAccount[]>();
+  const byProvider = new Map<string, LimitAccount[]>();
   for (const account of accounts) {
-    const list = byDriver.get(account.driver);
+    const key = usageLimitsProviderKey(account.driver, account.limits);
+    const list = byProvider.get(key);
     if (list) list.push(account);
-    else byDriver.set(account.driver, [account]);
+    else byProvider.set(key, [account]);
   }
-  return [...byDriver].map(([driver, members]) => {
+  return [...byProvider].map(([key, members]) => {
+    const { driver, limits } = members[0]!;
     const orderWindow = members
       .flatMap((account) => account.limits.windows)
       .sort((left, right) => WINDOW_KIND_ORDER[left.kind] - WINDOW_KIND_ORDER[right.kind])[0];
@@ -504,7 +522,13 @@ export function collectLimitPools(
         accountSortName(left).localeCompare(accountSortName(right)) ||
         left.key.localeCompare(right.key),
     );
-    return { driver, accounts: sorted, windows: poolWindows(sorted, now) };
+    return {
+      key,
+      label: usageLimitsDriverLabel(driver, limits),
+      driver,
+      accounts: sorted,
+      windows: poolWindows(sorted, now),
+    };
   });
 }
 
@@ -779,7 +803,12 @@ export function collectProviderUsageLimits(
     { usage: NativeSnapshot; credits: NativeSnapshot | null }
   >();
   for (const provider of providersWithLimits(providers)) {
-    if (provider.driver !== selected.driver || !provider.usageLimits) continue;
+    if (
+      !provider.usageLimits ||
+      usageLimitsProviderKey(provider.driver, provider.usageLimits) !==
+        usageLimitsProviderKey(selected.driver, selected.usageLimits)
+    )
+      continue;
     const snapshot = { provider, limits: provider.usageLimits };
     const key = resolveKey(nativeReport(provider)) ?? `instance:${provider.instanceId}`;
     const previous = nativeByAccount.get(key);
@@ -841,7 +870,7 @@ export function collectProviderUsageLimits(
     accounts.push({
       id: provider.instanceId,
       driver: provider.driver,
-      label: `${provider.displayName?.trim() || usageLimitsDriverLabel(provider.driver)} [${provider.instanceId}]`,
+      label: `${provider.displayName?.trim() || usageLimitsDriverLabel(provider.driver, limits)} [${provider.instanceId}]`,
       ...(provider.auth.label ? { plan: provider.auth.label } : {}),
       instanceId: provider.instanceId,
       resetCreditInput:
@@ -859,7 +888,11 @@ export function collectProviderUsageLimits(
     });
   }
   for (const source of sources) {
-    const matching = source.accounts.filter((account) => account.driver === selected.driver);
+    const matching = source.accounts.filter(
+      (account) =>
+        usageLimitsProviderKey(account.driver, account.usageLimits) ===
+        usageLimitsProviderKey(selected.driver, selected.usageLimits),
+    );
     for (const account of matching) {
       const key = resolveKey(account);
       if (key && nativeAccountKeys.has(key)) continue;

@@ -86,7 +86,7 @@ function AccountAvatar({
     return (
       <ProviderInstanceIcon
         driverKind={account.driver}
-        displayName={account.displayName ?? usageLimitsDriverLabel(account.driver)}
+        displayName={account.displayName ?? usageLimitsDriverLabel(account.driver, account.limits)}
         accentColor={account.accentColor}
         showBadge={Boolean(account.displayName)}
         indicatorBackground="var(--popover)"
@@ -113,7 +113,9 @@ function AccountName({
       </span>
     );
   }
-  return <span className={className}>{usageLimitsDriverLabel(account.driver)}</span>;
+  return (
+    <span className={className}>{usageLimitsDriverLabel(account.driver, account.limits)}</span>
+  );
 }
 
 function Row({ label, children }: { readonly label: string; readonly children: ReactNode }) {
@@ -156,7 +158,7 @@ function SegmentPopover({
         <span className="flex items-center gap-2 text-sm font-medium text-foreground">
           <AccountAvatar account={account} />
           <span className="truncate">
-            {account.displayName ?? usageLimitsDriverLabel(account.driver)}
+            {account.displayName ?? usageLimitsDriverLabel(account.driver, account.limits)}
           </span>
         </span>
         {account.email ? (
@@ -569,7 +571,7 @@ function PoolWindowCard({
 
 function PoolSection({ pool, now }: { readonly pool: LimitPool; readonly now: number }) {
   const color = barColor(pool.driver);
-  const label = usageLimitsDriverLabel(pool.driver);
+  const label = pool.label;
   const windows = displayLimitWindows(pool);
   return (
     <section className="flex flex-col gap-3">
@@ -628,7 +630,7 @@ export function UsageLimitsPooled({
       ) : null}
       <SegmentPopoverContext value={segmentPopover}>
         {pools.map((pool, index) => (
-          <Fragment key={pool.driver}>
+          <Fragment key={pool.key}>
             {index === cursorPromptAt ? cursorPrompt : null}
             <PoolSection pool={pool} now={now} />
           </Fragment>

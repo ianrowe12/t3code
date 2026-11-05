@@ -300,6 +300,7 @@ describe("Copilot quota transport", () => {
           detail: "234,000 of 1,000,000 ($2,340)",
         });
         expect(limits.credentialFingerprint).toBe(hashTelemetryId("github-copilot\0example-login"));
+        expect(limits.providerLabel).toBe("GitHub Copilot");
         expect(JSON.stringify(limits)).not.toMatch(/Example-Login|never-publish/);
         expect(yield* Deferred.isDone(peer.stopped)).toBe(true);
         expect(peer.launches).toHaveLength(1);

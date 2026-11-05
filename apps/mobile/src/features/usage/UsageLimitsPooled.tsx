@@ -34,7 +34,7 @@ const PACE_LABEL = { ahead: "Ahead of pace", on: "On pace", under: "Under pace" 
 
 function accountName(account: LimitAccount) {
   if (account.displayName) return account.displayName;
-  if (!account.email) return usageLimitsDriverLabel(account.driver);
+  if (!account.email) return usageLimitsDriverLabel(account.driver, account.limits);
   return emailInitials(account.email) || "Account";
 }
 
@@ -445,14 +445,12 @@ export function UsageLimitsSection({
       {pools.map((pool, index) => {
         const windows = displayLimitWindows(pool);
         return (
-          <Fragment key={pool.driver}>
+          <Fragment key={pool.key}>
             {index === cursorPromptAt ? cursorPrompt : null}
             <View className="gap-3">
               <View className="flex-row items-center gap-2 px-1">
                 <ProviderIcon provider={pool.driver} size={18} />
-                <Text className="text-base font-t3-medium text-foreground">
-                  {usageLimitsDriverLabel(pool.driver)}
-                </Text>
+                <Text className="text-base font-t3-medium text-foreground">{pool.label}</Text>
               </View>
               {windows.map((window) => {
                 const details =
@@ -567,7 +565,7 @@ export function UsageLimitAccountScreen({ route }: AccountScreenProps) {
               <View className="flex-row items-center gap-2">
                 <ProviderIcon provider={account.driver} size={24} />
                 <Text className="flex-1 text-xl font-t3-bold text-foreground">
-                  {account.displayName ?? usageLimitsDriverLabel(account.driver)}
+                  {account.displayName ?? usageLimitsDriverLabel(account.driver, account.limits)}
                 </Text>
               </View>
               {account.email ? (
