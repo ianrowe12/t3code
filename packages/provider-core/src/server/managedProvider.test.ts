@@ -140,6 +140,71 @@ const enrichedSnapshotSecond: ServerProvider = {
 };
 
 describe("makeManagedServerProvider", () => {
+  it.effect.each(["never", "success"] as const)(
+    "publishes readiness and discovery independently of a %s quota read",
+    (quotaRead) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const quotaStarted = yield* Deferred.make<void>();
+          const quotaResult = yield* Deferred.make<NonNullable<ServerProvider["usageLimits"]>>();
+          const discoveryDone = yield* Deferred.make<void>();
+          const releaseCheck = yield* Deferred.make<void>();
+          const provider = yield* makeManagedServerProvider<TestSettings>({
+            resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
+            getSettings: Effect.succeed({ enabled: true }),
+            streamSettings: Stream.empty,
+            haveSettingsChanged: () => false,
+            initialSnapshot: () => Effect.succeed(initialSnapshot),
+            checkProvider: Deferred.await(releaseCheck).pipe(Effect.as(refreshedSnapshot)),
+            checkUsageLimits: Deferred.succeed(quotaStarted, undefined).pipe(
+              Effect.andThen(quotaRead === "never" ? Effect.never : Deferred.await(quotaResult)),
+            ),
+            enrichSnapshot: ({ publishSnapshot }) =>
+              publishSnapshot(enrichedSnapshot).pipe(
+                Effect.andThen(Deferred.succeed(discoveryDone, undefined)),
+              ),
+            refreshInterval: "1 hour",
+          });
+          const discoveries = yield* provider.streamChanges.pipe(
+            Stream.take(2),
+            Stream.runCollect,
+            Effect.forkChild({ startImmediately: true }),
+          );
+          yield* Deferred.succeed(releaseCheck, undefined);
+          yield* Deferred.await(quotaStarted);
+          yield* Deferred.await(discoveryDone);
+          assert.deepStrictEqual(Array.from(yield* Fiber.join(discoveries)), [
+            refreshedSnapshot,
+            enrichedSnapshot,
+          ]);
+          assert.strictEqual(yield* Deferred.isDone(quotaResult), false);
+          if (quotaRead === "success") {
+            const limits = {
+              checkedAt: "2026-04-10T00:00:03.000Z",
+              credentialFingerprint: "login-a",
+              windows: [
+                { id: "chat", kind: "monthly", label: "Chat", detail: "4 of 200", usedPercent: 2 },
+              ],
+            } as const;
+            const usageUpdate = yield* provider.streamChanges.pipe(
+              Stream.take(1),
+              Stream.runCollect,
+              Effect.forkChild({ startImmediately: true }),
+            );
+            yield* Deferred.succeed(quotaResult, limits);
+            assert.deepStrictEqual(
+              Array.from(yield* Fiber.join(usageUpdate))[0]?.usageLimits,
+              limits,
+            );
+            assert.deepStrictEqual((yield* provider.getSnapshot).models, enrichedSnapshot.models);
+            assert.deepStrictEqual((yield* provider.refresh).usageLimits, limits);
+          } else {
+            assert.deepStrictEqual(yield* provider.getSnapshot, enrichedSnapshot);
+          }
+        }),
+      ).pipe(Effect.provide(layerAlwaysRunTest)),
+  );
+
   it.effect("invalidates cached usage and queues one refresh behind an in-flight refresh", () =>
     Effect.scoped(
       Effect.gen(function* () {
