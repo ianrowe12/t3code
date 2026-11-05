@@ -463,7 +463,7 @@ export const OpenCodeDriver: ProviderDriver<
       initialSnapshot: (settings) =>
         makePendingOpenCodeProvider(settings.provider).pipe(Effect.map(stampIdentity)),
       checkProvider,
-      checkUsageLimits,
+      recoverUsageLimits: checkUsageLimits,
       enrichSnapshot: ({ settings, snapshot, publishSnapshot }) =>
         resolveMaintenance().pipe(
           Effect.flatMap((maintenanceCapabilities) =>

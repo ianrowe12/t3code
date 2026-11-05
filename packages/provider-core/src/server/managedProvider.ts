@@ -44,7 +44,10 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
   readonly haveSettingsChanged: (previous: Settings, next: Settings) => boolean;
   readonly initialSnapshot: (settings: Settings) => Effect.Effect<ServerProvider>;
   readonly checkProvider: Effect.Effect<ServerProvider, ServerSettingsError>;
+  /** Independent of readiness and discovery; checkProvider must not also probe. */
   readonly checkUsageLimits?: Effect.Effect<ServerProvider["usageLimits"]>;
+  /** Retries failed inline quota reads without refreshing a ready catalog. */
+  readonly recoverUsageLimits?: Effect.Effect<ServerProvider["usageLimits"]>;
   readonly invalidateUsageCache?: Effect.Effect<void>;
   readonly enrichSnapshot?: (input: {
     readonly settings: Settings;
@@ -108,7 +111,7 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
       yield* Fiber.interrupt(previousFiber).pipe(Effect.ignore);
     }
 
-    if (!snapshot.enabled) {
+    if ((!input.enrichSnapshot && !input.checkUsageLimits) || !snapshot.enabled) {
       return;
     }
 
@@ -279,6 +282,13 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
     );
   });
 
+  const needsUsageRecovery = (snapshot: ServerProvider) =>
+    input.recoverUsageLimits !== undefined &&
+    snapshot.installed &&
+    snapshot.status === "ready" &&
+    snapshot.auth.status === "authenticated" &&
+    snapshot.usageLimits?.unavailable?.reason === "probeFailed";
+
   const needsProviderRefresh = (snapshot: ServerProvider) =>
     input.refreshOnInterval !== false &&
     (typeof input.refreshOnInterval !== "function" || input.refreshOnInterval(snapshot));
@@ -286,16 +296,32 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
   const refreshOnInterval = Effect.fn("ManagedServerProvider.refreshOnInterval")(function* () {
     const { snapshot } = yield* Ref.get(snapshotStateRef);
     if (!snapshot.enabled) return;
-    if (needsProviderRefresh(snapshot)) {
-      yield* applySnapshotBase(yield* input.getSettings, { forceRefresh: true });
+    if (!needsUsageRecovery(snapshot) || !input.recoverUsageLimits) {
+      if (needsProviderRefresh(snapshot)) {
+        yield* applySnapshotBase(yield* input.getSettings, { forceRefresh: true });
+      }
+      return;
     }
+    const probed = yield* input.recoverUsageLimits;
+    const next = yield* Ref.modify(snapshotStateRef, (state) => {
+      const usageLimits = resolveUsageLimitsAfterProbe({
+        published: state.snapshot.usageLimits,
+        probed,
+      });
+      const snapshot = withUsageLimits(state.snapshot, usageLimits);
+      return [snapshot, { ...state, snapshot }] as const;
+    });
+    yield* PubSub.publish(changesPubSub, next);
   });
 
   const shouldRefreshOnInterval = Effect.gen(function* () {
     const state = yield* Ref.get(snapshotStateRef);
     // A disabled instance has nothing to probe; a periodic check would only
     // republish a snapshot that differs in checkedAt.
-    if (!state.snapshot.enabled || !needsProviderRefresh(state.snapshot)) {
+    if (
+      !state.snapshot.enabled ||
+      (!needsUsageRecovery(state.snapshot) && !needsProviderRefresh(state.snapshot))
+    ) {
       return false;
     }
     const instanceId = state.snapshot.instanceId;
