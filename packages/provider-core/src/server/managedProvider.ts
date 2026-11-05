@@ -108,18 +108,43 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
       yield* Fiber.interrupt(previousFiber).pipe(Effect.ignore);
     }
 
-    if (!input.enrichSnapshot || !snapshot.enabled) {
+    if (!snapshot.enabled) {
       return;
     }
 
-    const fiber = yield* input
-      .enrichSnapshot({
-        settings,
-        snapshot,
-        getSnapshot: Ref.get(snapshotStateRef).pipe(Effect.map((state) => state.snapshot)),
-        publishSnapshot: (nextSnapshot) => publishEnrichedSnapshot(generation, nextSnapshot),
-      })
-      .pipe(Effect.ignoreCause({ log: true }), Effect.forkIn(scope));
+    const publishUsageLimits =
+      input.checkUsageLimits && snapshot.installed
+        ? input.checkUsageLimits.pipe(
+            Effect.flatMap((probed) =>
+              Ref.modify(snapshotStateRef, (state) => {
+                if (state.enrichmentGeneration !== generation) return [null, state] as const;
+                const usageLimits = resolveUsageLimitsAfterProbe({
+                  published: state.snapshot.usageLimits,
+                  probed,
+                });
+                if (usageLimits === state.snapshot.usageLimits) return [null, state] as const;
+                const next = withUsageLimits(state.snapshot, usageLimits);
+                return [next, { ...state, snapshot: next }] as const;
+              }),
+            ),
+            Effect.flatMap((next) =>
+              next === null ? Effect.void : PubSub.publish(changesPubSub, next).pipe(Effect.asVoid),
+            ),
+          )
+        : Effect.void;
+    const fiber = yield* Effect.forEach(
+      [
+        publishUsageLimits,
+        input.enrichSnapshot?.({
+          settings,
+          snapshot,
+          getSnapshot: Ref.get(snapshotStateRef).pipe(Effect.map((state) => state.snapshot)),
+          publishSnapshot: (nextSnapshot) => publishEnrichedSnapshot(generation, nextSnapshot),
+        }) ?? Effect.void,
+      ],
+      (effect) => effect.pipe(Effect.ignoreCause({ log: true })),
+      { concurrency: "unbounded", discard: true },
+    ).pipe(Effect.forkIn(scope));
 
     yield* Ref.set(enrichmentFiberRef, fiber);
   });
@@ -154,9 +179,10 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
     const { snapshot: nextSnapshot, generation: nextGeneration } = yield* Ref.modify(
       snapshotStateRef,
       (state) => {
-        const generation = input.enrichSnapshot
-          ? state.enrichmentGeneration + 1
-          : state.enrichmentGeneration;
+        const generation =
+          input.enrichSnapshot || input.checkUsageLimits
+            ? state.enrichmentGeneration + 1
+            : state.enrichmentGeneration;
         // Failed reads retain limits only for the same account and original workspace.
         const previous = state.snapshot.auth;
         const differs = (a: string | undefined, b: string | undefined) =>
@@ -167,10 +193,12 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
             probedSnapshot.auth.workspaceId !== previous.workspaceId);
         const usageLimits = switchedAccount
           ? probedSnapshot.usageLimits
-          : resolveUsageLimitsAfterProbe({
-              published: state.snapshot.usageLimits,
-              probed: probedSnapshot.usageLimits,
-            });
+          : input.checkUsageLimits && probedSnapshot.usageLimits === undefined
+            ? state.snapshot.usageLimits
+            : resolveUsageLimitsAfterProbe({
+                published: state.snapshot.usageLimits,
+                probed: probedSnapshot.usageLimits,
+              });
         const workspaceId =
           usageLimits === probedSnapshot.usageLimits ? undefined : state.snapshot.auth.workspaceId;
         const snapshot = withUsageLimits(
@@ -251,13 +279,6 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
     );
   });
 
-  const needsUsageRecovery = (snapshot: ServerProvider) =>
-    input.checkUsageLimits !== undefined &&
-    snapshot.installed &&
-    snapshot.status === "ready" &&
-    snapshot.auth.status === "authenticated" &&
-    snapshot.usageLimits?.unavailable?.reason === "probeFailed";
-
   const needsProviderRefresh = (snapshot: ServerProvider) =>
     input.refreshOnInterval !== false &&
     (typeof input.refreshOnInterval !== "function" || input.refreshOnInterval(snapshot));
@@ -265,32 +286,16 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
   const refreshOnInterval = Effect.fn("ManagedServerProvider.refreshOnInterval")(function* () {
     const { snapshot } = yield* Ref.get(snapshotStateRef);
     if (!snapshot.enabled) return;
-    if (!needsUsageRecovery(snapshot) || !input.checkUsageLimits) {
-      if (needsProviderRefresh(snapshot)) {
-        yield* applySnapshotBase(yield* input.getSettings, { forceRefresh: true });
-      }
-      return;
+    if (needsProviderRefresh(snapshot)) {
+      yield* applySnapshotBase(yield* input.getSettings, { forceRefresh: true });
     }
-    const probed = yield* input.checkUsageLimits;
-    const next = yield* Ref.modify(snapshotStateRef, (state) => {
-      const usageLimits = resolveUsageLimitsAfterProbe({
-        published: state.snapshot.usageLimits,
-        probed,
-      });
-      const snapshot = withUsageLimits(state.snapshot, usageLimits);
-      return [snapshot, { ...state, snapshot }] as const;
-    });
-    yield* PubSub.publish(changesPubSub, next);
   });
 
   const shouldRefreshOnInterval = Effect.gen(function* () {
     const state = yield* Ref.get(snapshotStateRef);
     // A disabled instance has nothing to probe; a periodic check would only
     // republish a snapshot that differs in checkedAt.
-    if (
-      !state.snapshot.enabled ||
-      (!needsUsageRecovery(state.snapshot) && !needsProviderRefresh(state.snapshot))
-    ) {
+    if (!state.snapshot.enabled || !needsProviderRefresh(state.snapshot)) {
       return false;
     }
     const instanceId = state.snapshot.instanceId;

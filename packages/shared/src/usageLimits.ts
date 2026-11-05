@@ -23,9 +23,7 @@ const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 
 export function usageLimitsDriverLabel(driver: ServerProvider["driver"]): string {
-  return driver === "acpRegistry"
-    ? "GitHub Copilot"
-    : (PROVIDER_DISPLAY_NAMES[driver] ?? String(driver));
+  return PROVIDER_DISPLAY_NAMES[driver] ?? String(driver);
 }
 
 export function exhaustedUsageWindow(
@@ -36,6 +34,7 @@ export function exhaustedUsageWindow(
   const exhausted = (provider?.usageLimits?.windows ?? []).filter(
     (window) =>
       (window.usedPercent ?? 0) >= 100 &&
+      !window.overageAllowed &&
       (!window.resetsAt ||
         !Number.isFinite(Date.parse(window.resetsAt)) ||
         Date.parse(window.resetsAt) > now),
@@ -428,6 +427,7 @@ export interface LimitPoolWindow {
   readonly id: string;
   readonly kind: ServerProviderUsageWindow["kind"];
   readonly label: string;
+  readonly detail?: string | undefined;
   readonly members: readonly LimitPoolMember[];
   readonly columns: ReadonlyArray<
     LimitPoolMember | { readonly account: LimitAccount; readonly window: null }
@@ -607,6 +607,7 @@ function poolWindows(accounts: readonly LimitAccount[], now: number): readonly L
       id,
       kind: first.kind,
       label: first.label,
+      ...(members.length === 1 && first.detail !== undefined ? { detail: first.detail } : {}),
       members,
       columns: accounts.map(
         (account) => memberByAccount.get(account.key) ?? { account, window: null },
@@ -699,10 +700,14 @@ export function isUsageLimitsCommand(prompt: string): boolean {
 }
 
 export function hasProviderUsageLimits(
-  driver: ServerProvider["driver"],
+  provider: ServerProvider,
   providers: readonly ServerProvider[],
   sources: UsageLimitSourceSnapshots,
 ): boolean {
+  if (provider.driver === "acpRegistry") {
+    return providersWithLimits([provider]).length > 0;
+  }
+  const { driver } = provider;
   return (
     providersWithLimits(providers).some((provider) => provider.driver === driver) ||
     sources.some(
@@ -736,7 +741,7 @@ export function withUsageLimitsCommands(
   sources: UsageLimitSourceSnapshots,
 ): ServerProvider[] {
   return providers.map((provider) => {
-    if (!hasProviderUsageLimits(provider.driver, providers, sources)) return provider;
+    if (!hasProviderUsageLimits(provider, providers, sources)) return provider;
     const commands = (items: readonly ServerProviderSlashCommand[]) => [
       ...items.filter((command) => command.name !== USAGE_LIMITS_COMMAND.name),
       USAGE_LIMITS_COMMAND,
@@ -763,7 +768,7 @@ export function collectProviderUsageLimits(
   now: number,
 ): UsageLimitsReport | null {
   const selected = providers.find((provider) => provider.instanceId === instanceId);
-  if (!selected || !hasProviderUsageLimits(selected.driver, providers, sources)) return null;
+  if (!selected || !hasProviderUsageLimits(selected, providers, sources)) return null;
   const resolveKey = accountKeyResolver([
     ...providers.filter((provider) => provider.enabled).map(nativeReport),
     ...sources.flatMap((source) => source.accounts),

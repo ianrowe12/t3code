@@ -23,6 +23,7 @@ import {
   paceRemainingPercent,
   usesChatGptSharing,
   resolveNewThreadModelSelection,
+  usageLimitsDriverLabel,
 } from "./usageLimits.ts";
 
 const now = Date.parse("2026-09-03T12:00:00.000Z");
@@ -79,6 +80,23 @@ describe("new thread model fallback", () => {
     ["missing default", { defaultSelection: null }, null],
     ["no fallback", { fallbackSelection: null }, selection],
     ["expired window", { now: Date.parse("2026-09-04T00:00:00Z") }, selection],
+    [
+      "Copilot overage",
+      {
+        providers: [
+          {
+            ...limited,
+            driver: ProviderDriverKind.make("acpRegistry"),
+            usageLimits: {
+              ...limited.usageLimits!,
+              windows: [{ ...window, usedPercent: 100, overageAllowed: true }],
+            },
+          },
+          available,
+        ],
+      },
+      selection,
+    ],
     [
       "environment disabled",
       {
@@ -780,8 +798,13 @@ describe("pools", () => {
                     usageLimits: {
                       checkedAt,
                       windows: [
-                        { ...window, usedPercent: 80, resetsAt: "2026-09-03T13:00:00.000Z" },
-                        { ...weekly, usedPercent: 20 },
+                        {
+                          ...window,
+                          detail: "80 of 100",
+                          usedPercent: 80,
+                          resetsAt: "2026-09-03T13:00:00.000Z",
+                        },
+                        { ...weekly, detail: "20 of 100", usedPercent: 20 },
                       ],
                     },
                   },
@@ -790,7 +813,7 @@ describe("pools", () => {
                     driver: claude,
                     usageLimits: {
                       checkedAt,
-                      windows: [{ ...window, usedPercent: 40 }],
+                      windows: [{ ...window, detail: "40 of 100", usedPercent: 40 }],
                     },
                   },
                   {
@@ -820,6 +843,12 @@ describe("pools", () => {
       ["codex", 1],
     ]);
     const [session, week] = pools[0]!.windows;
+    expect(session).not.toHaveProperty("detail");
+    expect(session?.members.map((member) => member.window.detail)).toEqual([
+      "80 of 100",
+      "40 of 100",
+    ]);
+    expect(week).toHaveProperty("detail", "20 of 100");
     const untimed = collectLimitPools(
       collectLimitAccounts(input).map((account) =>
         account.key === "hub:b"
@@ -1412,6 +1441,54 @@ describe("/usage-limits", () => {
     expect(
       withUsageLimitsCommands([selected], [])[0]?.slashCommands.map((command) => command.name),
     ).toEqual(["usage-limits"]);
+    const copilot = provider({
+      driver: ProviderDriverKind.make("acpRegistry"),
+      instanceId: ProviderInstanceId.make("copilot"),
+      usageLimits: { ...limits, credentialFingerprint: "same-login" },
+    });
+    const newerCopilot = {
+      ...copilot,
+      instanceId: ProviderInstanceId.make("copilot-newer"),
+      usageLimits: {
+        ...copilot.usageLimits!,
+        checkedAt: "2026-09-03T11:30:00.000Z",
+        windows: [{ ...window, usedPercent: 55 }],
+      },
+    };
+    const devin = {
+      ...copilot,
+      instanceId: ProviderInstanceId.make("devin"),
+      usageLimits: undefined,
+      workspaceSnapshots: withWorkspace.workspaceSnapshots!,
+    };
+    for (const providers of [
+      [copilot, newerCopilot, devin],
+      [devin, newerCopilot, copilot],
+    ]) {
+      expect(
+        withUsageLimitsCommands(providers, [unreadable]).find(
+          (entry) => entry.instanceId === devin.instanceId,
+        ),
+      ).toMatchObject({ slashCommands: [], workspaceSnapshots: [{ slashCommands: [] }] });
+      expect(collectProviderUsageLimits(devin.instanceId, providers, [unreadable], now)).toBeNull();
+      const report = collectProviderUsageLimits(copilot.instanceId, providers, [], now);
+      expect(report?.accounts.map((account) => account.id)).toEqual(["copilot-newer"]);
+      expect(report?.accounts[0]?.limits.windows[0]?.usedPercent).toBe(55);
+      expect(
+        collectLimitAccounts(
+          new Map([
+            [
+              EnvironmentId.make("local"),
+              {
+                entry: { target: { label: "Local" } },
+                serverConfig: { providers },
+              },
+            ],
+          ]),
+        ),
+      ).toMatchObject([{ limits: newerCopilot.usageLimits }]);
+    }
+    expect(usageLimitsDriverLabel(devin.driver)).toBe("ACP Registry");
   });
 });
 

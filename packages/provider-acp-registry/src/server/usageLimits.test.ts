@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { hashTelemetryId } from "@t3tools/shared/telemetryId";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -43,7 +44,8 @@ describe("Copilot quota mapping", () => {
       expected: [
         {
           id: "premium_interactions",
-          label: "AI credits: 234,000 of 1,000,000 ($2,340)",
+          label: "AI credits",
+          detail: "234,000 of 1,000,000 ($2,340)",
           usedPercent: 23.400000000000006,
         },
       ],
@@ -63,7 +65,8 @@ describe("Copilot quota mapping", () => {
       expected: [
         {
           id: "premium_interactions",
-          label: "Premium requests: 234 of 300",
+          label: "Premium requests",
+          detail: "234 of 300",
           usedPercent: 78,
           resetsAt: futureReset,
         },
@@ -80,7 +83,12 @@ describe("Copilot quota mapping", () => {
         },
       },
       expected: [
-        { id: "premium_interactions", label: "Premium requests: 234 of 300", usedPercent: 78 },
+        {
+          id: "premium_interactions",
+          label: "Premium requests",
+          detail: "234 of 300",
+          usedPercent: 78,
+        },
       ],
     },
     {
@@ -91,6 +99,11 @@ describe("Copilot quota mapping", () => {
     {
       name: "zero entitlement",
       snapshots: { premium_interactions: { ...quota, entitlementRequests: 0 } },
+      expected: [],
+    },
+    {
+      name: "completions alone do not report chat limits",
+      snapshots: { completions: { ...quota, entitlementRequests: -1 } },
       expected: [],
     },
     {
@@ -107,36 +120,41 @@ describe("Copilot quota mapping", () => {
       expected: [
         {
           id: "premium_interactions",
-          label: "AI credits: 1,100,000 of 1,000,000 ($11,000)",
+          label: "AI credits",
+          detail: "1,100,000 of 1,000,000 ($11,000)",
           usedPercent: 100,
+          overageAllowed: true,
         },
       ],
     },
     {
-      name: "capped chat and completions",
+      name: "capped chat ignores exhausted completions and unrelated quotas",
       snapshots: {
         chat: { ...quota, entitlementRequests: 200, usedRequests: 4, remainingPercentage: 98 },
         completions: {
           ...quota,
           entitlementRequests: 2_000,
-          usedRequests: 0,
-          remainingPercentage: 100,
+          usedRequests: 2_000,
+          remainingPercentage: 0,
         },
+        unrelated: quota,
       },
-      expected: [
-        { id: "chat", label: "Chat: 4 of 200", usedPercent: 2 },
-        { id: "completions", label: "Completions: 0 of 2,000", usedPercent: 0 },
-      ],
+      expected: [{ id: "chat", label: "Chat", detail: "4 of 200", usedPercent: 2 }],
     },
     {
       name: "near-present or invalid reset dates and percentages above 100",
       snapshots: {
         chat: { ...quota, remainingPercentage: 110, resetDate: "2026-11-05T00:00:30.000Z" },
-        completions: { ...quota, remainingPercentage: 100, resetDate: "not-a-date" },
+        premium_interactions: { ...quota, remainingPercentage: 100, resetDate: "not-a-date" },
       },
       expected: [
-        { id: "chat", label: "Chat: 234,000 of 1,000,000", usedPercent: 0 },
-        { id: "completions", label: "Completions: 234,000 of 1,000,000", usedPercent: 0 },
+        { id: "chat", label: "Chat", detail: "234,000 of 1,000,000", usedPercent: 0 },
+        {
+          id: "premium_interactions",
+          label: "AI credits",
+          detail: "234,000 of 1,000,000 ($2,340)",
+          usedPercent: 0,
+        },
       ],
     },
   ])("$name", ({ snapshots, expected }) => {
@@ -166,6 +184,7 @@ describe("Copilot quota mapping", () => {
 
 const makePeer = Effect.fn("test.makeCopilotQuotaPeer")(function* (
   output: readonly Uint8Array[] | "never" | "closed",
+  auth: unknown = { authInfo: { login: "Example-Login", token: "never-publish" } },
 ) {
   const requested = yield* Deferred.make<void>();
   const stopped = yield* Deferred.make<void>();
@@ -187,12 +206,27 @@ const makePeer = Effect.fn("test.makeCopilotQuotaPeer")(function* (
               const text = new TextDecoder().decode(bytes);
               const [header, body] = text.split("\r\n\r\n");
               expect(header).toBe(`Content-Length: ${encoder.encode(body!).length}`);
-              expect(JSON.parse(body!)).toEqual({
+              const request = JSON.parse(body!);
+              expect(request).toEqual({
                 jsonrpc: "2.0",
-                id: 1,
-                method: "account.getQuota",
+                id: request.id,
+                method: request.id === 1 ? "account.getQuota" : "account.getCurrentAuth",
                 params: {},
               });
+              if (request.id === 2) {
+                if (auth === "deferred") return;
+                yield* Queue.offer(
+                  stdout,
+                  frame({
+                    jsonrpc: "2.0",
+                    id: 2,
+                    ...(auth === "error"
+                      ? { error: { code: -32601, message: "unsupported" } }
+                      : { result: auth }),
+                  }),
+                );
+                return;
+              }
               yield* Deferred.succeed(requested, undefined);
               if (Array.isArray(output)) {
                 for (const chunk of output) yield* Queue.offer(stdout, chunk);
@@ -250,12 +284,23 @@ describe("Copilot quota transport", () => {
           id: 1,
           result: { quotaSnapshots: { premium_interactions: quota } },
         });
-        const bytes = new Uint8Array([...notice, ...other, ...reply]);
+        const authReply = frame({
+          jsonrpc: "2.0",
+          id: 2,
+          result: { authInfo: { login: "Example-Login", token: "never-publish" } },
+        });
+        const bytes = new Uint8Array([...notice, ...other, ...reply, ...authReply]);
         const peer = yield* makePeer(
           delivery === "fragmented" ? Array.from(bytes, (byte) => Uint8Array.of(byte)) : [bytes],
+          "deferred",
         );
         const limits = yield* peer.read;
-        expect(limits.windows[0]?.label).toBe("AI credits: 234,000 of 1,000,000 ($2,340)");
+        expect(limits.windows[0]).toMatchObject({
+          label: "AI credits",
+          detail: "234,000 of 1,000,000 ($2,340)",
+        });
+        expect(limits.credentialFingerprint).toBe(hashTelemetryId("github-copilot\0example-login"));
+        expect(JSON.stringify(limits)).not.toMatch(/Example-Login|never-publish/);
         expect(yield* Deferred.isDone(peer.stopped)).toBe(true);
         expect(peer.launches).toHaveLength(1);
         expect(peer.launches[0]).toMatchObject({
@@ -267,6 +312,26 @@ describe("Copilot quota transport", () => {
             killSignal: "SIGKILL",
           },
         });
+      }),
+  );
+
+  it.effect.each(["error", null, {}, { authInfo: { login: "" } }, { authInfo: { login: "  " } }])(
+    "keeps quota windows when current auth has no usable login: %j",
+    (auth) =>
+      Effect.gen(function* () {
+        const peer = yield* makePeer(
+          [
+            frame({
+              jsonrpc: "2.0",
+              id: 1,
+              result: { quotaSnapshots: { premium_interactions: quota } },
+            }),
+          ],
+          auth,
+        );
+        const limits = yield* peer.read;
+        expect(limits.windows).toHaveLength(1);
+        expect(limits.credentialFingerprint).toBeUndefined();
       }),
   );
 
@@ -285,6 +350,9 @@ describe("Copilot quota transport", () => {
         reason: "probeFailed",
         message: "GitHub Copilot could not read usage limits.",
       });
+      if (Array.isArray(output)) {
+        expect(limits.credentialFingerprint).toBe(hashTelemetryId("github-copilot\0example-login"));
+      }
       expect(yield* Deferred.isDone(peer.stopped)).toBe(true);
     }),
   );

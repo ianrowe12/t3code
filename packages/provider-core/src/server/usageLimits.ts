@@ -83,6 +83,9 @@ export function applyUsageLimitsUpdate(input: {
     previous === undefined ? { reason: "probeFailed" as const } : previous.unavailable;
   return {
     ...makeUsageLimits({ checkedAt: input.checkedAt, windows: merged.values() }),
+    ...(previous?.credentialFingerprint !== undefined
+      ? { credentialFingerprint: previous.credentialFingerprint }
+      : {}),
     ...(previous?.resetCredits !== undefined ? { resetCredits: previous.resetCredits } : {}),
     ...(unavailable !== undefined ? { unavailable } : {}),
   };
@@ -93,6 +96,8 @@ function usageWindowEquals(a: ServerProviderUsageWindow, b: ServerProviderUsageW
     a.id === b.id &&
     a.kind === b.kind &&
     a.label === b.label &&
+    a.detail === b.detail &&
+    a.overageAllowed === b.overageAllowed &&
     a.usedPercent === b.usedPercent &&
     a.resetsAt === b.resetsAt &&
     a.windowDurationMins === b.windowDurationMins
@@ -104,6 +109,7 @@ export function resolveUsageLimitsAfterProbe(input: {
   readonly probed: ServerProviderUsageLimits | undefined;
 }): ServerProviderUsageLimits | undefined {
   const { published, probed } = input;
+  if (published?.credentialFingerprint !== probed?.credentialFingerprint) return probed;
   if (probed?.unavailable?.reason === "probeFailed" && published && !published.unavailable) {
     return published;
   }

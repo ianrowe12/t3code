@@ -202,10 +202,12 @@ function baseSnapshot(
       ? null
       : (resolveOfficialAcpRegistryIconUrl(input.probe?.probe.icon) ??
         officialAcpRegistryIconUrlForAgentId(input.settings.agentId));
+  const displayName =
+    input.displayName ?? (isCopilotAgent(input.settings) ? "GitHub Copilot" : undefined);
   return {
     instanceId: input.instanceId,
     driver: DRIVER_KIND,
-    ...(input.displayName ? { displayName: input.displayName } : {}),
+    ...(displayName ? { displayName } : {}),
     ...(input.accentColor ? { accentColor: input.accentColor } : {}),
     ...(iconUrl ? { iconUrl } : {}),
     continuation: { groupKey: input.continuationKey },
@@ -588,14 +590,11 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
       Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, catalog),
       Effect.flatMap(withLiveRuntimeState),
     );
-    const checkProvider = checkReadiness.pipe(
-      Effect.filterOrElse(
-        (provider) => !(provider.enabled && provider.installed && isCopilotAgent(effectiveConfig)),
-        (provider) =>
-          readCopilotUsageLimits(effectiveConfig, host.paths.cwd, processEnvironment).pipe(
-            Effect.map((usageLimits) => ({ ...provider, usageLimits })),
-          ),
-      ),
+    const checkUsageLimits = readCopilotUsageLimits(
+      effectiveConfig,
+      host.paths.cwd,
+      processEnvironment,
+    ).pipe(
       Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, catalog),
       Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
     );
@@ -662,8 +661,26 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
       getSettings: snapshotSettings.getSettings,
       streamSettings: snapshotSettings.streamSettings,
       haveSettingsChanged: haveProviderSnapshotSettingsChanged,
-      initialSnapshot: () => checkReadiness,
-      checkProvider,
+      initialSnapshot: () =>
+        checkReadiness.pipe(
+          Effect.map((provider) =>
+            provider.enabled && provider.installed && isCopilotAgent(effectiveConfig)
+              ? {
+                  ...provider,
+                  usageLimits: {
+                    checkedAt: provider.checkedAt,
+                    windows: [],
+                    unavailable: {
+                      reason: "probeFailed" as const,
+                      message: "Checking GitHub Copilot usage limits...",
+                    },
+                  },
+                }
+              : provider,
+          ),
+        ),
+      checkProvider: checkReadiness,
+      ...(isCopilotAgent(effectiveConfig) ? { checkUsageLimits } : {}),
       enrichSnapshot: Effect.fn("enrichSnapshot")(function ({
         snapshot,
         getSnapshot,

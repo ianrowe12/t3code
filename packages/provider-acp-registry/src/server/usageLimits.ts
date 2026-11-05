@@ -5,6 +5,7 @@ import {
   makeUsageLimits,
 } from "@t3tools/provider-core/server/usageLimits";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
+import { hashTelemetryId } from "@t3tools/shared/telemetryId";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
@@ -24,17 +25,26 @@ const QuotaSnapshot = Schema.Struct({
   remainingPercentage: FiniteNumber,
   resetDate: Schema.optionalKey(Schema.String),
   tokenBasedBilling: Schema.optionalKey(Schema.Boolean),
+  overageAllowedWithExhaustedQuota: Schema.optionalKey(Schema.Boolean),
 });
 const QuotaResponse = Schema.Struct({
-  quotaSnapshots: Schema.Record(Schema.String, QuotaSnapshot),
+  quotaSnapshots: Schema.Struct({
+    premium_interactions: Schema.optionalKey(QuotaSnapshot),
+    chat: Schema.optionalKey(QuotaSnapshot),
+  }),
 });
 const decodeQuotaResponse = Schema.decodeUnknownOption(QuotaResponse);
+const decodeCurrentAuth = Schema.decodeUnknownOption(
+  Schema.Struct({
+    authInfo: Schema.Struct({ login: Schema.String }),
+  }),
+);
 const Reply = Schema.Struct({
   jsonrpc: Schema.Literal("2.0"),
-  id: Schema.Literal(1),
-  result: Schema.Unknown,
+  id: Schema.Literals([1, 2]),
+  result: Schema.optionalKey(Schema.Unknown),
 });
-const isReply = Schema.is(Schema.Struct({ id: Schema.Literal(1) }));
+const isReply = Schema.is(Schema.Struct({ id: Schema.Literals([1, 2]) }));
 const decodeReply = Schema.decodeUnknownEffect(Reply);
 const decodeJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
 const numberFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
@@ -60,17 +70,13 @@ export function copilotQuotaResponseToLimits(response: unknown, checkedAt: strin
   if (Option.isNone(decoded)) return probeFailed(checkedAt);
   const windows: ServerProviderUsageWindow[] = [];
   for (const [id, quota] of Object.entries(decoded.value.quotaSnapshots)) {
-    if (quota.isUnlimitedEntitlement || quota.entitlementRequests === 0) continue;
+    if (!quota || quota.isUnlimitedEntitlement || quota.entitlementRequests === 0) continue;
     const name =
       id === "premium_interactions"
         ? quota.tokenBasedBilling
           ? "AI credits"
           : "Premium requests"
-        : id === "chat"
-          ? "Chat"
-          : id === "completions"
-            ? "Completions"
-            : id;
+        : "Chat";
     const spend =
       id === "premium_interactions" && quota.tokenBasedBilling
         ? ` ($${numberFormat.format(quota.usedRequests * 0.01)})`
@@ -83,8 +89,12 @@ export function copilotQuotaResponseToLimits(response: unknown, checkedAt: strin
     windows.push({
       id,
       kind: "monthly",
-      label: `${name}: ${numberFormat.format(quota.usedRequests)} of ${numberFormat.format(quota.entitlementRequests)}${spend}`,
+      label: name,
+      detail: `${numberFormat.format(quota.usedRequests)} of ${numberFormat.format(quota.entitlementRequests)}${spend}`,
       usedPercent: clampPercent(100 - quota.remainingPercentage),
+      ...(quota.overageAllowedWithExhaustedQuota !== undefined
+        ? { overageAllowed: quota.overageAllowedWithExhaustedQuota }
+        : {}),
       ...(resetsAt ? { resetsAt } : {}),
     });
   }
@@ -144,7 +154,11 @@ export const readCopilotUsageLimits = Effect.fn("readCopilotUsageLimits")(functi
   environment: NodeJS.ProcessEnv,
 ) {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
-  return yield* Effect.gen(function* () {
+  let credentialFingerprint: string | undefined;
+  let quotaResult: unknown;
+  let receivedQuota = false;
+  let receivedAuth = false;
+  yield* Effect.gen(function* () {
     const catalog = yield* AcpRegistrySupport.AcpRegistryCatalog;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const { spawn } = yield* catalog.resolve(settings, cwd, environment);
@@ -174,9 +188,14 @@ export const readCopilotUsageLimits = Effect.fn("readCopilotUsageLimits")(functi
         killSignal: "SIGKILL",
       }),
     );
-    const request = '{"jsonrpc":"2.0","id":1,"method":"account.getQuota","params":{}}';
-    const body = new TextEncoder().encode(request);
-    const frame = new TextEncoder().encode(`Content-Length: ${body.length}\r\n\r\n${request}`);
+    const encoder = new TextEncoder();
+    const frames = [
+      { id: 2, method: "account.getCurrentAuth" },
+      { id: 1, method: "account.getQuota" },
+    ].map(({ id, method }) => {
+      const request = JSON.stringify({ jsonrpc: "2.0", id, method, params: {} });
+      return encoder.encode(`Content-Length: ${encoder.encode(request).length}\r\n\r\n${request}`);
+    });
     const readFrame = makeFrameReader();
     const response = child.stdout.pipe(
       Stream.mapEffect((chunk) =>
@@ -189,22 +208,35 @@ export const readCopilotUsageLimits = Effect.fn("readCopilotUsageLimits")(functi
       Stream.mapEffect((json) => decodeJson(json)),
       Stream.filter(isReply),
       Stream.mapEffect((reply) => decodeReply(reply)),
-      Stream.runHead,
-      Effect.flatMap(
-        Option.match({
-          onNone: () => Effect.fail(new CopilotQuotaReadError({})),
-          onSome: (reply) => Effect.succeed(reply.result),
+      Stream.tap((reply) =>
+        Effect.sync(() => {
+          if (reply.id === 1) {
+            quotaResult = reply.result;
+            receivedQuota = true;
+          } else {
+            const auth = decodeCurrentAuth(reply.result);
+            const login = Option.isSome(auth) ? auth.value.authInfo.login.trim().toLowerCase() : "";
+            credentialFingerprint = login ? hashTelemetryId(`github-copilot\0${login}`) : undefined;
+            receivedAuth = true;
+          }
         }),
       ),
+      Stream.takeUntil(() => receivedQuota && receivedAuth),
+      Stream.runDrain,
     );
-    const [, result] = yield* Effect.all(
-      [Stream.run(Stream.succeed(frame), child.stdin), response],
-      { concurrency: "unbounded" },
-    );
-    return copilotQuotaResponseToLimits(result, checkedAt);
+    yield* Effect.all([Stream.run(Stream.fromIterable(frames), child.stdin), response], {
+      concurrency: "unbounded",
+    });
   }).pipe(
     Effect.scoped,
     Effect.timeout("10 seconds"),
-    Effect.orElseSucceed(() => probeFailed(checkedAt)),
+    Effect.orElseSucceed(() => undefined),
   );
+  const limits = receivedQuota
+    ? copilotQuotaResponseToLimits(quotaResult, checkedAt)
+    : probeFailed(checkedAt);
+  return {
+    ...limits,
+    ...(credentialFingerprint ? { credentialFingerprint } : {}),
+  };
 });

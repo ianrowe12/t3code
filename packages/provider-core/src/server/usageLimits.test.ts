@@ -33,6 +33,14 @@ describe("applyUsageLimitsUpdate", () => {
       },
     });
     expect(next).toBe(published);
+    for (const changed of [{ detail: "41 of 100" }, { overageAllowed: true }]) {
+      const updated = applyUsageLimitsUpdate({
+        previous: published,
+        checkedAt,
+        update: { windows: [{ ...session, ...changed }] },
+      });
+      expect(updated?.windows[0]).toMatchObject(changed);
+    }
   });
 
   it("upserts by id and keeps the reset a percent-only update omits", () => {
@@ -69,7 +77,7 @@ describe("applyUsageLimitsUpdate", () => {
   it("preserves reset credits when a streamed window update changes usage", () => {
     const resetCredits = { availableCount: 2, nextExpiresAt: "2026-10-01T00:00:00.000Z" };
     const next = applyUsageLimitsUpdate({
-      previous: { ...published, resetCredits },
+      previous: { ...published, resetCredits, credentialFingerprint: "same-account" },
       checkedAt: "2026-09-03T12:00:05.000Z",
       update: { windows: [{ ...session, usedPercent: 55 }] },
     });
@@ -78,6 +86,7 @@ describe("applyUsageLimitsUpdate", () => {
       checkedAt: "2026-09-03T12:00:05.000Z",
       windows: [{ ...session, usedPercent: 55 }, weekly],
       resetCredits,
+      credentialFingerprint: "same-account",
     });
   });
 });
@@ -118,5 +127,21 @@ describe("resolveUsageLimitsAfterProbe", () => {
     expect(resolveUsageLimitsAfterProbe({ published, probed: failed })).toBe(published);
     expect(resolveUsageLimitsAfterProbe({ published, probed: unsupported })).toBe(unsupported);
     expect(resolveUsageLimitsAfterProbe({ published: undefined, probed: failed })).toBe(failed);
+    const identified = { ...published, credentialFingerprint: "login-a" };
+    for (const credentialFingerprint of ["login-a", "login-b", undefined]) {
+      const probed = { ...failed, credentialFingerprint };
+      expect(resolveUsageLimitsAfterProbe({ published: identified, probed })).toBe(
+        credentialFingerprint === "login-a" ? identified : probed,
+      );
+    }
+    const otherAccount = {
+      ...published,
+      checkedAt: "2026-09-03T11:59:00.000Z",
+      credentialFingerprint: "login-b",
+      windows: [{ ...session, usedPercent: 80 }],
+    };
+    expect(resolveUsageLimitsAfterProbe({ published: identified, probed: otherAccount })).toBe(
+      otherAccount,
+    );
   });
 });
