@@ -1455,7 +1455,12 @@ describe("/usage-limits", () => {
     const copilot = provider({
       driver: ProviderDriverKind.make("acpRegistry"),
       instanceId: ProviderInstanceId.make("copilot"),
-      usageLimits: { ...limits, credentialFingerprint: "same-login" },
+      displayName: "Work",
+      usageLimits: {
+        ...limits,
+        providerLabel: "GitHub Copilot",
+        credentialFingerprint: "same-login",
+      },
     });
     const newerCopilot = {
       ...copilot,
@@ -1469,6 +1474,7 @@ describe("/usage-limits", () => {
     const devin = {
       ...copilot,
       instanceId: ProviderInstanceId.make("devin"),
+      displayName: "Devin",
       usageLimits: undefined,
       workspaceSnapshots: withWorkspace.workspaceSnapshots!,
     };
@@ -1485,6 +1491,9 @@ describe("/usage-limits", () => {
       const report = collectProviderUsageLimits(copilot.instanceId, providers, [], now);
       expect(report?.accounts.map((account) => account.id)).toEqual(["copilot-newer"]);
       expect(report?.accounts[0]?.limits.windows[0]?.usedPercent).toBe(55);
+      expect(usageLimitsDriverLabel(report!.accounts[0]!.driver, report!.accounts[0]!.limits)).toBe(
+        "GitHub Copilot",
+      );
       expect(
         collectLimitAccounts(
           new Map([
@@ -1498,6 +1507,36 @@ describe("/usage-limits", () => {
           ]),
         ),
       ).toMatchObject([{ limits: newerCopilot.usageLimits }]);
+      const otherAgent = {
+        ...devin,
+        usageLimits: { ...limits, credentialFingerprint: "same-login" },
+      };
+      const accounts = collectLimitAccounts(
+        new Map([
+          [
+            EnvironmentId.make("local"),
+            {
+              entry: { target: { label: "Local" } },
+              serverConfig: { providers: [...providers, otherAgent] },
+            },
+          ],
+        ]),
+      );
+      expect(accounts).toHaveLength(2);
+      const pools = collectLimitPools(accounts, now);
+      expect(pools.map((pool) => pool.label).sort()).toEqual(["ACP Registry", "GitHub Copilot"]);
+      expect(new Set(pools.map((pool) => pool.key)).size).toBe(2);
+      expect(
+        pools.every((pool) => pool.windows.every((window) => window.members.length === 1)),
+      ).toBe(true);
+      expect(
+        collectProviderUsageLimits(
+          copilot.instanceId,
+          [...providers, otherAgent],
+          [],
+          now,
+        )?.accounts.map((account) => account.id),
+      ).toEqual(["copilot-newer"]);
     }
     expect(usageLimitsDriverLabel(devin.driver)).toBe("ACP Registry");
   });

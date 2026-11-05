@@ -13,7 +13,7 @@ import type { ComposerBannerStackItem } from "./ComposerBannerStack";
 
 function accountLabel(account: UsageLimitsReport["accounts"][number]): string {
   if (!account.instanceId) return account.label;
-  const driver = usageLimitsDriverLabel(account.driver);
+  const driver = usageLimitsDriverLabel(account.driver, account.limits);
   const instance =
     account.displayName?.trim() ||
     (String(account.instanceId) !== String(account.driver) ? account.instanceId : "");

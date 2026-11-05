@@ -58,6 +58,7 @@ describe("server config forward compatibility", () => {
       ...baseProviderSnapshot,
       usageLimits: {
         checkedAt: "2026-04-10T00:00:00.000Z",
+        providerLabel: "GitHub Copilot",
         windows: [
           { id: "primary", kind: "session", label: "Session", usedPercent: 12 },
           { id: "future", kind: "some-future-kind", label: "Future", usedPercent: 1 },
@@ -69,6 +70,7 @@ describe("server config forward compatibility", () => {
     expect(parsed.usageLimits?.windows).toEqual([
       { id: "primary", kind: "session", label: "Session", usedPercent: 12 },
     ]);
+    expect(parsed.usageLimits?.providerLabel).toBe("GitHub Copilot");
   });
 });
 
