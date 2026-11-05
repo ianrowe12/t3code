@@ -13,6 +13,7 @@ import {
   type LimitPoolWindow,
   paceRemainingPercent,
   remainingPercent,
+  usageLimitsDriverLabel,
 } from "@t3tools/shared/usageLimits";
 import type { Popover as PopoverPrimitive } from "@base-ui/react/popover";
 import { normalizeProviderAccentColor } from "@t3tools/client-runtime/state/provider-instance-display";
@@ -33,7 +34,6 @@ import { usePrimarySettings } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
 import { formatUpcomingTimestamp } from "../../timestampFormat";
 import { ProviderInstanceIcon } from "../chat/ProviderInstanceIcon";
-import { providerClients } from "../settings/providerDriverMeta";
 import { RedactedSensitiveText } from "../settings/RedactedSensitiveText";
 import { Button } from "../ui/button";
 import { OpenAI } from "../Icons";
@@ -86,11 +86,7 @@ function AccountAvatar({
     return (
       <ProviderInstanceIcon
         driverKind={account.driver}
-        displayName={
-          account.displayName ??
-          providerClients.get(account.driver)?.label ??
-          String(account.driver)
-        }
+        displayName={account.displayName ?? usageLimitsDriverLabel(account.driver)}
         accentColor={account.accentColor}
         showBadge={Boolean(account.displayName)}
         indicatorBackground="var(--popover)"
@@ -117,11 +113,7 @@ function AccountName({
       </span>
     );
   }
-  return (
-    <span className={className}>
-      {providerClients.get(account.driver)?.label ?? String(account.driver)}
-    </span>
-  );
+  return <span className={className}>{usageLimitsDriverLabel(account.driver)}</span>;
 }
 
 function Row({ label, children }: { readonly label: string; readonly children: ReactNode }) {
@@ -164,7 +156,7 @@ function SegmentPopover({
         <span className="flex items-center gap-2 text-sm font-medium text-foreground">
           <AccountAvatar account={account} />
           <span className="truncate">
-            {account.displayName ?? providerClients.get(account.driver)?.label ?? account.driver}
+            {account.displayName ?? usageLimitsDriverLabel(account.driver)}
           </span>
         </span>
         {account.email ? (
@@ -571,7 +563,7 @@ function PoolWindowCard({
 
 function PoolSection({ pool, now }: { readonly pool: LimitPool; readonly now: number }) {
   const color = barColor(pool.driver);
-  const label = providerClients.get(pool.driver)?.label ?? String(pool.driver);
+  const label = usageLimitsDriverLabel(pool.driver);
   const windows = displayLimitWindows(pool);
   return (
     <section className="flex flex-col gap-3">
