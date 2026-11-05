@@ -354,6 +354,7 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
   it.effect.each(
     [
       { name: "recovers" },
+      { name: "recovers after repeated failures", failures: 3 },
       { name: "skips without demand", demand: false },
       { name: "respects a disabled interval", intervalOff: true },
       { name: "skips disabled instances", enabled: false },
@@ -363,6 +364,7 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
       demand: true,
       intervalOff: false,
       unsupported: false,
+      failures: 1,
       ...scenario,
     })),
   )("Go usage recovery $name without restarting a ready catalog", (scenario) =>
@@ -379,7 +381,7 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
             return Effect.succeed(
               HttpClientResponse.fromWeb(request, new Response(null, { status: 403 })),
             );
-          if (usageReads === 1)
+          if (usageReads <= scenario.failures)
             return Deferred.succeed(usageStarted, undefined).pipe(Effect.andThen(Effect.never));
           const window = { percent: 10, resetsAt: "2026-11-01T00:00:00.000Z" };
           return Effect.succeed(
@@ -492,6 +494,16 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
 
       const shouldRecover =
         scenario.enabled && scenario.demand && !scenario.intervalOff && !scenario.unsupported;
+      if (shouldRecover) {
+        for (let failure = 1; failure < scenario.failures; failure += 1) {
+          yield* TestClock.adjust("305 seconds");
+          assert.strictEqual(usageReads, failure + 1);
+          assert.strictEqual(
+            (yield* instance.snapshot.getSnapshot).usageLimits?.unavailable?.reason,
+            "probeFailed",
+          );
+        }
+      }
       const recovery = shouldRecover
         ? yield* instance.snapshot.streamChanges.pipe(
             Stream.filter((snapshot) => snapshot.usageLimits?.windows.length === 3),
@@ -502,7 +514,7 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
         : undefined;
       yield* TestClock.adjust("5 minutes");
       const recovered = yield* instance.snapshot.getSnapshot;
-      const expectedReads = !scenario.enabled ? 0 : shouldRecover ? 2 : 1;
+      const expectedReads = !scenario.enabled ? 0 : shouldRecover ? scenario.failures + 1 : 1;
       assert.strictEqual(usageReads, expectedReads);
       if (recovery) assert.deepStrictEqual(Array.from(yield* Fiber.join(recovery)), [recovered]);
       assert.strictEqual(

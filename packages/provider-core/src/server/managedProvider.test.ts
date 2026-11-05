@@ -140,15 +140,24 @@ const enrichedSnapshotSecond: ServerProvider = {
 };
 
 describe("makeManagedServerProvider", () => {
-  it.effect.each(["never", "success"] as const)(
+  it.effect.each(["never", "success", "probeFailed"] as const)(
     "publishes readiness and discovery independently of a %s quota read",
     (quotaRead) =>
       Effect.scoped(
         Effect.gen(function* () {
           const quotaStarted = yield* Deferred.make<void>();
+          const quotaRetried = yield* Deferred.make<void>();
           const quotaResult = yield* Deferred.make<NonNullable<ServerProvider["usageLimits"]>>();
           const discoveryDone = yield* Deferred.make<void>();
           const releaseCheck = yield* Deferred.make<void>();
+          const limits = {
+            checkedAt: "2026-04-10T00:00:03.000Z",
+            credentialFingerprint: "login-a",
+            windows: [
+              { id: "chat", kind: "monthly", label: "Chat", detail: "4 of 200", usedPercent: 2 },
+            ],
+          } as const;
+          let quotaReads = 0;
           const provider = yield* makeManagedServerProvider<TestSettings>({
             resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
             getSettings: Effect.succeed({ enabled: true }),
@@ -156,9 +165,15 @@ describe("makeManagedServerProvider", () => {
             haveSettingsChanged: () => false,
             initialSnapshot: () => Effect.succeed(initialSnapshot),
             checkProvider: Deferred.await(releaseCheck).pipe(Effect.as(refreshedSnapshot)),
-            checkUsageLimits: Deferred.succeed(quotaStarted, undefined).pipe(
-              Effect.andThen(quotaRead === "never" ? Effect.never : Deferred.await(quotaResult)),
-            ),
+            checkUsageLimits: Effect.gen(function* () {
+              quotaReads += 1;
+              yield* Deferred.succeed(quotaStarted, undefined);
+              if (quotaReads > 1) {
+                yield* Deferred.succeed(quotaRetried, undefined);
+                return limits;
+              }
+              return yield* quotaRead === "never" ? Effect.never : Deferred.await(quotaResult);
+            }),
             enrichSnapshot: ({ publishSnapshot }) =>
               publishSnapshot(enrichedSnapshot).pipe(
                 Effect.andThen(Deferred.succeed(discoveryDone, undefined)),
@@ -178,26 +193,37 @@ describe("makeManagedServerProvider", () => {
             enrichedSnapshot,
           ]);
           assert.strictEqual(yield* Deferred.isDone(quotaResult), false);
-          if (quotaRead === "success") {
-            const limits = {
-              checkedAt: "2026-04-10T00:00:03.000Z",
-              credentialFingerprint: "login-a",
-              windows: [
-                { id: "chat", kind: "monthly", label: "Chat", detail: "4 of 200", usedPercent: 2 },
-              ],
-            } as const;
+          if (quotaRead !== "never") {
+            const firstLimits =
+              quotaRead === "success"
+                ? limits
+                : {
+                    checkedAt: limits.checkedAt,
+                    windows: [],
+                    unavailable: { reason: "probeFailed" as const },
+                  };
             const usageUpdate = yield* provider.streamChanges.pipe(
               Stream.take(1),
               Stream.runCollect,
               Effect.forkChild({ startImmediately: true }),
             );
-            yield* Deferred.succeed(quotaResult, limits);
+            yield* Deferred.succeed(quotaResult, firstLimits);
             assert.deepStrictEqual(
               Array.from(yield* Fiber.join(usageUpdate))[0]?.usageLimits,
-              limits,
+              firstLimits,
             );
             assert.deepStrictEqual((yield* provider.getSnapshot).models, enrichedSnapshot.models);
-            assert.deepStrictEqual((yield* provider.refresh).usageLimits, limits);
+            const recovered = yield* provider.streamChanges.pipe(
+              Stream.filter((snapshot) => snapshot.usageLimits === limits),
+              Stream.take(1),
+              Stream.runDrain,
+              Effect.forkChild({ startImmediately: true }),
+            );
+            yield* provider.refresh;
+            yield* Deferred.await(quotaRetried);
+            yield* Fiber.join(recovered);
+            assert.deepStrictEqual((yield* provider.getSnapshot).usageLimits, limits);
+            assert.strictEqual(quotaReads, 2);
           } else {
             assert.deepStrictEqual(yield* provider.getSnapshot, enrichedSnapshot);
           }
@@ -357,11 +383,16 @@ describe("makeManagedServerProvider", () => {
       ).pipe(Effect.provide(layerAlwaysRunTest)),
   );
 
-  it.effect("skips periodic provider refreshes without foreground provider-status demand", () =>
+  it.effect.each([
+    { name: "without foreground provider-status demand", demand: false, interval: "1 second" },
+    { name: "with the interval disabled", demand: true, interval: "0 seconds" },
+  ] as const)("skips periodic provider and quota refreshes $name", ({ demand, interval }) =>
     Effect.scoped(
       Effect.gen(function* () {
         const checkCalls = yield* Ref.make(0);
+        const quotaCalls = yield* Ref.make(0);
         const initialCheckDone = yield* Deferred.make<void>();
+        const initialQuotaDone = yield* Deferred.make<void>();
         yield* makeManagedServerProvider<TestSettings>({
           resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
           getSettings: Effect.succeed({ enabled: true }),
@@ -377,18 +408,23 @@ describe("makeManagedServerProvider", () => {
             ),
             Effect.as(refreshedSnapshot),
           ),
-          refreshInterval: "1 second",
+          checkUsageLimits: Ref.update(quotaCalls, (count) => count + 1).pipe(
+            Effect.andThen(Deferred.succeed(initialQuotaDone, undefined)),
+            Effect.as(undefined),
+          ),
+          refreshInterval: interval,
         });
 
         yield* Deferred.await(initialCheckDone);
-        yield* TestClock.adjust("1 second");
-        yield* Effect.yieldNow;
+        yield* Deferred.await(initialQuotaDone);
+        yield* TestClock.adjust("3 seconds");
 
         assert.strictEqual(yield* Ref.get(checkCalls), 1);
+        assert.strictEqual(yield* Ref.get(quotaCalls), 1);
       }),
     ).pipe(
       Effect.provide(
-        Layer.mergeAll(layerProviderHost({ runBackgroundWork: false }), TestClock.layer()),
+        Layer.mergeAll(layerProviderHost({ runBackgroundWork: demand }), TestClock.layer()),
       ),
     ),
   );
