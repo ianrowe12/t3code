@@ -207,6 +207,9 @@ function PoolWindowCard({
           <Text className="text-xs text-foreground-tertiary">{PACE_LABEL[pool.pace]}</Text>
         ) : null}
       </View>
+      {pool.detail ? (
+        <Text className="text-xs tabular-nums text-foreground-muted">{pool.detail}</Text>
+      ) : null}
       {description ? <Text className="text-xs text-foreground-muted">{description}</Text> : null}
       {nextRefill ? (
         <Text className="text-xs tabular-nums text-foreground-muted">
@@ -590,6 +593,11 @@ export function UsageLimitAccountScreen({ route }: AccountScreenProps) {
               <Text className="text-3xl font-t3-bold tabular-nums text-foreground">
                 {remainingPercent(window)}% left
               </Text>
+              {window.detail ? (
+                <Text selectable className="text-sm tabular-nums text-foreground-muted">
+                  {window.detail}
+                </Text>
+              ) : null}
               {window.resetsAt ? (
                 <Text selectable className="text-sm text-foreground-muted">
                   Resets{" "}

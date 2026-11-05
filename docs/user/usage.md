@@ -115,7 +115,9 @@ setting removes it from `settings.json`.
 ## Track subscription limits
 
 GitHub Copilot reports account-wide monthly allowances in **Usage → Limits**, including AI credits
-or premium requests on request-based plans, and capped chat allowances.
+or premium requests on request-based plans, and capped chat allowances. Copilot's limit row shows
+the credits used, the allowance, and their dollar value at $0.01 per credit. This counts the whole
+account, not one machine.
 
 **Usage → Limits** pools every subscription account it can see per provider, so with several Codex
 or Claude accounts across your enabled environments and hubs you read one number per window rather than a

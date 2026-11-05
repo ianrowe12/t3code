@@ -155,12 +155,13 @@ function LimitRow({
       fill={left}
       tone={left <= 10 ? "error" : left <= 20 ? "warning" : null}
       value={`${left}%`}
-      ariaValue={`${left}% left`}
+      ariaValue={`${left}% left${window.detail ? `, ${window.detail}` : ""}`}
       tooltip={
         <>
           <span className="text-foreground">
             {window.label}: {left}% left
           </span>
+          {window.detail ? <span className="text-muted-foreground">{window.detail}</span> : null}
           {window.resetsAt && resetsAt > now ? (
             <span className="text-muted-foreground">
               Resets in {formatDuration(resetsAt - now)} ·{" "}

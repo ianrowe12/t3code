@@ -177,6 +177,7 @@ function SegmentPopover({
       </div>
       <div className="flex flex-col gap-1 border-t border-border/60 pt-2.5">
         <Row label="Left">{remaining}%</Row>
+        {window.detail ? <Row label="Used">{window.detail}</Row> : null}
         {window.resetsAt ? (
           <Row label="Resets">
             {formatUpcomingTimestamp(window.resetsAt, timestampFormat, now)}
@@ -538,6 +539,11 @@ function PoolWindowCard({
     <div className="grid items-center gap-x-6 gap-y-3 rounded-lg border border-border/60 p-4 md:grid-cols-[11rem_minmax(0,1fr)]">
       <div className="flex flex-col gap-1">
         <span className="text-sm font-medium text-foreground">{label ?? pool.label}</span>
+        {pool.detail ? (
+          <span className="text-xs break-words text-muted-foreground tabular-nums">
+            {pool.detail}
+          </span>
+        ) : null}
         <span className="flex items-baseline gap-2">
           <span className="text-3xl font-semibold text-foreground tabular-nums">
             {pool.remainingPercent}%

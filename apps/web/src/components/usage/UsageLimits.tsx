@@ -223,6 +223,11 @@ export function LimitWindows({
               {pace ? <PaceIcon pace={pace} /> : null}
               <span className="ms-auto shrink-0">{resetsIn ?? ""}</span>
             </span>
+            {window.detail ? (
+              <span className="col-span-full min-w-0 text-xs break-words text-muted-foreground tabular-nums">
+                {window.detail}
+              </span>
+            ) : null}
           </Fragment>
         );
       })}
