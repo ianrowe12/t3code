@@ -57,6 +57,8 @@ import * as AcpRegistrySupport from "./AcpRegistrySupport.ts";
 import * as AcpRegistryRuntimeCoordinator from "./AcpRegistryRuntimeCoordinator.ts";
 import * as AcpRegistryAuth from "./auth.ts";
 import * as AcpRegistryAuthenticationState from "./authenticationState.ts";
+import { isCopilotAgent } from "./copilotAcp.ts";
+import { readCopilotUsageLimits } from "./usageLimits.ts";
 
 const DRIVER_KIND = ProviderDriverKind.make("acpRegistry");
 const decodeSettings = Schema.decodeSync(AcpRegistrySettings);
@@ -582,9 +584,20 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
             }),
           );
     });
-    const checkProvider = checkAcpRegistryProviderReadiness(readinessInput).pipe(
+    const checkReadiness = checkAcpRegistryProviderReadiness(readinessInput).pipe(
       Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, catalog),
       Effect.flatMap(withLiveRuntimeState),
+    );
+    const checkProvider = checkReadiness.pipe(
+      Effect.filterOrElse(
+        (provider) => !(provider.enabled && provider.installed && isCopilotAgent(effectiveConfig)),
+        (provider) =>
+          readCopilotUsageLimits(effectiveConfig, host.paths.cwd, processEnvironment).pipe(
+            Effect.map((usageLimits) => ({ ...provider, usageLimits })),
+          ),
+      ),
+      Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, catalog),
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
     );
     const enrichProvider = checkAcpRegistryProviderStatus(
       {
@@ -649,7 +662,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
       getSettings: snapshotSettings.getSettings,
       streamSettings: snapshotSettings.streamSettings,
       haveSettingsChanged: haveProviderSnapshotSettingsChanged,
-      initialSnapshot: () => checkProvider,
+      initialSnapshot: () => checkReadiness,
       checkProvider,
       enrichSnapshot: Effect.fn("enrichSnapshot")(function ({
         snapshot,

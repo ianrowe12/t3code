@@ -22,6 +22,12 @@ const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 
+export function usageLimitsDriverLabel(driver: ServerProvider["driver"]): string {
+  return driver === "acpRegistry"
+    ? "GitHub Copilot"
+    : (PROVIDER_DISPLAY_NAMES[driver] ?? String(driver));
+}
+
 export function exhaustedUsageWindow(
   provider: ServerProvider | undefined,
   now: number,
@@ -398,7 +404,7 @@ export function collectLimitNotices(presentations: LimitPresentations): readonly
     for (const provider of providersWithLimits(presentation.serverConfig?.providers ?? [])) {
       if (provider.usageLimits?.unavailable?.reason === "unsupported") continue;
       const notice = provider.usageLimits ? limitsNotice(provider.usageLimits) : null;
-      const name = provider.displayName?.trim() || String(provider.driver);
+      const name = provider.displayName?.trim() || usageLimitsDriverLabel(provider.driver);
       if (notice) notices.push(`${label(environmentLabel, name)}: ${notice}`);
     }
     for (const source of presentation.serverConfig?.usageLimitSources ?? []) {
@@ -830,7 +836,7 @@ export function collectProviderUsageLimits(
     accounts.push({
       id: provider.instanceId,
       driver: provider.driver,
-      label: `${provider.displayName?.trim() || String(provider.driver)} [${provider.instanceId}]`,
+      label: `${provider.displayName?.trim() || usageLimitsDriverLabel(provider.driver)} [${provider.instanceId}]`,
       ...(provider.auth.label ? { plan: provider.auth.label } : {}),
       instanceId: provider.instanceId,
       resetCreditInput:
