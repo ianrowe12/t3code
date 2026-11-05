@@ -2740,8 +2740,8 @@ describe("UsageService", () => {
       }).pipe(Effect.scoped),
   );
 
-  it.live.each([4, 5, 6, 7, 8, 10])(
-    "upgrades a v%s cache: reparses live Codex usage, keeps deleted rollouts and the old file",
+  it.live.each([4, 5, 6, 7, 8, 10, 11])(
+    "upgrades a v%s cache: keeps live usage, deleted transcripts and the old file",
     (version) =>
       Effect.gen(function* () {
         const { home, settings } = yield* setup;
@@ -2773,10 +2773,34 @@ describe("UsageService", () => {
             .join("\n") + "\n";
         const live = NodePath.join(sessions, "live.jsonl");
         const deleted = NodePath.join(sessions, "deleted.jsonl");
+        const copilot = NodePath.join(home, "copilot", "session-state", "deleted", "events.jsonl");
         yield* Effect.promise(async () => {
           await NodeFSP.mkdir(sessions, { recursive: true });
           await NodeFSP.writeFile(live, rollout("live", 10));
           await NodeFSP.writeFile(deleted, rollout("deleted", 20));
+          if (version === 11) {
+            await NodeFSP.mkdir(NodePath.dirname(copilot), { recursive: true });
+            await NodeFSP.writeFile(
+              copilot,
+              [
+                { type: "session.start", data: { sessionId: "deleted" } },
+                {
+                  type: "session.usage_record",
+                  timestamp: "2026-08-01T10:00:00Z",
+                  data: {
+                    usage: {
+                      model: "gpt-6.1-sol",
+                      outputTokens: 3,
+                      copilotUsage: { totalNanoAiu: 1_000_000_000 },
+                      aiCreditsStatus: "complete",
+                    },
+                  },
+                },
+              ]
+                .map((line) => encodeUnknownJsonString(line) + "\n")
+                .join(""),
+            );
+          }
         });
 
         yield* Effect.gen(function* () {
@@ -2796,6 +2820,7 @@ describe("UsageService", () => {
               files: Record<string, { r: unknown[][]; mr: number; cs: Record<string, unknown> }>;
             };
             for (const [path, file] of Object.entries(document.files)) {
+              if (version === 11) continue;
               file.r = file.r.map((row) => [
                 ...row.slice(0, 6),
                 path === livePath ? 99 : row[6],
@@ -2828,21 +2853,49 @@ describe("UsageService", () => {
               }
             }
             await NodeFSP.rm(deleted);
+            if (version === 11) await NodeFSP.rm(copilot);
             return text;
           });
 
           const upgraded = yield* UsageService.make;
           const summary = yield* upgraded.readSummary(WINDOW);
-          assert.strictEqual(totalOutputTokens(summary), 30);
+          assert.strictEqual(totalOutputTokens(summary), version === 11 ? 33 : 30);
           assert.strictEqual(
             summary.buckets.reduce((sum, bucket) => sum + bucket.costUsd, 0),
-            60 + 20 * (version === 4 ? 1 : 2),
+            version === 11 ? 180.01 : 60 + 20 * (version === 4 ? 1 : 2),
           );
           yield* upgraded.awaitPersisted;
-          assert.strictEqual(SCAN_CACHE_FILE_NAME, "usage-scan-cache-v11.json");
           assert.strictEqual(
             yield* Effect.promise(() => NodeFSP.readFile(legacyPath, "utf8")),
             legacy,
+          );
+          if (version === 11) {
+            yield* Effect.promise(async () => {
+              const document = decodeUnknownJsonString(legacy) as {
+                files: Record<string, { p: string }>;
+              };
+              await NodeFSP.writeFile(
+                legacyPath,
+                encodeUnknownJsonString({
+                  ...document,
+                  files: Object.fromEntries(
+                    Object.entries(document.files).filter(([, file]) => file.p !== "copilot"),
+                  ),
+                }),
+              );
+            });
+            const restarted = yield* UsageService.make;
+            const restored = yield* restarted.readSummary(WINDOW);
+            assert.deepStrictEqual(
+              restored.buckets.filter((bucket) => bucket.provider === "copilot"),
+              summary.buckets.filter((bucket) => bucket.provider === "copilot"),
+            );
+          }
+          assert.strictEqual(SCAN_CACHE_FILE_NAME, "usage-scan-cache-v12.json");
+          const persisted = yield* Effect.promise(() => NodeFSP.readFile(cachePath, "utf8"));
+          assert.strictEqual(
+            (decodeUnknownJsonString(persisted) as { version: number }).version,
+            12,
           );
         }).pipe(
           Effect.provide(

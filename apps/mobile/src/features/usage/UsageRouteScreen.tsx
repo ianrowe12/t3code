@@ -27,6 +27,7 @@ import {
   formatUsageContractMismatch,
   formatUsd,
   makeWindow,
+  usageCostLabel,
   usageSourceMessages,
 } from "@t3tools/shared/usageFormat";
 import { useRef, useState, type ReactNode } from "react";
@@ -655,17 +656,21 @@ function ChartCard(props: {
 
 function UsageSummary(props: { readonly merged: MergedUsage; readonly metric: UsageChartMetric }) {
   const { merged, metric } = props;
+  const costLabel = usageCostLabel(merged.costQuality);
+  const costTitle = costLabel === "API estimate" ? "Raw token cost" : "Cost";
   return (
     <View className="gap-0.5">
       <Text className="text-sm text-foreground-muted">
-        {metric === "cost" ? "Raw token cost" : "Processed tokens"}
+        {metric === "cost" ? costTitle : "Processed tokens"}
       </Text>
       <Text className="text-4xl font-t3-bold tabular-nums text-foreground">
         {metric === "cost" ? `${formatUsd(merged.costUsd)}*` : formatTokens(merged.totalTokens)}
       </Text>
       <Text className="text-sm text-foreground-muted">
         {metric === "cost"
-          ? "* if billed at full API rate"
+          ? costLabel === "API estimate"
+            ? "* if billed at full API rate"
+            : `* ${costLabel}`
           : `Across ${formatCount(merged.sessions)} sessions`}
       </Text>
     </View>

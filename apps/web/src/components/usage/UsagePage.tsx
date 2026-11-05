@@ -56,6 +56,7 @@ import {
   formatUsageContractMismatch,
   formatUsd,
   makeWindow,
+  usageCostLabel,
   usageSourceMessages,
 } from "@t3tools/shared/usageFormat";
 import { Button, InlineButton } from "../ui/button";
@@ -659,6 +660,7 @@ function UsageOverview({
         ) ?? [],
     ),
   );
+  const costLabel = usageCostLabel(merged.costQuality);
   const breakdownPeriods: readonly (DailyTotals | HourlyTotals)[] = (
     shownHourly ? merged.hourly : merged.daily
   ).toReversed();
@@ -708,7 +710,7 @@ function UsageOverview({
                 <span className={figureClass(loadingPartial)}>
                   {formatCount(merged.sessions)} sessions
                 </span>
-                {metric === "cost" && " · API estimate"}
+                {metric === "cost" && ` · ${costLabel}`}
               </span>
               {metric === "cost" && merged.costQuality.unpricedShare > 0 && (
                 <Popover>
@@ -720,8 +722,8 @@ function UsageOverview({
                     <InfoIcon className="size-3" aria-hidden />
                   </PopoverTrigger>
                   <PopoverPopup side="top" tooltipStyle>
-                    API estimate excludes {formatPercent(merged.costQuality.unpricedShare)} unpriced
-                    records.
+                    {costLabel === "API estimate" ? "API estimate" : "Total"} excludes{" "}
+                    {formatPercent(merged.costQuality.unpricedShare)} unpriced records.
                   </PopoverPopup>
                 </Popover>
               )}

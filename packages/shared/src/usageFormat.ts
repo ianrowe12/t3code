@@ -6,7 +6,7 @@ import {
   type UsageSummaryInput,
 } from "@t3tools/contracts";
 
-import type { UsageContractMismatch } from "./usageMerge.ts";
+import type { CostQuality, UsageContractMismatch } from "./usageMerge.ts";
 
 const CURRENCY = new Intl.NumberFormat("en-US", {
   style: "currency",
@@ -62,6 +62,14 @@ export function formatUsd(value: number): string {
 
 export function formatCount(value: number): string {
   return INTEGER.format(Math.round(value));
+}
+
+export function usageCostLabel(quality: CostQuality): string {
+  if (quality.copilotReportedShare === 0) return "API estimate";
+  if (quality.modelPricedShare > 0) return "Recorded cost + API estimate";
+  return quality.copilotReportedShare === quality.providerReportedShare
+    ? "Recorded by Copilot"
+    : "Recorded cost";
 }
 
 export function formatTokens(value: number): string {

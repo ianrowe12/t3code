@@ -60,6 +60,7 @@ export interface HourlyTotals {
 
 export interface CostQuality {
   readonly providerReportedShare: number;
+  readonly copilotReportedShare: number;
   readonly modelPricedShare: number;
   readonly unpricedShare: number;
   readonly cacheSavingsUsd: number;
@@ -288,6 +289,7 @@ const EMPTY_MERGED: MergedUsage = {
   hourly: [],
   costQuality: {
     providerReportedShare: 0,
+    copilotReportedShare: 0,
     modelPricedShare: 0,
     unpricedShare: 0,
     cacheSavingsUsd: 0,
@@ -341,6 +343,7 @@ export function mergeUsage(
   let sessions = 0;
   let cacheSavingsUsd = 0;
   let providerReportedRecords = 0;
+  let copilotReportedRecords = 0;
   let unpricedRecords = 0;
   const categoryCost = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
   const speedCost = { fast: 0, ultrafast: 0, premium: 0 };
@@ -415,7 +418,10 @@ export function mergeUsage(
       reasoningTokens += bucket.totals.reasoningTokens;
       records += bucket.records;
       unpricedRecords += bucket.unpricedRecords;
-      if (bucket.costSource === "providerReported") providerReportedRecords += bucket.records;
+      if (bucket.costSource === "providerReported") {
+        providerReportedRecords += bucket.records;
+        if (bucket.provider === "copilot") copilotReportedRecords += bucket.records;
+      }
       if (bucket.categoryCostUsd !== undefined) {
         categoryCost.input += bucket.categoryCostUsd.input;
         categoryCost.cacheRead += bucket.categoryCostUsd.cacheRead;
@@ -562,6 +568,7 @@ export function mergeUsage(
     hourly,
     costQuality: {
       providerReportedShare: records === 0 ? 0 : providerReportedRecords / records,
+      copilotReportedShare: records === 0 ? 0 : copilotReportedRecords / records,
       unpricedShare: records === 0 ? 0 : unpricedRecords / records,
       modelPricedShare:
         records === 0 ? 0 : (records - providerReportedRecords - unpricedRecords) / records,

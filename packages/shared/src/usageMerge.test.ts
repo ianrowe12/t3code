@@ -11,6 +11,7 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 
 import { isModelCostUnknown, mergeUsage, type EnvironmentUsage } from "./usageMerge.ts";
+import { usageCostLabel } from "./usageFormat.ts";
 
 const decodeSummary = Schema.decodeUnknownSync(UsageSummary);
 
@@ -78,6 +79,66 @@ function environment(id: string, usageSummary: UsageSummary): EnvironmentUsage {
 }
 
 describe("mergeUsage", () => {
+  it.each([
+    {
+      name: "zero recorded Copilot credits",
+      buckets: [bucket({ provider: "copilot", costSource: "providerReported", costUsd: 0 })],
+      label: "Recorded by Copilot",
+    },
+    {
+      name: "recorded Copilot credits and API-priced usage",
+      buckets: [bucket({ provider: "copilot", costSource: "providerReported" }), bucket()],
+      label: "Recorded cost + API estimate",
+    },
+    {
+      name: "recorded Copilot credits and custom-priced Copilot usage",
+      buckets: [
+        bucket({ provider: "copilot", costSource: "providerReported" }),
+        bucket({ provider: "copilot", model: "custom-priced" }),
+      ],
+      label: "Recorded cost + API estimate",
+    },
+    {
+      name: "recorded costs from Copilot and another provider",
+      buckets: [
+        bucket({ provider: "copilot", costSource: "providerReported" }),
+        bucket({ provider: "opencode", costSource: "providerReported" }),
+      ],
+      label: "Recorded cost",
+    },
+    {
+      name: "recorded Copilot credits with unpriced usage",
+      buckets: [
+        bucket({ provider: "copilot", costSource: "providerReported" }),
+        bucket({ costSource: "unpriced", costUsd: 0, unpricedRecords: 5 }),
+      ],
+      label: "Recorded by Copilot",
+    },
+  ])("labels $name by its cost basis", ({ buckets, label }) => {
+    const sources = [...new Set(buckets.map((entry) => entry.provider))].map((provider) => ({
+      provider,
+      hostId: "host",
+      homePath: `/${provider}`,
+    }));
+    const merged = mergeUsage(
+      [environment("env-a", summary(buckets, sources))],
+      USAGE_CONTRACT_VERSION,
+    );
+
+    expect(usageCostLabel(merged.costQuality)).toBe(label);
+    const withoutRecordedCredits = buckets.map((entry) =>
+      entry.provider === "copilot" ? { ...entry, costSource: "modelPriced" as const } : entry,
+    );
+    expect(
+      usageCostLabel(
+        mergeUsage(
+          [environment("env-a", summary(withoutRecordedCredits, sources))],
+          USAGE_CONTRACT_VERSION,
+        ).costQuality,
+      ),
+    ).toBe("API estimate");
+  });
+
   it("counts a Cursor account once across servers while retaining each server's other providers", () => {
     const account = {
       provider: "cursor" as const,
