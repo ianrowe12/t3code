@@ -91,6 +91,9 @@ function WindowRow(props: {
           {remaining}% left
         </Text>
       </View>
+      {window.detail ? (
+        <Text className="text-xs tabular-nums text-foreground-tertiary">{window.detail}</Text>
+      ) : null}
       <View
         className="h-3 justify-center"
         onLayout={(event) => setBarWidth(event.nativeEvent.layout.width)}
