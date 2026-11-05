@@ -418,10 +418,14 @@ export function mergeUsage(
       reasoningTokens += bucket.totals.reasoningTokens;
       records += bucket.records;
       unpricedRecords += bucket.unpricedRecords;
-      if (bucket.costSource === "providerReported") {
-        providerReportedRecords += bucket.records;
-        if (bucket.provider === "copilot") copilotReportedRecords += bucket.records;
-      }
+      const reportedRecords =
+        bucket.costSource === "providerReported"
+          ? bucket.records
+          : bucket.provider === "copilot"
+            ? (bucket.providerReportedRecords ?? 0)
+            : 0;
+      providerReportedRecords += reportedRecords;
+      if (bucket.provider === "copilot") copilotReportedRecords += reportedRecords;
       if (bucket.categoryCostUsd !== undefined) {
         categoryCost.input += bucket.categoryCostUsd.input;
         categoryCost.cacheRead += bucket.categoryCostUsd.cacheRead;

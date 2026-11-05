@@ -12,14 +12,16 @@ import { vi } from "vite-plus/test";
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { usageCostLabel } from "@t3tools/shared/usageFormat";
 import { mergeUsage } from "@t3tools/shared/usageMerge";
 import {
   EnvironmentId,
   ProviderDriverKind,
   ProviderInstanceId,
+  USAGE_CONTRACT_VERSION,
   UsageDay,
   type UsageSource,
-  type UsageSummary,
+  UsageSummary,
   type UsageSummaryInput,
 } from "@t3tools/contracts";
 import * as Duration from "effect/Duration";
@@ -74,6 +76,7 @@ vi.mock("../../../../packages/provider-muse/src/server/sdk.ts", async (importOri
 const encodeUnknownJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeUnknownJsonString = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeUsageSummary = Schema.decodeUnknownSync(UsageSummary);
 
 function claudeLine(
   id: number,
@@ -1439,6 +1442,95 @@ describe("UsageService", () => {
         Effect.provideService(HostProcess.HomeDirectory, home),
       );
     }).pipe(Effect.scoped),
+  );
+
+  it.live.each([
+    { resolution: "day", withRates: true },
+    { resolution: "hour", withRates: true },
+    { resolution: "day", withRates: false },
+    { resolution: "hour", withRates: false },
+  ] as const)(
+    "labels mixed Copilot receipts in a $resolution bucket with rates available: $withRates",
+    ({ resolution, withRates }) =>
+      Effect.gen(function* () {
+        const { home, settings } = yield* setup;
+        const transcript = NodePath.join(
+          home,
+          "copilot",
+          "session-state",
+          "session",
+          "events.jsonl",
+        );
+        yield* Effect.promise(async () => {
+          await NodeFSP.mkdir(NodePath.dirname(transcript), { recursive: true });
+          await NodeFSP.writeFile(
+            transcript,
+            [
+              { type: "session.start", data: { sessionId: "session" } },
+              ...["complete", "partial"].map((aiCreditsStatus) => ({
+                id: aiCreditsStatus,
+                type: "session.usage_record",
+                timestamp: "2026-08-01T10:00:00Z",
+                data: {
+                  usage: {
+                    model: "gpt-6.1-sol",
+                    outputTokens: 1,
+                    aiCreditsStatus,
+                    copilotUsage: { totalNanoAiu: 1_000_000_000 },
+                  },
+                },
+              })),
+            ]
+              .map((line) => encodeUnknownJsonString(line) + "\n")
+              .join(""),
+          );
+        });
+        yield* Effect.gen(function* () {
+          const service = yield* UsageService.make;
+          const summary = yield* service.readSummary({
+            ...WINDOW,
+            resolution,
+            ...(resolution === "hour"
+              ? { sinceTime: "2026-08-01T10:00:00Z", untilTime: "2026-08-01T11:00:00Z" }
+              : {}),
+          });
+          const merged = mergeUsage(
+            [
+              {
+                environmentId: EnvironmentId.make("test"),
+                label: "test",
+                summary: decodeUsageSummary(summary),
+              },
+            ],
+            USAGE_CONTRACT_VERSION,
+          );
+          assert.strictEqual(summary.buckets.length, 1);
+          assert.strictEqual(merged.records, 2);
+          assert.strictEqual(merged.costUsd, withRates ? 0.02 : 0.01);
+          assert.strictEqual(
+            usageCostLabel(merged.costQuality),
+            withRates ? "Recorded cost + API estimate" : "Recorded by Copilot",
+          );
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            layerService({
+              prefix: "usage-copilot-mixed",
+              home,
+              settings,
+              ratesDocument: withRates
+                ? {
+                    "github_copilot/gpt-6.1-sol": {
+                      input_cost_per_token: 0,
+                      output_cost_per_token: 0.01,
+                    },
+                  }
+                : {},
+            }),
+          ),
+          Effect.provideService(HostProcess.HomeDirectory, home),
+        );
+      }).pipe(Effect.scoped),
   );
 
   it.live("reads shared managed default and disabled extra account history once", () =>

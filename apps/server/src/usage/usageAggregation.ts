@@ -320,6 +320,9 @@ export class UsageAggregator {
         ...(speedPremiumUsd === 0 ? {} : { speedPremiumUsd }),
         costSource: resolveCostSource(bucket),
         records: bucket.records,
+        ...(provider === "copilot"
+          ? { providerReportedRecords: bucket.providerReportedRecords }
+          : {}),
         unpricedRecords: bucket.unpricedRecords,
         sessions: bucket.sessions.size,
       });

@@ -66,6 +66,8 @@ export const UsageBucket = Schema.Struct({
   speedPremiumUsd: Schema.optional(Schema.Number),
   costSource: UsageCostSource,
   records: NonNegativeInt,
+  /** Receipt-level count for mixed-source Copilot buckets; older servers omit it. */
+  providerReportedRecords: Schema.optional(NonNegativeInt),
   unpricedRecords: NonNegativeInt,
   sessions: NonNegativeInt,
 });

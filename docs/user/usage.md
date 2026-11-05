@@ -45,6 +45,7 @@ known prices still contribute tokens and appear as unpriced; set custom prices t
 GitHub Copilot reads Copilot CLI sessions, including subagent calls, from `~/.copilot/session-state`,
 or from `session-state` under `COPILOT_HOME` on the server or a Copilot account. Its cost is the value
 of the AI credits Copilot recorded, at $0.01 per credit, even when your plan covers them.
+Receipts without complete credit totals use model price estimates when rates are available.
 Use absolute paths or `~/` paths in the account's environment settings; relative environment paths
 depend on each project's working directory and cannot be reliably discovered by Usage. Accounts
 sharing a history directory count once.
